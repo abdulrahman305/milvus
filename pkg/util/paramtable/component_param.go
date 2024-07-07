@@ -2819,7 +2819,8 @@ user-task-polling:
 	p.QueryStreamBatchSize.Init(base.mgr)
 
 	p.BloomFilterApplyParallelFactor = ParamItem{
-		Key:          "queryNode.bloomFilterApplyBatchSize",
+		Key:          "queryNode.bloomFilterApplyParallelFactor",
+		FallbackKeys: []string{"queryNode.bloomFilterApplyBatchSize"},
 		Version:      "2.4.5",
 		DefaultValue: "4",
 		Doc:          "parallel factor when to apply pk to bloom filter, default to 4*CPU_CORE_NUM",
@@ -3711,7 +3712,6 @@ type dataNodeConfig struct {
 	MemoryCheckInterval       ParamItem `refreshable:"true"`
 	MemoryForceSyncWatermark  ParamItem `refreshable:"true"`
 
-	DataNodeTimeTickByRPC ParamItem `refreshable:"false"`
 	// DataNode send timetick interval per collection
 	DataNodeTimeTickInterval ParamItem `refreshable:"false"`
 
@@ -3733,7 +3733,8 @@ type dataNodeConfig struct {
 	ReadBufferSizeInMB         ParamItem `refreshable:"true"`
 
 	// Compaction
-	L0BatchMemoryRatio ParamItem `refreshable:"true"`
+	L0BatchMemoryRatio       ParamItem `refreshable:"true"`
+	L0CompactionMaxBatchSize ParamItem `refreshable:"true"`
 
 	GracefulStopTimeout ParamItem `refreshable:"true"`
 
@@ -3918,15 +3919,6 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 	}
 	p.FileReadConcurrency.Init(base.mgr)
 
-	p.DataNodeTimeTickByRPC = ParamItem{
-		Key:          "dataNode.timetick.byRPC",
-		Version:      "2.2.9",
-		PanicIfEmpty: false,
-		DefaultValue: "true",
-		Export:       true,
-	}
-	p.DataNodeTimeTickByRPC.Init(base.mgr)
-
 	p.DataNodeTimeTickInterval = ParamItem{
 		Key:          "dataNode.timetick.interval",
 		Version:      "2.2.5",
@@ -4042,6 +4034,15 @@ if this parameter <= 0, will set it as 10`,
 	}
 	p.L0BatchMemoryRatio.Init(base.mgr)
 
+	p.L0CompactionMaxBatchSize = ParamItem{
+		Key:          "dataNode.compaction.levelZeroMaxBatchSize",
+		Version:      "2.4.5",
+		Doc:          "Max batch size refers to the max number of L1/L2 segments in a batch when executing L0 compaction. Default to -1, any value that is less than 1 means no limit. Valid range: >= 1.",
+		DefaultValue: "-1",
+		Export:       true,
+	}
+	p.L0CompactionMaxBatchSize.Init(base.mgr)
+
 	p.GracefulStopTimeout = ParamItem{
 		Key:          "dataNode.gracefulStopTimeout",
 		Version:      "2.3.7",
@@ -4081,7 +4082,8 @@ if this parameter <= 0, will set it as 10`,
 	p.ClusteringCompactionWorkerPoolSize.Init(base.mgr)
 
 	p.BloomFilterApplyParallelFactor = ParamItem{
-		Key:          "dataNode.bloomFilterApplyBatchSize",
+		Key:          "datanode.bloomFilterApplyParallelFactor",
+		FallbackKeys: []string{"datanode.bloomFilterApplyBatchSize"},
 		Version:      "2.4.5",
 		DefaultValue: "4",
 		Doc:          "parallel factor when to apply pk to bloom filter, default to 4*CPU_CORE_NUM",
