@@ -25,7 +25,7 @@
 #include "plan/PlanNode.h"
 #include "exec/Task.h"
 #include "segcore/SegmentInterface.h"
-#include "query/GroupByOperator.h"
+#include "query/groupby/SearchGroupByOperator.h"
 namespace milvus::query {
 
 namespace impl {
@@ -164,6 +164,8 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
         return;
     }
 
+    std::chrono::high_resolution_clock::time_point scalar_start =
+        std::chrono::high_resolution_clock::now();
     std::unique_ptr<BitsetType> bitset_holder;
     if (node.filter_plannode_.has_value()) {
         BitsetType expr_res;
@@ -177,6 +179,12 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
     segment->mask_with_timestamps(*bitset_holder, timestamp_);
 
     segment->mask_with_delete(*bitset_holder, active_count, timestamp_);
+    std::chrono::high_resolution_clock::time_point scalar_end =
+        std::chrono::high_resolution_clock::now();
+    double scalar_cost =
+        std::chrono::duration<double, std::micro>(scalar_end - scalar_start)
+            .count();
+    monitor::internal_core_search_latency_scalar.Observe(scalar_cost);
 
     // if bitset_holder is all 1's, we got empty result
     if (bitset_holder->all()) {
@@ -184,6 +192,9 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
             empty_search_result(num_queries, node.search_info_);
         return;
     }
+
+    std::chrono::high_resolution_clock::time_point vector_start =
+        std::chrono::high_resolution_clock::now();
     BitsetView final_view = *bitset_holder;
     segment->vector_search(node.search_info_,
                            src_data,
@@ -193,14 +204,20 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
                            search_result);
     search_result.total_data_cnt_ = final_view.size();
     if (search_result.vector_iterators_.has_value()) {
+        AssertInfo(search_result.vector_iterators_.value().size() ==
+                       search_result.total_nq_,
+                   "Vector Iterators' count must be equal to total_nq_, Check "
+                   "your code");
         std::vector<GroupByValueType> group_by_values;
-        GroupBy(search_result.vector_iterators_.value(),
-                node.search_info_,
-                group_by_values,
-                *segment,
-                search_result.seg_offsets_,
-                search_result.distances_);
+        SearchGroupBy(search_result.vector_iterators_.value(),
+                      node.search_info_,
+                      group_by_values,
+                      *segment,
+                      search_result.seg_offsets_,
+                      search_result.distances_,
+                      search_result.topk_per_nq_prefix_sum_);
         search_result.group_by_values_ = std::move(group_by_values);
+        search_result.group_size_ = node.search_info_.group_size_;
         AssertInfo(search_result.seg_offsets_.size() ==
                        search_result.group_by_values_.value().size(),
                    "Wrong state! search_result group_by_values_ size:{} is not "
@@ -209,6 +226,20 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
                    search_result.seg_offsets_.size());
     }
     search_result_opt_ = std::move(search_result);
+    std::chrono::high_resolution_clock::time_point vector_end =
+        std::chrono::high_resolution_clock::now();
+    double vector_cost =
+        std::chrono::duration<double, std::micro>(vector_end - vector_start)
+            .count();
+    monitor::internal_core_search_latency_vector.Observe(vector_cost);
+
+    double total_cost =
+        std::chrono::duration<double, std::micro>(vector_end - scalar_start)
+            .count();
+    double scalar_ratio =
+        total_cost > 0.0 ? scalar_cost / total_cost : 0.0;
+    monitor::internal_core_search_latency_scalar_proportion.Observe(
+        scalar_ratio);
 }
 
 std::unique_ptr<RetrieveResult>

@@ -16,7 +16,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/resource/timestamp"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource/idalloc"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/registry"
 	"github.com/milvus-io/milvus/pkg/streaming/util/message"
@@ -32,7 +32,7 @@ type walTestFramework struct {
 }
 
 func TestWAL(t *testing.T) {
-	rc := timestamp.NewMockRootCoordClient(t)
+	rc := idalloc.NewMockRootCoordClient(t)
 	resource.InitForTest(resource.OptRootCoordClient(rc))
 
 	b := registry.MustGetBuilder(walimplstest.WALName)
@@ -86,9 +86,8 @@ func (f *testOneWALFramework) Run() {
 	ctx := context.Background()
 	for ; f.term <= 3; f.term++ {
 		pChannel := types.PChannelInfo{
-			Name:     f.pchannel,
-			Term:     int64(f.term),
-			ServerID: 1,
+			Name: f.pchannel,
+			Term: int64(f.term),
 		}
 		w, err := f.opener.Open(ctx, &wal.OpenOption{
 			Channel: pChannel,
@@ -96,7 +95,6 @@ func (f *testOneWALFramework) Run() {
 		assert.NoError(f.t, err)
 		assert.NotNil(f.t, w)
 		assert.Equal(f.t, pChannel.Name, w.Channel().Name)
-		assert.Equal(f.t, pChannel.ServerID, w.Channel().ServerID)
 
 		f.testReadAndWrite(ctx, w)
 		// close the wal

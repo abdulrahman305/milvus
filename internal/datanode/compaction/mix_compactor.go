@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	sio "io"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -27,7 +28,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/datanode/io"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -42,8 +43,8 @@ import (
 
 // for MixCompaction only
 type mixCompactionTask struct {
-	binlogIO io.BinlogIO
-	allocator.Allocator
+	binlogIO  io.BinlogIO
+	allocator allocator.Interface
 	currentTs typeutil.Timestamp
 
 	plan *datapb.CompactionPlan
@@ -61,15 +62,15 @@ var _ Compactor = (*mixCompactionTask)(nil)
 func NewMixCompactionTask(
 	ctx context.Context,
 	binlogIO io.BinlogIO,
-	alloc allocator.Allocator,
 	plan *datapb.CompactionPlan,
 ) *mixCompactionTask {
 	ctx1, cancel := context.WithCancel(ctx)
+	alloc := allocator.NewLocalAllocator(plan.GetBeginLogID(), math.MaxInt64)
 	return &mixCompactionTask{
 		ctx:       ctx1,
 		cancel:    cancel,
 		binlogIO:  binlogIO,
-		Allocator: alloc,
+		allocator: alloc,
 		plan:      plan,
 		tr:        timerecord.NewTimeRecorder("mix compaction"),
 		currentTs: tsoutil.GetCurrentTime(),
@@ -92,6 +93,10 @@ func (t *mixCompactionTask) GetPlanID() typeutil.UniqueID {
 
 func (t *mixCompactionTask) GetChannelName() string {
 	return t.plan.GetChannel()
+}
+
+func (t *mixCompactionTask) GetCompactionType() datapb.CompactionType {
+	return t.plan.GetType()
 }
 
 // return num rows of all segment compaction from
@@ -124,6 +129,7 @@ func (t *mixCompactionTask) merge(
 		syncBatchCount    int   // binlog batch count
 		remainingRowCount int64 // the number of remaining entities
 		expiredRowCount   int64 // the number of expired entities
+		deletedRowCount   int64 = 0
 		unflushedRowCount int64 = 0
 
 		// All binlog meta of a segment
@@ -177,6 +183,7 @@ func (t *mixCompactionTask) merge(
 			}
 			v := iter.Value()
 			if isValueDeleted(v) {
+				deletedRowCount++
 				continue
 			}
 
@@ -196,7 +203,7 @@ func (t *mixCompactionTask) merge(
 
 			if (unflushedRowCount+1)%100 == 0 && writer.FlushAndIsFull() {
 				serWriteStart := time.Now()
-				kvs, partialBinlogs, err := serializeWrite(ctx, t.Allocator, writer)
+				kvs, partialBinlogs, err := serializeWrite(ctx, t.allocator, writer)
 				if err != nil {
 					log.Warn("compact wrong, failed to serialize writer", zap.Error(err))
 					return nil, err
@@ -218,7 +225,7 @@ func (t *mixCompactionTask) merge(
 
 	if !writer.FlushAndIsEmpty() {
 		serWriteStart := time.Now()
-		kvs, partialBinlogs, err := serializeWrite(ctx, t.Allocator, writer)
+		kvs, partialBinlogs, err := serializeWrite(ctx, t.allocator, writer)
 		if err != nil {
 			log.Warn("compact wrong, failed to serialize writer", zap.Error(err))
 			return nil, err
@@ -237,7 +244,7 @@ func (t *mixCompactionTask) merge(
 	}
 
 	serWriteStart := time.Now()
-	sPath, err := statSerializeWrite(ctx, t.binlogIO, t.Allocator, writer, remainingRowCount)
+	sPath, err := statSerializeWrite(ctx, t.binlogIO, t.allocator, writer, remainingRowCount)
 	if err != nil {
 		log.Warn("compact wrong, failed to serialize write segment stats",
 			zap.Int64("remaining row count", remainingRowCount), zap.Error(err))
@@ -257,6 +264,7 @@ func (t *mixCompactionTask) merge(
 
 	log.Info("compact merge end",
 		zap.Int64("remaining row count", remainingRowCount),
+		zap.Int64("deleted row count", deletedRowCount),
 		zap.Int64("expired entities", expiredRowCount),
 		zap.Int("binlog batch count", syncBatchCount),
 		zap.Duration("download binlogs elapse", downloadTimeCost),
@@ -306,12 +314,7 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 
 	log.Info("compact start")
 
-	targetSegID, err := t.AllocOne()
-	if err != nil {
-		log.Warn("compact wrong, unable to allocate segmentID", zap.Error(err))
-		return nil, err
-	}
-
+	targetSegID := t.plan.GetPreAllocatedSegments().GetBegin()
 	previousRowCount := t.getNumRows()
 
 	writer, err := NewSegmentWriter(t.plan.GetSchema(), previousRowCount, targetSegID, partitionID, collectionID)
@@ -388,4 +391,8 @@ func (t *mixCompactionTask) isExpiredEntity(ts typeutil.Timestamp) bool {
 	nowT, _ := tsoutil.ParseTS(now)
 
 	return entityT.Add(time.Duration(t.plan.GetCollectionTtl())).Before(nowT)
+}
+
+func (t *mixCompactionTask) GetSlotUsage() int64 {
+	return t.plan.GetSlotUsage()
 }

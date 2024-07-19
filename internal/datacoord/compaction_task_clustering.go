@@ -35,7 +35,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -49,8 +48,9 @@ type clusteringCompactionTask struct {
 	*datapb.CompactionTask
 	plan   *datapb.CompactionPlan
 	result *datapb.CompactionPlanResult
-	span   trace.Span
 
+	span             trace.Span
+	allocator        allocator
 	meta             CompactionMeta
 	sessions         SessionManager
 	handler          Handler
@@ -75,19 +75,19 @@ func (t *clusteringCompactionTask) Process() bool {
 	currentState := t.State.String()
 	if currentState != lastState {
 		ts := time.Now().UnixMilli()
-		t.updateAndSaveTaskMeta(setRetryTimes(0), setLastStateStartTime(ts))
 		lastStateDuration := ts - t.GetLastStateStartTime()
 		log.Info("clustering compaction task state changed", zap.String("lastState", lastState), zap.String("currentState", currentState), zap.Int64("elapse", lastStateDuration))
 		metrics.DataCoordCompactionLatency.
-			WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetClusteringKeyField().DataType)), datapb.CompactionType_ClusteringCompaction.String(), lastState).
+			WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetClusteringKeyField().DataType)), fmt.Sprint(t.CollectionID), t.Channel, datapb.CompactionType_ClusteringCompaction.String(), lastState).
 			Observe(float64(lastStateDuration))
+		t.updateAndSaveTaskMeta(setRetryTimes(0), setLastStateStartTime(ts))
 
 		if t.State == datapb.CompactionTaskState_completed {
 			t.updateAndSaveTaskMeta(setEndTime(ts))
-			elapse := ts - tsoutil.PhysicalTime(uint64(t.StartTime)).UnixMilli()
+			elapse := ts - t.StartTime
 			log.Info("clustering compaction task total elapse", zap.Int64("elapse", elapse))
 			metrics.DataCoordCompactionLatency.
-				WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetClusteringKeyField().DataType)), datapb.CompactionType_ClusteringCompaction.String(), "total").
+				WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetClusteringKeyField().DataType)), fmt.Sprint(t.CollectionID), t.Channel, datapb.CompactionType_ClusteringCompaction.String(), "total").
 				Observe(float64(elapse))
 		}
 	}
@@ -134,6 +134,10 @@ func (t *clusteringCompactionTask) retryableProcess() error {
 }
 
 func (t *clusteringCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, error) {
+	beginLogID, _, err := t.allocator.allocN(1)
+	if err != nil {
+		return nil, err
+	}
 	plan := &datapb.CompactionPlan{
 		PlanID:             t.GetPlanID(),
 		StartTime:          t.GetStartTime(),
@@ -147,7 +151,13 @@ func (t *clusteringCompactionTask) BuildCompactionRequest() (*datapb.CompactionP
 		MaxSegmentRows:     t.GetMaxSegmentRows(),
 		PreferSegmentRows:  t.GetPreferSegmentRows(),
 		AnalyzeResultPath:  path.Join(t.meta.(*meta).chunkManager.RootPath(), common.AnalyzeStatsPath, metautil.JoinIDPath(t.AnalyzeTaskID, t.AnalyzeVersion)),
-		AnalyzeSegmentIds:  t.GetInputSegments(), // todo: if need
+		AnalyzeSegmentIds:  t.GetInputSegments(),
+		BeginLogID:         beginLogID,
+		PreAllocatedSegments: &datapb.IDRange{
+			Begin: t.GetResultSegments()[0],
+			End:   t.GetResultSegments()[1],
+		},
+		SlotUsage: Params.DataCoordCfg.ClusteringCompactionSlotUsage.GetAsInt64(),
 	}
 	log := log.With(zap.Int64("taskID", t.GetTriggerID()), zap.Int64("planID", plan.GetPlanID()))
 
@@ -334,20 +344,23 @@ func (t *clusteringCompactionTask) processAnalyzing() error {
 }
 
 func (t *clusteringCompactionTask) resetSegmentCompacting() {
-	var segmentIDs []UniqueID
-	for _, binLogs := range t.GetPlan().GetSegmentBinlogs() {
-		segmentIDs = append(segmentIDs, binLogs.GetSegmentID())
-	}
-	t.meta.SetSegmentsCompacting(segmentIDs, false)
+	t.meta.SetSegmentsCompacting(t.GetInputSegments(), false)
 }
 
 func (t *clusteringCompactionTask) processFailedOrTimeout() error {
 	log.Info("clean task", zap.Int64("triggerID", t.GetTriggerID()), zap.Int64("planID", t.GetPlanID()), zap.String("state", t.GetState().String()))
-	// revert segment level
+	// revert segments meta
 	var operators []UpdateOperator
+	// revert level of input segments
+	// L1 : L1 ->(processPipelining)-> L2 ->(processFailedOrTimeout)-> L1
+	// L2 : L2 ->(processPipelining)-> L2 ->(processFailedOrTimeout)-> L2
 	for _, segID := range t.InputSegments {
 		operators = append(operators, RevertSegmentLevelOperator(segID))
-		operators = append(operators, RevertSegmentPartitionStatsVersionOperator(segID))
+	}
+	// if result segments are generated but task fail in the other steps, mark them as L1 segments without partitions stats
+	for _, segID := range t.ResultSegments {
+		operators = append(operators, UpdateSegmentLevelOperator(segID, datapb.SegmentLevel_L1))
+		operators = append(operators, UpdateSegmentPartitionStatsVersionOperator(segID, 0))
 	}
 	err := t.meta.UpdateSegmentsInfo(operators...)
 	if err != nil {
@@ -367,7 +380,6 @@ func (t *clusteringCompactionTask) processFailedOrTimeout() error {
 	err = t.meta.CleanPartitionStatsInfo(partitionStatsInfo)
 	if err != nil {
 		log.Warn("gcPartitionStatsInfo fail", zap.Error(err))
-		return merr.WrapErrClusteringCompactionMetaError("CleanPartitionStatsInfo", err)
 	}
 
 	t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_cleaned))
@@ -405,8 +417,10 @@ func (t *clusteringCompactionTask) doAnalyze() error {
 func (t *clusteringCompactionTask) doCompact() error {
 	log := log.With(zap.Int64("planID", t.GetPlanID()), zap.String("type", t.GetType().String()))
 	if t.NeedReAssignNodeID() {
-		return errors.New("not assign nodeID")
+		log.RatedWarn(10, "not assign nodeID")
+		return nil
 	}
+	log = log.With(zap.Int64("nodeID", t.GetNodeID()))
 
 	// todo refine this logic: GetCompactionPlanResult return a fail result when this is no compaction in datanode which is weird
 	// check whether the compaction plan is already submitted considering
@@ -435,6 +449,11 @@ func (t *clusteringCompactionTask) doCompact() error {
 	}
 	err = t.sessions.Compaction(context.Background(), t.GetNodeID(), t.GetPlan())
 	if err != nil {
+		if errors.Is(err, merr.ErrDataNodeSlotExhausted) {
+			log.Warn("fail to notify compaction tasks to DataNode because the node slots exhausted")
+			t.updateAndSaveTaskMeta(setNodeID(NullNodeID))
+			return nil
+		}
 		log.Warn("Failed to notify compaction tasks to DataNode", zap.Error(err))
 		t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
 		return err
@@ -469,6 +488,7 @@ func (t *clusteringCompactionTask) ShadowClone(opts ...compactionTaskOpt) *datap
 		PreferSegmentRows:  t.GetPreferSegmentRows(),
 		AnalyzeTaskID:      t.GetAnalyzeTaskID(),
 		AnalyzeVersion:     t.GetAnalyzeVersion(),
+		LastStateStartTime: t.GetLastStateStartTime(),
 	}
 	for _, opt := range opts {
 		opt(taskClone)
@@ -556,7 +576,7 @@ func (t *clusteringCompactionTask) GetLabel() string {
 }
 
 func (t *clusteringCompactionTask) NeedReAssignNodeID() bool {
-	return t.GetState() == datapb.CompactionTaskState_pipelining && t.GetNodeID() == 0
+	return t.GetState() == datapb.CompactionTaskState_pipelining && (t.GetNodeID() == 0 || t.GetNodeID() == NullNodeID)
 }
 
 func (t *clusteringCompactionTask) CleanLogPath() {

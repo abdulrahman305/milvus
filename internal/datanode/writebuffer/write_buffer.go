@@ -157,11 +157,13 @@ func newWriteBufferBase(channel string, metacache metacache.MetaCache, storageV2
 	if params.Params.CommonCfg.EnableStorageV2.GetAsBool() {
 		serializer, err = syncmgr.NewStorageV2Serializer(
 			storageV2Cache,
+			option.idAllocator,
 			metacache,
 			option.metaWriter,
 		)
 	} else {
 		serializer, err = syncmgr.NewStorageSerializer(
+			option.idAllocator,
 			metacache,
 			option.metaWriter,
 		)
@@ -595,7 +597,7 @@ func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (sy
 	actions := []metacache.SegmentAction{}
 
 	for _, chunk := range insert {
-		batchSize = int64(chunk.GetRowNum())
+		batchSize += int64(chunk.GetRowNum())
 		totalMemSize += float64(chunk.GetMemorySize())
 	}
 

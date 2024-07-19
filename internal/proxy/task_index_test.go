@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -36,6 +38,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/config"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
@@ -47,6 +50,11 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func sortKeyValuePairs(pairs []*commonpb.KeyValuePair) {
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].Key > pairs[j].Key
+	})
+}
 func TestGetIndexStateTask_Execute(t *testing.T) {
 	dbName := funcutil.GenRandomStr()
 	collectionName := funcutil.GenRandomStr()
@@ -577,7 +585,7 @@ func Test_parseIndexParams(t *testing.T) {
 				ExtraParams: []*commonpb.KeyValuePair{
 					{
 						Key:   common.IndexTypeKey,
-						Value: DefaultStringIndexType,
+						Value: indexparamcheck.IndexINVERTED,
 					},
 				},
 				IndexName: "",
@@ -608,7 +616,9 @@ func Test_parseIndexParams(t *testing.T) {
 		}
 		err := cit.parseIndexParams()
 		assert.NoError(t, err)
-		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: DefaultStringIndexType}})
+		sortKeyValuePairs(cit.newIndexParams)
+		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: indexparamcheck.IndexHybrid},
+			{Key: common.BitmapCardinalityLimitKey, Value: strconv.Itoa(paramtable.DefaultBitmapIndexCardinalityBound)}})
 	})
 
 	t.Run("create index on Arithmetic field", func(t *testing.T) {
@@ -648,7 +658,9 @@ func Test_parseIndexParams(t *testing.T) {
 		}
 		err := cit.parseIndexParams()
 		assert.NoError(t, err)
-		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: DefaultArithmeticIndexType}})
+		sortKeyValuePairs(cit.newIndexParams)
+		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: indexparamcheck.IndexHybrid},
+			{Key: common.BitmapCardinalityLimitKey, Value: strconv.Itoa(paramtable.DefaultBitmapIndexCardinalityBound)}})
 	})
 
 	// Compatible with the old version <= 2.3.0
@@ -873,7 +885,9 @@ func Test_parseIndexParams(t *testing.T) {
 
 		err = cit.parseIndexParams()
 		assert.NoError(t, err)
-		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: DefaultArithmeticIndexType}})
+		sortKeyValuePairs(cit.newIndexParams)
+		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: indexparamcheck.IndexHybrid},
+			{Key: common.BitmapCardinalityLimitKey, Value: strconv.Itoa(paramtable.DefaultBitmapIndexCardinalityBound)}})
 	})
 
 	t.Run("create auto index on numeric field", func(t *testing.T) {
@@ -899,7 +913,9 @@ func Test_parseIndexParams(t *testing.T) {
 
 		err := cit.parseIndexParams()
 		assert.NoError(t, err)
-		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: DefaultArithmeticIndexType}})
+		sortKeyValuePairs(cit.newIndexParams)
+		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: indexparamcheck.IndexHybrid},
+			{Key: common.BitmapCardinalityLimitKey, Value: strconv.Itoa(paramtable.DefaultBitmapIndexCardinalityBound)}})
 	})
 
 	t.Run("create auto index on varchar field", func(t *testing.T) {
@@ -925,7 +941,9 @@ func Test_parseIndexParams(t *testing.T) {
 
 		err := cit.parseIndexParams()
 		assert.NoError(t, err)
-		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: DefaultStringIndexType}})
+		sortKeyValuePairs(cit.newIndexParams)
+		assert.Equal(t, cit.newIndexParams, []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: indexparamcheck.IndexHybrid},
+			{Key: common.BitmapCardinalityLimitKey, Value: strconv.Itoa(paramtable.DefaultBitmapIndexCardinalityBound)}})
 	})
 
 	t.Run("create auto index on json field", func(t *testing.T) {
@@ -1006,6 +1024,7 @@ func Test_parseIndexParams_AutoIndex_WithType(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.True(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: "HNSW"},
 			{Key: common.MetricTypeKey, Value: "L2"},
@@ -1026,6 +1045,7 @@ func Test_parseIndexParams_AutoIndex_WithType(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.True(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: "SPARSE_INVERTED_INDEX"},
 			{Key: common.MetricTypeKey, Value: "IP"},
@@ -1044,6 +1064,7 @@ func Test_parseIndexParams_AutoIndex_WithType(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.True(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: "BIN_IVF_FLAT"},
 			{Key: common.MetricTypeKey, Value: "JACCARD"},
@@ -1093,6 +1114,7 @@ func Test_parseIndexParams_AutoIndex(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.False(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: AutoIndexName},
 			{Key: common.MetricTypeKey, Value: autoIndexConfigBinary[common.MetricTypeKey]},
@@ -1108,6 +1130,7 @@ func Test_parseIndexParams_AutoIndex(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.False(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: AutoIndexName},
 			{Key: common.MetricTypeKey, Value: autoIndexConfigSparse[common.MetricTypeKey]},
@@ -1123,6 +1146,7 @@ func Test_parseIndexParams_AutoIndex(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.False(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: AutoIndexName},
 			{Key: common.MetricTypeKey, Value: autoIndexConfig[common.MetricTypeKey]},
@@ -1140,6 +1164,7 @@ func Test_parseIndexParams_AutoIndex(t *testing.T) {
 		}
 		err := task.parseIndexParams()
 		assert.NoError(t, err)
+		assert.True(t, task.userAutoIndexMetricTypeSpecified)
 		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
 			{Key: common.IndexTypeKey, Value: AutoIndexName},
 			{Key: common.MetricTypeKey, Value: "L2"},

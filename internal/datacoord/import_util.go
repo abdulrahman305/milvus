@@ -195,13 +195,19 @@ func AssembleImportRequest(task ImportTask, job ImportJob, meta *meta, alloc all
 	if err != nil {
 		return nil, err
 	}
+
 	totalRows := lo.SumBy(task.GetFileStats(), func(stat *datapb.ImportFileStats) int64 {
 		return stat.GetTotalRows()
 	})
-	idBegin, idEnd, err := alloc.allocN(totalRows)
+
+	// Allocated IDs are used for rowID and the BEGINNING of the logID.
+	allocNum := totalRows + 1
+
+	idBegin, idEnd, err := alloc.allocN(allocNum)
 	if err != nil {
 		return nil, err
 	}
+
 	importFiles := lo.Map(task.GetFileStats(), func(fileStat *datapb.ImportFileStats, _ int) *internalpb.ImportFile {
 		return fileStat.GetImportFile()
 	})
@@ -215,7 +221,7 @@ func AssembleImportRequest(task ImportTask, job ImportJob, meta *meta, alloc all
 		Files:           importFiles,
 		Options:         job.GetOptions(),
 		Ts:              ts,
-		AutoIDRange:     &datapb.AutoIDRange{Begin: idBegin, End: idEnd},
+		IDRange:         &datapb.IDRange{Begin: idBegin, End: idEnd},
 		RequestSegments: requestSegments,
 	}, nil
 }
@@ -278,7 +284,8 @@ func CheckDiskQuota(job ImportJob, meta *meta, imeta ImportMeta) (int64, error) 
 	}
 
 	err := merr.WrapErrServiceQuotaExceeded("disk quota exceeded, please allocate more resources")
-	totalUsage, collectionsUsage, _ := meta.GetCollectionBinlogSize()
+	quotaInfo := meta.GetQuotaInfo()
+	totalUsage, collectionsUsage := quotaInfo.TotalBinlogSize, quotaInfo.CollectionBinlogSize
 
 	tasks := imeta.GetTaskBy(WithJob(job.GetJobID()), WithType(PreImportTaskType))
 	files := make([]*datapb.ImportFileStats, 0)

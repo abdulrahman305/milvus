@@ -26,9 +26,9 @@ set(MILVUS_QUERY_SRCS
         SearchOnIndex.cpp
         SearchBruteForce.cpp
         SubSearchResult.cpp
-        GroupByOperator.cpp
+        groupby/SearchGroupByOperator.cpp
         PlanProto.cpp
         )
 add_library(milvus_query ${MILVUS_QUERY_SRCS})
 
-target_link_libraries(milvus_query milvus_index milvus_bitset)
+target_link_libraries(milvus_query milvus_index milvus_bitset milvus_monitor)
