@@ -2592,7 +2592,7 @@ func (node *Proxy) Insert(ctx context.Context, request *milvuspb.InsertRequest) 
 	dbName := request.DbName
 	collectionName := request.CollectionName
 
-	v := Extension.Report(map[string]any{
+	v := hookutil.GetExtension().Report(map[string]any{
 		hookutil.OpTypeKey:          hookutil.OpTypeInsert,
 		hookutil.DatabaseKey:        dbName,
 		hookutil.UsernameKey:        username,
@@ -2696,7 +2696,7 @@ func (node *Proxy) Delete(ctx context.Context, request *milvuspb.DeleteRequest) 
 
 	username := GetCurUserFromContextOrDefault(ctx)
 	collectionName := request.CollectionName
-	v := Extension.Report(map[string]any{
+	v := hookutil.GetExtension().Report(map[string]any{
 		hookutil.OpTypeKey:     hookutil.OpTypeDelete,
 		hookutil.DatabaseKey:   dbName,
 		hookutil.UsernameKey:   username,
@@ -2829,7 +2829,7 @@ func (node *Proxy) Upsert(ctx context.Context, request *milvuspb.UpsertRequest) 
 	nodeID := paramtable.GetStringNodeID()
 	dbName := request.DbName
 	collectionName := request.CollectionName
-	v := Extension.Report(map[string]any{
+	v := hookutil.GetExtension().Report(map[string]any{
 		hookutil.OpTypeKey:          hookutil.OpTypeUpsert,
 		hookutil.DatabaseKey:        request.DbName,
 		hookutil.UsernameKey:        username,
@@ -3072,7 +3072,7 @@ func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest) 
 	if qt.result != nil {
 		username := GetCurUserFromContextOrDefault(ctx)
 		sentSize := proto.Size(qt.result)
-		v := Extension.Report(map[string]any{
+		v := hookutil.GetExtension().Report(map[string]any{
 			hookutil.OpTypeKey:          hookutil.OpTypeSearch,
 			hookutil.DatabaseKey:        dbName,
 			hookutil.UsernameKey:        username,
@@ -3269,7 +3269,7 @@ func (node *Proxy) hybridSearch(ctx context.Context, request *milvuspb.HybridSea
 	if qt.result != nil {
 		sentSize := proto.Size(qt.result)
 		username := GetCurUserFromContextOrDefault(ctx)
-		v := Extension.Report(map[string]any{
+		v := hookutil.GetExtension().Report(map[string]any{
 			hookutil.OpTypeKey:          hookutil.OpTypeHybridSearch,
 			hookutil.DatabaseKey:        dbName,
 			hookutil.UsernameKey:        username,
@@ -3595,7 +3595,7 @@ func (node *Proxy) Query(ctx context.Context, request *milvuspb.QueryRequest) (*
 
 	username := GetCurUserFromContextOrDefault(ctx)
 	nodeID := paramtable.GetStringNodeID()
-	v := Extension.Report(map[string]any{
+	v := hookutil.GetExtension().Report(map[string]any{
 		hookutil.OpTypeKey:          hookutil.OpTypeQuery,
 		hookutil.DatabaseKey:        request.DbName,
 		hookutil.UsernameKey:        username,
@@ -3998,11 +3998,8 @@ func (node *Proxy) FlushAll(ctx context.Context, req *milvuspb.FlushAllRequest) 
 					DbName:          dbName,
 					CollectionNames: []string{collection},
 				})
-				if err != nil {
+				if err = merr.CheckRPCCall(flushRsp, err); err != nil {
 					return err
-				}
-				if flushRsp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-					return merr.Error(flushRsp.GetStatus())
 				}
 				return nil
 			})
@@ -4113,6 +4110,7 @@ func (node *Proxy) GetPersistentSegmentInfo(ctx context.Context, req *milvuspb.G
 			PartitionID:  info.PartitionID,
 			NumRows:      info.NumOfRows,
 			State:        info.State,
+			Level:        commonpb.SegmentLevel(info.Level),
 		}
 	}
 	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method,
@@ -4185,6 +4183,7 @@ func (node *Proxy) GetQuerySegmentInfo(ctx context.Context, req *milvuspb.GetQue
 			IndexID:      info.IndexID,
 			State:        info.SegmentState,
 			NodeIds:      info.NodeIds,
+			Level:        commonpb.SegmentLevel(info.Level),
 		}
 	}
 

@@ -111,6 +111,8 @@ func (cit *createIndexTask) OnEnqueue() error {
 	if cit.req.Base == nil {
 		cit.req.Base = commonpbutil.NewMsgBase()
 	}
+	cit.req.Base.MsgType = commonpb.MsgType_CreateIndex
+	cit.req.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
@@ -438,8 +440,6 @@ func checkTrain(field *schemapb.FieldSchema, indexParams map[string]string) erro
 }
 
 func (cit *createIndexTask) PreExecute(ctx context.Context) error {
-	cit.req.Base.MsgType = commonpb.MsgType_CreateIndex
-	cit.req.Base.SourceID = paramtable.GetNodeID()
 
 	collName := cit.req.GetCollectionName()
 
@@ -487,11 +487,8 @@ func (cit *createIndexTask) Execute(ctx context.Context) error {
 		UserAutoindexMetricTypeSpecified: cit.userAutoIndexMetricTypeSpecified,
 	}
 	cit.result, err = cit.datacoord.CreateIndex(ctx, req)
-	if err != nil {
+	if err = merr.CheckRPCCall(cit.result, err); err != nil {
 		return err
-	}
-	if cit.result.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(cit.result.Reason)
 	}
 	SendReplicateMessagePack(ctx, cit.replicateMsgStream, cit.req)
 	return nil
@@ -551,12 +548,12 @@ func (t *alterIndexTask) OnEnqueue() error {
 	if t.req.Base == nil {
 		t.req.Base = commonpbutil.NewMsgBase()
 	}
+	t.req.Base.MsgType = commonpb.MsgType_AlterIndex
+	t.req.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (t *alterIndexTask) PreExecute(ctx context.Context) error {
-	t.req.Base.MsgType = commonpb.MsgType_AlterIndex
-	t.req.Base.SourceID = paramtable.GetNodeID()
 
 	for _, param := range t.req.GetExtraParams() {
 		if !indexparams.IsConfigableIndexParam(param.GetKey()) {
@@ -607,11 +604,8 @@ func (t *alterIndexTask) Execute(ctx context.Context) error {
 		Params:       t.req.GetExtraParams(),
 	}
 	t.result, err = t.datacoord.AlterIndex(ctx, req)
-	if err != nil {
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
-	}
-	if t.result.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(t.result.Reason)
 	}
 	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.req)
 	return nil
@@ -666,12 +660,12 @@ func (dit *describeIndexTask) SetTs(ts Timestamp) {
 
 func (dit *describeIndexTask) OnEnqueue() error {
 	dit.Base = commonpbutil.NewMsgBase()
+	dit.Base.MsgType = commonpb.MsgType_DescribeIndex
+	dit.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (dit *describeIndexTask) PreExecute(ctx context.Context) error {
-	dit.Base.MsgType = commonpb.MsgType_DescribeIndex
-	dit.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(dit.CollectionName); err != nil {
 		return err
@@ -791,12 +785,12 @@ func (dit *getIndexStatisticsTask) SetTs(ts Timestamp) {
 
 func (dit *getIndexStatisticsTask) OnEnqueue() error {
 	dit.Base = commonpbutil.NewMsgBase()
+	dit.Base.MsgType = commonpb.MsgType_GetIndexStatistics
+	dit.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (dit *getIndexStatisticsTask) PreExecute(ctx context.Context) error {
-	dit.Base.MsgType = commonpb.MsgType_GetIndexStatistics
-	dit.Base.SourceID = dit.nodeID
 
 	if err := validateCollectionName(dit.CollectionName); err != nil {
 		return err
@@ -825,14 +819,11 @@ func (dit *getIndexStatisticsTask) Execute(ctx context.Context) error {
 	resp, err := dit.datacoord.GetIndexStatistics(ctx, &indexpb.GetIndexStatisticsRequest{
 		CollectionID: dit.collectionID, IndexName: dit.IndexName,
 	})
-	if err != nil || resp == nil {
+	if err := merr.CheckRPCCall(resp, err); err != nil {
 		return err
 	}
 	dit.result = &milvuspb.GetIndexStatisticsResponse{}
 	dit.result.Status = resp.GetStatus()
-	if dit.result.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		return merr.Error(dit.result.GetStatus())
-	}
 	for _, indexInfo := range resp.IndexInfos {
 		field, err := schemaHelper.GetFieldFromID(indexInfo.FieldID)
 		if err != nil {
@@ -912,12 +903,12 @@ func (dit *dropIndexTask) OnEnqueue() error {
 	if dit.Base == nil {
 		dit.Base = commonpbutil.NewMsgBase()
 	}
+	dit.Base.MsgType = commonpb.MsgType_DropIndex
+	dit.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
-	dit.Base.MsgType = commonpb.MsgType_DropIndex
-	dit.Base.SourceID = paramtable.GetNodeID()
 
 	collName, fieldName := dit.CollectionName, dit.FieldName
 
@@ -964,15 +955,9 @@ func (dit *dropIndexTask) Execute(ctx context.Context) error {
 		IndexName:    dit.IndexName,
 		DropAll:      false,
 	})
-	if err != nil {
+	if err = merr.CheckRPCCall(dit.result, err); err != nil {
 		ctxLog.Warn("drop index failed", zap.Error(err))
 		return err
-	}
-	if dit.result == nil {
-		return errors.New("drop index resp is nil")
-	}
-	if dit.result.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(dit.result.Reason)
 	}
 	SendReplicateMessagePack(ctx, dit.replicateMsgStream, dit.DropIndexRequest)
 	return nil
@@ -1029,12 +1014,12 @@ func (gibpt *getIndexBuildProgressTask) SetTs(ts Timestamp) {
 
 func (gibpt *getIndexBuildProgressTask) OnEnqueue() error {
 	gibpt.Base = commonpbutil.NewMsgBase()
+	gibpt.Base.MsgType = commonpb.MsgType_GetIndexBuildProgress
+	gibpt.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (gibpt *getIndexBuildProgressTask) PreExecute(ctx context.Context) error {
-	gibpt.Base.MsgType = commonpb.MsgType_GetIndexBuildProgress
-	gibpt.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(gibpt.CollectionName); err != nil {
 		return err
@@ -1055,7 +1040,7 @@ func (gibpt *getIndexBuildProgressTask) Execute(ctx context.Context) error {
 		CollectionID: collectionID,
 		IndexName:    gibpt.IndexName,
 	})
-	if err != nil {
+	if err = merr.CheckRPCCall(resp, err); err != nil {
 		return err
 	}
 
@@ -1119,12 +1104,12 @@ func (gist *getIndexStateTask) SetTs(ts Timestamp) {
 
 func (gist *getIndexStateTask) OnEnqueue() error {
 	gist.Base = commonpbutil.NewMsgBase()
+	gist.Base.MsgType = commonpb.MsgType_GetIndexState
+	gist.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (gist *getIndexStateTask) PreExecute(ctx context.Context) error {
-	gist.Base.MsgType = commonpb.MsgType_GetIndexState
-	gist.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(gist.CollectionName); err != nil {
 		return err
@@ -1143,7 +1128,7 @@ func (gist *getIndexStateTask) Execute(ctx context.Context) error {
 		CollectionID: collectionID,
 		IndexName:    gist.IndexName,
 	})
-	if err != nil {
+	if err = merr.CheckRPCCall(state, err); err != nil {
 		return err
 	}
 
