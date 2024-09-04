@@ -40,7 +40,8 @@
 namespace milvus::index {
 
 StringIndexMarisa::StringIndexMarisa(
-    const storage::FileManagerContext& file_manager_context) {
+    const storage::FileManagerContext& file_manager_context)
+    : StringIndex(MARISA_TRIE) {
     if (file_manager_context.Valid()) {
         file_manager_ =
             std::make_shared<storage::MemFileManagerImpl>(file_manager_context);
@@ -99,7 +100,7 @@ StringIndexMarisa::BuildWithFieldData(
     for (const auto& data : field_datas) {
         auto slice_num = data->get_num_rows();
         for (int64_t i = 0; i < slice_num; ++i) {
-            if (data->is_valid(offset)) {
+            if (data->is_valid(i)) {
                 auto str_id =
                     lookup(*static_cast<const std::string*>(data->RawValue(i)));
                 AssertInfo(valid_str_id(str_id), "invalid marisa key");
@@ -201,7 +202,7 @@ StringIndexMarisa::LoadWithoutAssemble(const BinarySet& set,
     }
 
     file.Seek(0, SEEK_SET);
-    if (config.contains(kEnableMmap)) {
+    if (config.contains(ENABLE_MMAP)) {
         trie_.mmap(file_name.c_str());
     } else {
         trie_.read(file.Descriptor());

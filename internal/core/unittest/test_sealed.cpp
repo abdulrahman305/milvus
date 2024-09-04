@@ -1715,7 +1715,7 @@ TEST(Sealed, WarmupChunkCache) {
     auto has = segment->HasRawData(vec_info.field_id);
     EXPECT_FALSE(has);
 
-    segment_sealed->WarmupChunkCache(FieldId(vec_info.field_id));
+    segment_sealed->WarmupChunkCache(FieldId(vec_info.field_id), true);
 
     auto ids_ds = GenRandomIds(N);
     auto result =
@@ -2015,12 +2015,12 @@ TEST(Sealed, SkipIndexSkipUnaryRangeNullable) {
 
     //test for int64
     std::vector<int64_t> int64s = {1, 2, 3, 4, 5};
-    uint8_t* valid_data = new uint8_t[1]{0x03};
+    std::array<uint8_t, 1> valid_data = {0x03};
     FixedVector<bool> valid_data_ = {true, true, false, false, false};
     auto int64s_field_data =
         storage::CreateFieldData(DataType::INT64, true, 1, 5);
 
-    int64s_field_data->FillFieldData(int64s.data(), valid_data, 5);
+    int64s_field_data->FillFieldData(int64s.data(), valid_data.data(), 5);
     segment->LoadPrimitiveSkipIndex(i64_fid,
                                     0,
                                     DataType::INT64,
@@ -2084,12 +2084,12 @@ TEST(Sealed, SkipIndexSkipBinaryRangeNullable) {
 
     //test for int64
     std::vector<int64_t> int64s = {1, 2, 3, 4, 5};
-    uint8_t* valid_data = new uint8_t[1]{0x03};
+    std::array<uint8_t, 1> valid_data = {0x03};
     FixedVector<bool> valid_data_ = {true, true, false, false, false};
     auto int64s_field_data =
         storage::CreateFieldData(DataType::INT64, true, 1, 5);
 
-    int64s_field_data->FillFieldData(int64s.data(), valid_data, 5);
+    int64s_field_data->FillFieldData(int64s.data(), valid_data.data(), 5);
     segment->LoadPrimitiveSkipIndex(i64_fid,
                                     0,
                                     DataType::INT64,
