@@ -72,7 +72,6 @@ type CompactionMeta interface {
 	GetAnalyzeMeta() *analyzeMeta
 	GetPartitionStatsMeta() *partitionStatsMeta
 	GetCompactionTaskMeta() *compactionTaskMeta
-	GetStatsTaskMeta() *statsTaskMeta
 }
 
 var _ CompactionMeta = (*meta)(nil)
@@ -107,10 +106,6 @@ func (m *meta) GetPartitionStatsMeta() *partitionStatsMeta {
 
 func (m *meta) GetCompactionTaskMeta() *compactionTaskMeta {
 	return m.compactionTaskMeta
-}
-
-func (m *meta) GetStatsTaskMeta() *statsTaskMeta {
-	return m.statsTaskMeta
 }
 
 type channelCPs struct {
@@ -447,11 +442,19 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 
 	metrics.DataCoordNumStoredRows.Reset()
 	for collectionID, statesRows := range collectionRowsNum {
-		for state, rows := range statesRows {
-			coll, ok := m.collections[collectionID]
-			if ok {
+		coll, ok := m.collections[collectionID]
+		if ok {
+			for state, rows := range statesRows {
 				metrics.DataCoordNumStoredRows.WithLabelValues(coll.DatabaseName, fmt.Sprint(collectionID), state.String()).Set(float64(rows))
 			}
+		}
+	}
+
+	metrics.DataCoordL0DeleteEntriesNum.Reset()
+	for collectionID, entriesNum := range collectionL0RowCounts {
+		coll, ok := m.collections[collectionID]
+		if ok {
+			metrics.DataCoordL0DeleteEntriesNum.WithLabelValues(coll.DatabaseName, fmt.Sprint(collectionID)).Set(float64(entriesNum))
 		}
 	}
 
@@ -463,11 +466,13 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	return info
 }
 
-// GetCollectionIndexFilesSize returns the total index files size of all segment for each collection.
-func (m *meta) GetCollectionIndexFilesSize() uint64 {
+// SetStoredIndexFileSizeMetric returns the total index files size of all segment for each collection.
+func (m *meta) SetStoredIndexFileSizeMetric() uint64 {
 	m.RLock()
 	defer m.RUnlock()
 	var total uint64
+
+	metrics.DataCoordStoredIndexFilesSize.Reset()
 	for _, segmentIdx := range m.indexMeta.GetAllSegIndexes() {
 		coll, ok := m.collections[segmentIdx.CollectionID]
 		if ok {

@@ -439,6 +439,7 @@ message TextIndexStats {
   repeated string files = 3;
   int64 log_size = 4;
   int64 memory_size = 5;
+  int64 buildID = 6;
 }
 
 message Binlog {
@@ -904,6 +905,7 @@ message ImportTaskV2 {
   string reason = 7;
   string complete_time = 8;
   repeated ImportFileStats file_stats = 9;
+  repeated int64 stats_segmentIDs = 10;
 }
 
 enum GcCommand {

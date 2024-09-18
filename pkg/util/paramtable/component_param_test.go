@@ -454,6 +454,8 @@ func TestComponentParam(t *testing.T) {
 
 		assert.Equal(t, 4, Params.BloomFilterApplyParallelFactor.GetAsInt())
 		assert.Equal(t, "/var/lib/milvus/data/mmap", Params.MmapDirPath.GetValue())
+
+		assert.Equal(t, true, Params.MmapChunkCache.GetAsBool())
 	})
 
 	t.Run("test dataCoordConfig", func(t *testing.T) {
@@ -656,4 +658,12 @@ func TestCachedParam(t *testing.T) {
 	assert.Equal(t, float64(256*1024*1024), params.QuotaConfig.DiskQuota.GetAsFloat())
 	assert.Equal(t, float64(256*1024*1024), params.QuotaConfig.DiskQuotaPerCollection.GetAsFloat())
 	params.Save(params.QuotaConfig.DiskQuota.Key, "192")
+}
+
+func TestFallbackParam(t *testing.T) {
+	Init()
+	params := Get()
+	params.Save("common.chanNamePrefix.cluster", "foo")
+
+	assert.Equal(t, "foo", params.CommonCfg.ClusterPrefix.GetValue())
 }

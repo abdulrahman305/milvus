@@ -412,7 +412,11 @@ queryNode:
     vectorIndex: false # Enable mmap for loading vector index
     scalarField: false # Enable mmap for loading scalar data
     scalarIndex: false # Enable mmap for loading scalar index
-    growingMmapEnabled: false # Enable mmap for using in growing raw data
+    chunkCache: true # Enable mmap for chunk cache (raw vector retrieving).
+    # Enable memory mapping (mmap) to optimize the handling of growing raw data. 
+    # By activating this feature, the memory overhead associated with newly added or modified data will be significantly minimized. 
+    # However, this optimization may come at the cost of a slight decrease in query latency for the affected data segments.
+    growingMmapEnabled: false
     fixedFileSizeForMmapAlloc: 1 # tmp file size for mmap chunk manager
     maxDiskUsagePercentageForMmapAlloc: 50 # disk percentage used in mmap chunk manager
   lazyload:
@@ -422,6 +426,7 @@ queryNode:
     requestResourceRetryInterval: 2000 # retry interval in milliseconds for waiting request resource for lazy load, 2s by default
     maxRetryTimes: 1 # max retry times for lazy load, 1 by default
     maxEvictPerRetry: 1 # max evict count for lazy load, 1 by default
+  indexOffsetCacheEnabled: false # enable index offset cache for some scalar indexes, now is just for bitmap index, enable this param can improve performance for retrieving raw data from index
   grouping:
     enabled: true
     maxNQ: 1000
@@ -449,12 +454,14 @@ queryNode:
       taskQueueExpire: 60 # Control how long (many seconds) that queue retains since queue is empty
       enableCrossUserGrouping: false # Enable Cross user grouping when using user-task-polling policy. (Disable it if user's task can not merge each other)
       maxPendingTaskPerUser: 1024 # Max pending task per user in scheduler
+  levelZeroForwardPolicy: FilterByBF # delegator level zero deletion forward policy, possible option["FilterByBF", "RemoteLoad"]
   dataSync:
     flowGraph:
       maxQueueLength: 16 # The maximum size of task queue cache in flow graph in query node.
       maxParallelism: 1024 # Maximum number of tasks executed in parallel in the flowgraph
   enableSegmentPrune: false # use partition stats to prune data in search/query on shard delegator
-  queryStreamBatchSize: 4194304 # return batch size of stream query
+  queryStreamBatchSize: 4194304 # return min batch size of stream query
+  queryStreamMaxBatchSize: 134217728 # return max batch size of stream query
   bloomFilterApplyParallelFactor: 4 # parallel factor when to apply pk to bloom filter, default to 4*CPU_CORE_NUM
   workerPooling:
     size: 10 # the size for worker querynode client pool
@@ -763,7 +770,6 @@ common:
     BeamWidthRatio: 4
   gracefulTime: 5000 # milliseconds. it represents the interval (in ms) by which the request arrival time needs to be subtracted in the case of Bounded Consistency.
   gracefulStopTimeout: 1800 # seconds. it will force quit the server if the graceful stop process is not completed during this time.
-  bitmapIndexCardinalityBound: 500
   storageType: remote # please adjust in embedded Milvus: local, available values are [local, remote, opendal], value minio is deprecated, use remote instead
   # Default value: auto
   # Valid values: [auto, avx512, avx2, avx, sse4_2]
@@ -826,6 +832,7 @@ quotaAndLimits:
     maxCollectionNumPerDB: 65536 # Maximum number of collections per database.
     maxInsertSize: -1 # maximum size of a single insert request, in bytes, -1 means no limit
     maxResourceGroupNumOfQueryNode: 1024 # maximum number of resource groups of query nodes
+    maxGroupSize: 10 # maximum size for one single group when doing search group by
   ddl:
     enabled: false # Whether DDL request throttling is enabled.
     # Maximum number of collection-related DDL requests per second.
@@ -977,8 +984,16 @@ quotaAndLimits:
       diskQuotaPerPartition: -1 # MB, (0, +inf), default no limit
     l0SegmentsRowCountProtection:
       enabled: false # switch to enable l0 segment row count quota
-      lowWaterLevel: 32768 # l0 segment row count quota, low water level
-      highWaterLevel: 65536 # l0 segment row count quota, low water level
+      lowWaterLevel: 30000000 # l0 segment row count quota, low water level
+      highWaterLevel: 50000000 # l0 segment row count quota, high water level
+    deleteBufferRowCountProtection:
+      enabled: false # switch to enable delete buffer row count quota
+      lowWaterLevel: 32768 # delete buffer row count quota, low water level
+      highWaterLevel: 65536 # delete buffer row count quota, high water level
+    deleteBufferSizeProtection:
+      enabled: false # switch to enable delete buffer size quota
+      lowWaterLevel: 134217728 # delete buffer size quota, low water level
+      highWaterLevel: 268435456 # delete buffer size quota, high water level
   limitReading:
     # forceDeny false means dql requests are allowed (except for some
     # specific conditions, such as collection has been dropped), true means always reject all dql requests.

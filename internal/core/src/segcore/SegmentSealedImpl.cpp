@@ -21,8 +21,10 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <boost/pointer_cast.hpp>
 
 #include "Utils.h"
 #include "Types.h"
@@ -152,9 +154,13 @@ SegmentSealedImpl::WarmupChunkCache(const FieldId field_id, bool mmap_enabled) {
     auto field_info = it->second;
 
     auto cc = storage::MmapManager::GetInstance().GetChunkCache();
+    bool mmap_rss_not_need = true;
     for (const auto& data_path : field_info.insert_files) {
-        auto column =
-            cc->Read(data_path, mmap_descriptor_, field_meta, mmap_enabled);
+        auto column = cc->Read(data_path,
+                               mmap_descriptor_,
+                               field_meta,
+                               mmap_enabled,
+                               mmap_rss_not_need);
     }
 }
 
@@ -601,8 +607,38 @@ SegmentSealedImpl::LoadDeletedRecord(const LoadDeletedRecordInfo& info) {
     ParsePksFromIDs(pks, field_meta.get_data_type(), *info.primary_keys);
     auto timestamps = reinterpret_cast<const Timestamp*>(info.timestamps);
 
-    // step 2: fill pks and timestamps
-    deleted_record_.push(pks, timestamps);
+    std::vector<std::tuple<Timestamp, PkType>> ordering(size);
+    for (int i = 0; i < size; i++) {
+        ordering[i] = std::make_tuple(timestamps[i], pks[i]);
+    }
+
+    if (!insert_record_.empty_pks()) {
+        auto end = std::remove_if(
+            ordering.begin(),
+            ordering.end(),
+            [&](const std::tuple<Timestamp, PkType>& record) {
+                return !insert_record_.contain(std::get<1>(record));
+            });
+        size = end - ordering.begin();
+        ordering.resize(size);
+    }
+
+    // all record filtered
+    if (size == 0) {
+        return;
+    }
+
+    std::sort(ordering.begin(), ordering.end());
+    std::vector<PkType> sort_pks(size);
+    std::vector<Timestamp> sort_timestamps(size);
+
+    for (int i = 0; i < size; i++) {
+        auto [t, pk] = ordering[i];
+        sort_timestamps[i] = t;
+        sort_pks[i] = pk;
+    }
+
+    deleted_record_.push(sort_pks, sort_timestamps.data());
 }
 
 void
@@ -903,7 +939,7 @@ SegmentSealedImpl::get_deleted_bitmap_s(int64_t del_barrier,
 }
 
 void
-SegmentSealedImpl::mask_with_delete(BitsetType& bitset,
+SegmentSealedImpl::mask_with_delete(BitsetTypeView& bitset,
                                     int64_t ins_barrier,
                                     Timestamp timestamp) const {
     auto del_barrier = get_barrier(get_deleted_record(), timestamp);
@@ -1841,7 +1877,7 @@ SegmentSealedImpl::get_active_count(Timestamp ts) const {
 }
 
 void
-SegmentSealedImpl::mask_with_timestamps(BitsetType& bitset_chunk,
+SegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
                                         Timestamp timestamp) const {
     // TODO change the
     AssertInfo(insert_record_.timestamps_.num_chunk() == 1,
@@ -1986,6 +2022,85 @@ SegmentSealedImpl::RemoveFieldFile(const FieldId field_id) {
             return;
         }
     }
+}
+
+void
+SegmentSealedImpl::CreateTextIndex(FieldId field_id) {
+    std::unique_lock lck(mutex_);
+
+    const auto& field_meta = schema_->operator[](field_id);
+    auto& cfg = storage::MmapManager::GetInstance().GetMmapConfig();
+    std::unique_ptr<index::TextMatchIndex> index;
+    if (!cfg.GetEnableMmap()) {
+        // build text index in ram.
+        index = std::make_unique<index::TextMatchIndex>(
+            std::numeric_limits<int64_t>::max(),
+            "milvus_tokenizer",
+            field_meta.get_tokenizer_params());
+    } else {
+        // build text index using mmap.
+        index = std::make_unique<index::TextMatchIndex>(
+            cfg.GetMmapPath(),
+            "milvus_tokenizer",
+            field_meta.get_tokenizer_params());
+    }
+
+    {
+        // build
+        auto iter = fields_.find(field_id);
+        if (iter != fields_.end()) {
+            auto column =
+                std::dynamic_pointer_cast<VariableColumn<std::string>>(
+                    iter->second);
+            AssertInfo(
+                column != nullptr,
+                "failed to create text index, field is not of text type: {}",
+                field_id.get());
+            auto n = column->NumRows();
+            for (size_t i = 0; i < n; i++) {
+                index->AddText(std::string(column->RawAt(i)), i);
+            }
+        } else {  // fetch raw data from index.
+            auto field_index_iter = scalar_indexings_.find(field_id);
+            AssertInfo(field_index_iter != scalar_indexings_.end(),
+                       "failed to create text index, neither raw data nor "
+                       "index are found");
+            auto ptr = field_index_iter->second.get();
+            AssertInfo(ptr->HasRawData(),
+                       "text raw data not found, trying to create text index "
+                       "from index, but this index don't contain raw data");
+            auto impl = dynamic_cast<index::ScalarIndex<std::string>*>(ptr);
+            AssertInfo(impl != nullptr,
+                       "failed to create text index, field index cannot be "
+                       "converted to string index");
+            auto n = impl->Size();
+            for (size_t i = 0; i < n; i++) {
+                index->AddText(impl->Reverse_Lookup(i), i);
+            }
+        }
+    }
+
+    // create index reader.
+    index->CreateReader();
+    // release index writer.
+    index->Finish();
+
+    index->Reload();
+
+    index->RegisterTokenizer("milvus_tokenizer",
+                             field_meta.get_tokenizer_params());
+
+    text_indexes_[field_id] = std::move(index);
+}
+
+void
+SegmentSealedImpl::LoadTextIndex(FieldId field_id,
+                                 std::unique_ptr<index::TextMatchIndex> index) {
+    std::unique_lock lck(mutex_);
+    const auto& field_meta = schema_->operator[](field_id);
+    index->RegisterTokenizer("milvus_tokenizer",
+                             field_meta.get_tokenizer_params());
+    text_indexes_[field_id] = std::move(index);
 }
 
 }  // namespace milvus::segcore

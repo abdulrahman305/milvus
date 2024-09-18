@@ -34,6 +34,7 @@
 #include "sys/mman.h"
 #include "common/Types.h"
 #include "common/IndexMeta.h"
+#include "index/TextMatchIndex.h"
 
 namespace milvus::segcore {
 
@@ -90,6 +91,13 @@ class SegmentSealedImpl : public SegmentSealed {
 
     void
     RemoveFieldFile(const FieldId field_id);
+
+    void
+    CreateTextIndex(FieldId field_id) override;
+
+    void
+    LoadTextIndex(FieldId field_id,
+                  std::unique_ptr<index::TextMatchIndex> index) override;
 
  public:
     size_t
@@ -268,7 +276,7 @@ class SegmentSealedImpl : public SegmentSealed {
     }
 
     void
-    mask_with_timestamps(BitsetType& bitset_chunk,
+    mask_with_timestamps(BitsetTypeView& bitset_chunk,
                          Timestamp timestamp) const override;
 
     void
@@ -280,7 +288,7 @@ class SegmentSealedImpl : public SegmentSealed {
                   SearchResult& output) const override;
 
     void
-    mask_with_delete(BitsetType& bitset,
+    mask_with_delete(BitsetTypeView& bitset,
                      int64_t ins_barrier,
                      Timestamp timestamp) const override;
 

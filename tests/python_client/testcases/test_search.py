@@ -1329,6 +1329,10 @@ class TestCollectionSearch(TestcaseBase):
     def scalar_index(self, request):
         yield request.param
 
+    @pytest.fixture(scope="function", params=[0, 0.5, 1])
+    def null_data_percent(self, request):
+        yield request.param
+
     """
     ******************************************************************
     #  The following are valid base cases
@@ -1462,7 +1466,9 @@ class TestCollectionSearch(TestcaseBase):
             self.init_collection_general(prefix, True, auto_id=auto_id, dim=dim, is_flush=is_flush,
                                          enable_dynamic_field=enable_dynamic_field,
                                          multiple_dim_array=multiple_dim_array,
-                                         vector_data_type=vector_data_type)[0:5]
+                                         vector_data_type=vector_data_type,
+                                         nullable_fields={ct.default_string_field_name: 1},
+                                         default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0:5]
         # 2. generate search data
         vectors = cf.gen_vectors_based_on_vector_type(nq, dim, vector_data_type)
         vector_name_list = cf.extract_vector_field_name_list(collection_w)
@@ -1472,10 +1478,13 @@ class TestCollectionSearch(TestcaseBase):
             collection_w.search(vectors[:nq], search_field,
                                 default_search_params, default_limit,
                                 default_search_exp,
+                                output_fields = [ct.default_float_field_name, ct.default_string_field_name],
                                 check_task=CheckTasks.check_search_results,
                                 check_items={"nq": nq,
                                              "ids": insert_ids,
-                                             "limit": default_limit})
+                                             "limit": default_limit,
+                                             "output_fields": [ct.default_float_field_name,
+                                                               ct.default_string_field_name]})
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_search_random_primary_key(self, random_primary_key):
@@ -1485,7 +1494,6 @@ class TestCollectionSearch(TestcaseBase):
         expected: Search without errors and data consistency
         """
         # 1. initialize collection with random primary key
-
         collection_w, _vectors, _, insert_ids, time_stamp = \
             self.init_collection_general(
                 prefix, True, 10, random_primary_key=random_primary_key)[0:5]
@@ -1557,8 +1565,7 @@ class TestCollectionSearch(TestcaseBase):
         expected: search successfully
         """
         # initialize with data
-        collection_w, insert_data, _, insert_ids = self.init_collection_general(prefix, True)[
-            0:4]
+        collection_w, insert_data, _, insert_ids = self.init_collection_general(prefix, True)[0:4]
         # search
         collection_w.search(vectors[:nq], default_search_field,
                             search_params, default_limit,
@@ -1775,8 +1782,7 @@ class TestCollectionSearch(TestcaseBase):
         auto_id = True
         enable_dynamic_field = True
         collection_w, _, _, insert_ids, time_stamp = self.init_collection_general(prefix, True, nb,
-                                                                                  1, auto_id=auto_id,
-                                                                                  dim=dim,
+                                                                                  1, auto_id=auto_id, dim=dim,
                                                                                   enable_dynamic_field=enable_dynamic_field)[0:5]
         # 2. release collection
         log.info("test_search_collection_after_release_load: releasing collection %s" %
@@ -3575,9 +3581,8 @@ class TestCollectionSearch(TestcaseBase):
         # 1. initialize with data
         auto_id = True
         enable_dynamic_field = False
-        collection_w, _, _, insert_ids = self.init_collection_general(prefix, True,
-                                                                      auto_id=auto_id,
-                                                                      enable_dynamic_field=enable_dynamic_field)[0:4]
+        collection_w, _, _, insert_ids = \
+            self.init_collection_general(prefix, True, auto_id=auto_id, enable_dynamic_field=enable_dynamic_field)[0:4]
         # 2. search
         log.info("test_search_with_output_field: Searching collection %s" % collection_w.name)
         collection_w.search(vectors[:default_nq], default_search_field,
@@ -3585,11 +3590,9 @@ class TestCollectionSearch(TestcaseBase):
                             default_search_exp, _async=_async,
                             output_fields=[field_name],
                             check_task=CheckTasks.check_search_results,
-                            check_items={"nq": default_nq,
-                                         "ids": insert_ids,
-                                         "limit": default_limit,
-                                         "_async": _async,
-                                         "output_fields": [field_name]})
+                            check_items={"nq": default_nq, "ids": insert_ids,
+                                         "limit": default_limit, "_async": _async,
+                                         "output_fields": [field_name]})[0]
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_search_with_output_fields(self, _async):
@@ -7011,6 +7014,10 @@ class TestCollectionRangeSearch(TestcaseBase):
     def enable_dynamic_field(self, request):
         yield request.param
 
+    @pytest.fixture(scope="function", params=[0, 0.5, 1])
+    def null_data_percent(self, request):
+        yield request.param
+
     """
     ******************************************************************
     #  The followings are valid range search cases
@@ -7019,7 +7026,8 @@ class TestCollectionRangeSearch(TestcaseBase):
     @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("vector_data_type", ct.all_dense_vector_types)
     @pytest.mark.parametrize("with_growing", [False, True])
-    def test_range_search_default(self, index_type, metric, vector_data_type, with_growing):
+    @pytest.mark.skip("https://github.com/milvus-io/milvus/issues/32630")
+    def test_range_search_default(self, index_type, metric, vector_data_type, with_growing, null_data_percent):
         """
         target: verify the range search returns correct results
         method: 1. create collection, insert 10k vectors,
@@ -7028,7 +7036,8 @@ class TestCollectionRangeSearch(TestcaseBase):
                 4. verified the range search results is same as the search results in the range
         """
         collection_w = self.init_collection_general(prefix, auto_id=True, insert_data=False, is_index=False,
-                                                    vector_data_type=vector_data_type, with_json=False)[0]
+                                                    vector_data_type=vector_data_type, with_json=False,
+                                                    nullable_fields={ct.default_float_field_name: null_data_percent})[0]
         nb = 1000
         rounds = 10
         for i in range(rounds):
@@ -10302,6 +10311,90 @@ class TestSearchGroupBy(TestcaseBase):
                 # verify no dup values of the group_by_field in results
                 assert len(grpby_values) == len(set(grpby_values))
 
+    @pytest.mark.tags(CaseLabel.L0)
+    @pytest.mark.parametrize("index_type, metric", zip(["FLAT", "IVF_FLAT", "HNSW"], ct.float_metrics))
+    @pytest.mark.parametrize("vector_data_type", ["FLOAT_VECTOR", "FLOAT16_VECTOR",  "BFLOAT16_VECTOR"])
+    @pytest.mark.parametrize("group_strict_size", [True, False])
+    def test_search_group_size_default(self, index_type, metric, vector_data_type, group_strict_size):
+        """
+        target: test search group by
+        method: 1. create a collection with data
+                2. search with group by int32 with group size
+                verify results entity = limit * group_size  and group size is full if group_strict_size is True
+                verfiy results group counts = limit if group_strict_size is False
+        """
+        collection_w = self.init_collection_general(prefix, auto_id=True, insert_data=False, is_index=False,
+                                                    vector_data_type=vector_data_type,
+                                                    is_all_data_type=True, with_json=False)[0]
+        _index_params = {"index_type": index_type, "metric_type": metric, "params": {"M": 16, "efConstruction": 128}}
+        if index_type in ["IVF_FLAT", "FLAT"]:
+            _index_params = {"index_type": index_type, "metric_type": metric, "params": {"nlist": 128}}
+        collection_w.create_index(ct.default_float_vec_field_name, index_params=_index_params)
+        # insert with the same values for scalar fields
+        for _ in range(500):
+            data = cf.gen_dataframe_all_data_type(nb=100, auto_id=True, with_json=False)
+            collection_w.insert(data)
+
+        collection_w.flush()
+        collection_w.create_index(ct.default_float_vec_field_name, index_params=_index_params)
+        collection_w.load()
+
+        search_params = {"metric_type": metric, "params": {"ef": 128}}
+        nq = 2
+        limit = 100
+        group_size = 10
+        search_vectors = cf.gen_vectors(nq, dim=ct.default_dim)
+        # verify
+        res1 = collection_w.search(data=search_vectors, anns_field=ct.default_float_vec_field_name,
+                                   param=search_params, limit=limit, consistency_level=CONSISTENCY_STRONG,
+                                   group_by_field=ct.default_int32_field_name, group_size=group_size,
+                                   group_strict_size=group_strict_size,
+                                   output_fields=[ct.default_int32_field_name]
+                                   )[0]
+        # print(res1)
+        if group_strict_size is True:   # when true, it shall return results with entities = limit * group_size
+            for i in range(nq):
+                for l in range(limit):
+                    group_values = []
+                    for k in range(10):
+                        group_values.append(res1[i][l].fields.get(ct.default_int32_field_name))
+                    assert len(set(group_values)) == 1
+                assert len(res1[i]) == limit * group_size
+        else:   # when False, it shall return results with group counts = limit
+            for i in range(nq):
+                group_values = []
+                for l in range(len(res1[i])):
+                    group_values.append(res1[i][l].fields.get(ct.default_int32_field_name))
+                assert len(set(group_values)) == limit
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_search_max_group_size_and_max_limit(self):
+        """
+        target: test search group by with max group size and max limit
+        method: 1. create a collection with data
+                2. search with group by int32 with max group size and max limit
+
+        """
+        pass
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("group_size", [0, -1])
+    @pytest.mark.xfail(reason="issue #36146")
+    def test_search_negative_group_size(self, group_size):
+        """
+        target: test search group by with negative group size
+        """
+        collection_w = self.init_collection_general(prefix, auto_id=True, insert_data=True, is_index=True)[0]
+        search_params = ct.default_search_params
+        search_vectors = cf.gen_vectors(1, dim=ct.default_dim)
+        # verify
+        error = {ct.err_code: 999, ct.err_msg: "group_size must be greater than 1"}
+        collection_w.search(data=search_vectors, anns_field=ct.default_float_vec_field_name,
+                            param=search_params, limit=10,
+                            group_by_field=ct.default_int64_field_name,
+                            group_size=group_size,
+                            check_task=CheckTasks.err_res, check_items=error)
+
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("metric", ["JACCARD", "HAMMING"])
     def test_search_binary_vec_group_by(self, metric):
@@ -10330,7 +10423,7 @@ class TestSearchGroupBy(TestcaseBase):
         limit = 10
         search_vectors = cf.gen_binary_vectors(nq, dim=ct.default_dim)[1]
 
-        # verify the results are same if gourp by pk
+        # verify the results are same if group by pk
         err_code = 999
         err_msg = "not support search_group_by operation based on binary"
         collection_w.search(data=search_vectors, anns_field=ct.default_binary_vec_field_name,
@@ -10781,7 +10874,7 @@ class TestSearchGroupBy(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema()
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
         nb = 5000
         data = cf.gen_default_list_sparse_data(nb=nb)
         # update float fields
@@ -10797,15 +10890,14 @@ class TestSearchGroupBy(TestcaseBase):
         nq = 2
         limit = 20
         search_params = ct.default_sparse_search_params
-
-        search_vectors = cf.gen_default_list_sparse_data(nb=nq)[-1][-2:]
-        # verify the results are same if gourp by pk
+        search_vectors = cf.gen_default_list_sparse_data(nb=nq)[-1][0:nq]
+        # verify the result if gourp by
         res = collection_w.search(data=search_vectors, anns_field=ct.default_sparse_vec_field_name,
-                            param=search_params, limit=limit,
-                            group_by_field="varchar",
-                            output_fields=["varchar"],
-                            check_task=CheckTasks.check_search_results,
-                            check_items={"nq": nq, "limit": limit})
+                                  param=search_params, limit=limit,
+                                  group_by_field=ct.default_string_field_name,
+                                  output_fields=[ct.default_string_field_name],
+                                  check_task=CheckTasks.check_search_results,
+                                  check_items={"nq": nq, "limit": limit})[0]
 
         hit = res[0]
         set_varchar = set()
@@ -10892,7 +10984,8 @@ class TestCollectionHybridSearchValid(TestcaseBase):
             self.init_collection_general(prefix, True, dim=dim, is_flush=is_flush,
                                          primary_field=primary_field, enable_dynamic_field=enable_dynamic_field,
                                          multiple_dim_array=multiple_dim_array,
-                                         vector_data_type=vector_data_type)[0:5]
+                                         vector_data_type=vector_data_type,
+                                         nullable_fields={ct.default_float_field_name: 1})[0:5]
         # 2. extract vector field name
         vector_name_list = cf.extract_vector_field_name_list(collection_w)
         vector_name_list.append(ct.default_float_vec_field_name)
@@ -10976,8 +11069,6 @@ class TestCollectionHybridSearchValid(TestcaseBase):
         req_list = []
         weights = [1]
         vectors = cf.gen_vectors_based_on_vector_type(nq, default_dim, "FLOAT_VECTOR")
-        log.debug("binbin")
-        log.debug(vectors)
         # 4. get hybrid search req list
         for i in range(len(vector_name_list)):
             search_param = {
@@ -11273,6 +11364,7 @@ class TestCollectionHybridSearchValid(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("primary_field", [ct.default_int64_field_name, ct.default_string_field_name])
+    @pytest.mark.skip("https://github.com/milvus-io/milvus/issues/36273")
     def test_hybrid_search_overall_limit_larger_sum_each_limit(self, nq, primary_field, metric_type):
 
         """
@@ -11376,6 +11468,7 @@ class TestCollectionHybridSearchValid(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("primary_field", [ct.default_int64_field_name, ct.default_string_field_name])
+    @pytest.mark.skip("https://github.com/milvus-io/milvus/issues/36273")
     def test_hybrid_search_min_limit(self, primary_field, metric_type):
         """
         target: test hybrid search with minimum limit params
@@ -12761,25 +12854,31 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema(auto_id=False)
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
-        data = cf.gen_default_list_sparse_data(nb=4000)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
+        data = cf.gen_default_list_sparse_data(nb=3000)
         collection_w.insert(data)
         params = cf.get_index_params_params(index)
         index_params = {"index_type": index, "metric_type": "IP", "params": params}
         collection_w.create_index(ct.default_sparse_vec_field_name, index_params, index_name=index)
-
         collection_w.load()
-        collection_w.search(data[-1][-1:], ct.default_sparse_vec_field_name,
+
+        collection_w.search(data[-1][0:default_nq], ct.default_sparse_vec_field_name,
                             ct.default_sparse_search_params, default_limit,
+                            output_fields=[ct.default_sparse_vec_field_name],
                             check_task=CheckTasks.check_search_results,
                             check_items={"nq": default_nq,
-                                         "limit": default_limit})
+                                         "limit": default_limit,
+                                         "original_entities": [data],
+                                         "output_fields": [ct.default_sparse_vec_field_name]})
         expr = "int64 < 100 "
-        collection_w.search(data[-1][-1:], ct.default_sparse_vec_field_name,
+        collection_w.search(data[-1][0:default_nq], ct.default_sparse_vec_field_name,
                             ct.default_sparse_search_params, default_limit,
-                            expr,
+                            expr=expr, output_fields=[ct.default_sparse_vec_field_name],
                             check_task=CheckTasks.check_search_results,
-                            check_items={"nq": default_nq})
+                            check_items={"nq": default_nq,
+                                         "limit": default_limit,
+                                         "original_entities": [data],
+                                         "output_fields": [ct.default_sparse_vec_field_name]})
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("index", ct.all_index_types[9:11])
@@ -12793,7 +12892,7 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema(auto_id=False)
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
         data = cf.gen_default_list_sparse_data(dim=dim)
         collection_w.insert(data)
         params = cf.get_index_params_params(index)
@@ -12801,14 +12900,13 @@ class TestSparseSearch(TestcaseBase):
         collection_w.create_index(ct.default_sparse_vec_field_name, index_params, index_name=index)
 
         collection_w.load()
-        collection_w.search(data[-1][-1:], ct.default_sparse_vec_field_name,
-                            ct.default_sparse_search_params, default_limit,
+        collection_w.search(data[-1][0:default_nq], ct.default_sparse_vec_field_name,
+                            ct.default_sparse_search_params, limit=1,
                             check_task=CheckTasks.check_search_results,
                             check_items={"nq": default_nq,
-                                         "limit": default_limit})
+                                         "limit": 1})
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.skip(reason="issue #31485")
     @pytest.mark.parametrize("index", ct.all_index_types[9:11])
     def test_sparse_index_enable_mmap_search(self, index):
         """
@@ -12819,9 +12917,10 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema(auto_id=False)
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
 
-        data = cf.gen_default_list_sparse_data()
+        first_nb = 3000
+        data = cf.gen_default_list_sparse_data(nb=first_nb, start=0)
         collection_w.insert(data)
 
         params = cf.get_index_params_params(index)
@@ -12829,18 +12928,28 @@ class TestSparseSearch(TestcaseBase):
         collection_w.create_index(ct.default_sparse_vec_field_name, index_params, index_name=index)
 
         collection_w.set_properties({'mmap.enabled': True})
-        pro = collection_w.describe().get("properties")
+        pro = collection_w.describe()[0].get("properties")
         assert pro["mmap.enabled"] == 'True'
         collection_w.alter_index(index, {'mmap.enabled': True})
-        assert collection_w.index().params["mmap.enabled"] == 'True'
+        assert collection_w.index()[0].params["mmap.enabled"] == 'True'
+        data2 = cf.gen_default_list_sparse_data(nb=2000, start=first_nb)    # id shall be continuous
+        all_data = []   # combine 2 insert datas for next checking
+        for i in range(len(data2)):
+            all_data.append(data[i] + data2[i])
+        collection_w.insert(data2)
+        collection_w.flush()
         collection_w.load()
-        collection_w.search(data[-1][-1:], ct.default_sparse_vec_field_name,
+        collection_w.search(data[-1][0:default_nq], ct.default_sparse_vec_field_name,
                             ct.default_sparse_search_params, default_limit,
+                            output_fields=[ct.default_sparse_vec_field_name],
                             check_task=CheckTasks.check_search_results,
                             check_items={"nq": default_nq,
-                                         "limit": default_limit})
-        term_expr = f'{ct.default_int64_field_name} in [0, 1, 10, 100]'
-        res = collection_w.query(term_expr)
+                                         "limit": default_limit,
+                                         "original_entities": [all_data],
+                                         "output_fields": [ct.default_sparse_vec_field_name]})
+        expr_id_list = [0, 1, 10, 100]
+        term_expr = f'{ct.default_int64_field_name} in {expr_id_list}'
+        res = collection_w.query(term_expr)[0]
         assert len(res) == 4
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -12855,15 +12964,15 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema(auto_id=False)
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
         data = cf.gen_default_list_sparse_data(nb=4000)
         collection_w.insert(data)
         params = {"index_type": index, "metric_type": "IP", "params": {"drop_ratio_build": ratio}}
         collection_w.create_index(ct.default_sparse_vec_field_name, params, index_name=index)
         collection_w.load()
-        assert collection_w.has_index(index_name=index) == True
+        assert collection_w.has_index(index_name=index)[0] is True
         search_params = {"metric_type": "IP", "params": {"drop_ratio_search": ratio}}
-        collection_w.search(data[-1][-1:], ct.default_sparse_vec_field_name,
+        collection_w.search(data[-1][0:default_nq], ct.default_sparse_vec_field_name,
                             search_params, default_limit,
                             check_task=CheckTasks.check_search_results,
                             check_items={"nq": default_nq,
@@ -12880,7 +12989,7 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema()
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
         data = cf.gen_default_list_sparse_data(nb=4000)
         collection_w.insert(data)
         params = cf.get_index_params_params(index)
@@ -12888,9 +12997,9 @@ class TestSparseSearch(TestcaseBase):
         collection_w.create_index(ct.default_sparse_vec_field_name, index_params, index_name=index)
 
         collection_w.load()
-        d = cf.gen_default_list_sparse_data(nb=1)
-        collection_w.search(d[-1][-1:], ct.default_sparse_vec_field_name,
-                            ct.default_sparse_search_params, 5,
+        d = cf.gen_default_list_sparse_data(nb=10)
+        collection_w.search(d[-1][0:default_nq], ct.default_sparse_vec_field_name,
+                            ct.default_sparse_search_params, default_limit,
                             output_fields=["float", "sparse_vector"],
                             check_task=CheckTasks.check_search_results,
                             check_items={"nq": default_nq,
@@ -12900,6 +13009,7 @@ class TestSparseSearch(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("index", ct.all_index_types[9:11])
+    @pytest.mark.xfail(reason="issue #36174")
     def test_sparse_vector_search_iterator(self, index):
         """
         target: create sparse vectors and search iterator
@@ -12909,7 +13019,7 @@ class TestSparseSearch(TestcaseBase):
         self._connect()
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_sparse_schema()
-        collection_w, _ = self.collection_wrap.init_collection(c_name, schema=schema)
+        collection_w = self.init_collection_wrap(c_name, schema=schema)
         data = cf.gen_default_list_sparse_data(nb=4000)
         collection_w.insert(data)
         params = cf.get_index_params_params(index)
@@ -12917,8 +13027,437 @@ class TestSparseSearch(TestcaseBase):
         collection_w.create_index(ct.default_sparse_vec_field_name, index_params, index_name=index)
 
         collection_w.load()
-        batch_size = 10
-        collection_w.search_iterator(data[-1][-1:], ct.default_sparse_vec_field_name,
-                                     ct.default_sparse_search_params, batch_size,
+        batch_size = 100
+        collection_w.search_iterator(data[-1][0:1], ct.default_sparse_vec_field_name,
+                                     ct.default_sparse_search_params, limit=500, batch_size=batch_size,
                                      check_task=CheckTasks.check_search_iterator,
                                      check_items={"batch_size": batch_size})
+
+
+class TestCollectionSearchNoneAndDefaultData(TestcaseBase):
+    """ Test case of search interface """
+
+    @pytest.fixture(scope="function", params=[default_nb_medium])
+    def nb(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[200])
+    def nq(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[32, 128])
+    def dim(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[False, True])
+    def auto_id(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[False, True])
+    def _async(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=["JACCARD", "HAMMING"])
+    def metrics(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[False, True])
+    def is_flush(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[True, False])
+    def enable_dynamic_field(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=["IP", "COSINE", "L2"])
+    def metric_type(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[True, False])
+    def random_primary_key(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=["FLOAT_VECTOR", "FLOAT16_VECTOR", "BFLOAT16_VECTOR"])
+    def vector_data_type(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=["STL_SORT", "INVERTED"])
+    def numeric_scalar_index(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=["TRIE", "INVERTED", "BITMAP"])
+    def varchar_scalar_index(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[200, 600])
+    def batch_size(self, request):
+        yield request.param
+
+    @pytest.fixture(scope="function", params=[0, 0.5, 1])
+    def null_data_percent(self, request):
+        yield request.param
+
+    """
+    ******************************************************************
+    #  The following are valid base cases
+    ******************************************************************
+    """
+
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_search_normal_none_data(self, nq, dim, auto_id, is_flush, enable_dynamic_field, vector_data_type, null_data_percent):
+        """
+        target: test search normal case with none data inserted
+        method: create connection, collection with nullable fields, insert data including none, and search
+        expected: 1. search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w, _, _, insert_ids, time_stamp = \
+            self.init_collection_general(prefix, True, auto_id=auto_id, dim=dim, is_flush=is_flush,
+                                         enable_dynamic_field=enable_dynamic_field,
+                                         vector_data_type=vector_data_type,
+                                         nullable_fields={ct.default_float_field_name: null_data_percent})[0:5]
+        # 2. generate search data
+        vectors = cf.gen_vectors_based_on_vector_type(nq, dim, vector_data_type)
+        # 3. search after insert
+        collection_w.search(vectors[:nq], default_search_field,
+                            default_search_params, default_limit,
+                            default_search_exp,
+                            output_fields=[default_int64_field_name,
+                                           default_float_field_name],
+                            guarantee_timestamp=0,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": nq,
+                                         "ids": insert_ids,
+                                         "limit": default_limit,
+                                         "output_fields": [default_int64_field_name,
+                                                           default_float_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip(reason="issue #36184")
+    def test_search_after_none_data_all_field_datatype(self, varchar_scalar_index, numeric_scalar_index,
+                                                       null_data_percent, _async):
+        """
+        target: test search after different index
+        method: test search after different index and corresponding search params
+        expected: search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        nullable_fields = {ct.default_int32_field_name: null_data_percent,
+                           ct.default_int16_field_name: null_data_percent,
+                           ct.default_int8_field_name: null_data_percent,
+                           ct.default_bool_field_name: null_data_percent,
+                           ct.default_float_field_name: null_data_percent,
+                           ct.default_double_field_name: null_data_percent,
+                           ct.default_string_field_name: null_data_percent}
+        collection_w, _, _, insert_ids = self.init_collection_general(prefix, True, 5000, partition_num=1,
+                                                                      is_all_data_type=True, dim=default_dim, is_index=False,
+                                                                      nullable_fields=nullable_fields)[0:4]
+        # 2. create index on vector field and load
+        index = "HNSW"
+        params = cf.get_index_params_params(index)
+        default_index = {"index_type": index, "params": params, "metric_type": "COSINE"}
+        vector_name_list = cf.extract_vector_field_name_list(collection_w)
+        vector_name_list.append(ct.default_float_vec_field_name)
+        for vector_name in vector_name_list:
+            collection_w.create_index(vector_name, default_index)
+        # 3. create index on scalar field with None data
+        scalar_index_params = {"index_type": varchar_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_string_field_name, scalar_index_params)
+        # 4. create index on scalar field with default data
+        scalar_index_params = {"index_type": numeric_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_int64_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int32_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int16_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int8_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_bool_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_float_field_name, scalar_index_params)
+        collection_w.load()
+        # 5. search
+        search_params = cf.gen_search_param(index, "COSINE")
+        limit = search_params[0]["params"]["ef"]
+        log.info("Searching with search params: {}".format(search_params[0]))
+        vectors = [[random.random() for _ in range(default_dim)] for _ in range(default_nq)]
+        collection_w.search(vectors[:default_nq], default_search_field,
+                            search_param, limit, default_search_exp, _async=_async,
+                            output_fields=[ct.default_string_field_name, ct.default_float_field_name],
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": default_nq,
+                                         "ids": insert_ids,
+                                         "limit": limit,
+                                         "_async": _async,
+                                         "output_fields": [ct.default_string_field_name,
+                                                           ct.default_float_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_search_default_value_with_insert(self, nq, dim, auto_id, is_flush, enable_dynamic_field, vector_data_type):
+        """
+        target: test search normal case with default value set
+        method: create connection, collection with default value set, insert and search
+        expected: 1. search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w, _, _, insert_ids, time_stamp = \
+            self.init_collection_general(prefix, True, auto_id=auto_id, dim=dim, is_flush=is_flush,
+                                         enable_dynamic_field=enable_dynamic_field,
+                                         vector_data_type=vector_data_type,
+                                         default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0:5]
+        # 2. generate search data
+        vectors = cf.gen_vectors_based_on_vector_type(nq, dim, vector_data_type)
+        # 3. search after insert
+        collection_w.search(vectors[:nq], default_search_field,
+                            default_search_params, default_limit,
+                            default_search_exp,
+                            output_fields=[default_int64_field_name,
+                                           default_float_field_name],
+                            guarantee_timestamp=0,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": nq,
+                                         "ids": insert_ids,
+                                         "limit": default_limit,
+                                         "output_fields": [default_int64_field_name,
+                                                           default_float_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_search_default_value_without_insert(self, enable_dynamic_field):
+        """
+        target: test search normal case with default value set
+        method: create connection, collection with default value set, no insert and search
+        expected: 1. search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w = self.init_collection_general(prefix, False, dim=default_dim,
+                                                    enable_dynamic_field=enable_dynamic_field,
+                                                    nullable_fields={ct.default_float_field_name: 0},
+                                                    default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0]
+        # 2. generate search data
+        vectors = cf.gen_vectors_based_on_vector_type(default_nq, default_dim, "FLOAT_VECTOR")
+        # 3. search after insert
+        collection_w.search(vectors[:default_nq], default_search_field,
+                            default_search_params, default_limit,
+                            default_search_exp,
+                            guarantee_timestamp=0,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": default_nq,
+                                         "limit": 0})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_search_after_default_data_all_field_datatype(self, varchar_scalar_index, numeric_scalar_index, _async):
+        """
+        target: test search after different index
+        method: test search after different index and corresponding search params
+        expected: search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        default_value_fields = {ct.default_int32_field_name: np.int32(1),
+                           ct.default_int16_field_name: np.int32(2),
+                           ct.default_int8_field_name: np.int32(3),
+                           ct.default_bool_field_name: True,
+                           ct.default_float_field_name: np.float32(10.0),
+                           ct.default_double_field_name: 10.0,
+                           ct.default_string_field_name: "1"}
+        collection_w, _, _, insert_ids = self.init_collection_general(prefix, True, 5000, partition_num=1,
+                                                                      is_all_data_type=True, dim=default_dim, is_index=False,
+                                                                      default_value_fields=default_value_fields)[0:4]
+        # 2. create index on vector field and load
+        index = "HNSW"
+        params = cf.get_index_params_params(index)
+        default_index = {"index_type": index, "params": params, "metric_type": "L2"}
+        vector_name_list = cf.extract_vector_field_name_list(collection_w)
+        vector_name_list.append(ct.default_float_vec_field_name)
+        for vector_name in vector_name_list:
+            collection_w.create_index(vector_name, default_index)
+        # 3. create index on scalar field with None data
+        scalar_index_params = {"index_type": varchar_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_string_field_name, scalar_index_params)
+        # 4. create index on scalar field with default data
+        scalar_index_params = {"index_type": numeric_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_int64_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int32_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int16_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_int8_field_name, scalar_index_params)
+        if numeric_scalar_index != "STL_SORT":
+            collection_w.create_index(ct.default_bool_field_name, scalar_index_params)
+        collection_w.create_index(ct.default_float_field_name, scalar_index_params)
+        collection_w.load()
+        # 5. search
+        search_params = cf.gen_search_param(index, "L2")
+        limit = search_params[0]["params"]["ef"]
+        log.info("Searching with search params: {}".format(search_params[0]))
+        vectors = [[random.random() for _ in range(default_dim)] for _ in range(default_nq)]
+        output_fields = [ct.default_int64_field_name, ct.default_int32_field_name,
+                         ct.default_int16_field_name, ct.default_int8_field_name,
+                         ct.default_bool_field_name, ct.default_float_field_name,
+                         ct.default_double_field_name, ct.default_string_field_name]
+        collection_w.search(vectors[:default_nq], default_search_field,
+                            search_param, limit, default_search_exp, _async=_async,
+                            output_fields=output_fields,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": default_nq,
+                                         "ids": insert_ids,
+                                         "limit": limit,
+                                         "_async": _async,
+                                         "output_fields": output_fields})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.skip(reason="issue #36003")
+    def test_search_both_default_value_non_data(self, nq, dim, auto_id, is_flush, enable_dynamic_field, vector_data_type):
+        """
+        target: test search normal case with default value set
+        method: create connection, collection with default value set, insert and search
+        expected: 1. search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w, _, _, insert_ids, time_stamp = \
+            self.init_collection_general(prefix, True, auto_id=auto_id, dim=dim, is_flush=is_flush,
+                                         enable_dynamic_field=enable_dynamic_field,
+                                         vector_data_type=vector_data_type,
+                                         nullable_fields={ct.default_float_field_name: 1},
+                                         default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0:5]
+        # 2. generate search data
+        vectors = cf.gen_vectors_based_on_vector_type(nq, dim, vector_data_type)
+        # 3. search after insert
+        collection_w.search(vectors[:nq], default_search_field,
+                            default_search_params, default_limit,
+                            default_search_exp,
+                            output_fields=[default_int64_field_name,
+                                           default_float_field_name],
+                            guarantee_timestamp=0,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": nq,
+                                         "ids": insert_ids,
+                                         "limit": default_limit,
+                                         "output_fields": [default_int64_field_name,
+                                                           default_float_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_search_collection_with_non_default_data_after_release_load(self, nq, _async, null_data_percent):
+        """
+        target: search the pre-released collection after load
+        method: 1. create collection
+                2. release collection
+                3. load collection
+                4. search the pre-released collection
+        expected: search successfully
+        """
+        # 1. initialize without data
+        nb= 2000
+        dim = 64
+        auto_id = True
+        collection_w, _, _, insert_ids, time_stamp = self.init_collection_general(prefix, True, nb,
+                                                                                  1, auto_id=auto_id, dim=dim,
+                                                                                  nullable_fields={ct.default_string_field_name: null_data_percent},
+                                                                                  default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0:5]
+        # 2. release collection
+        collection_w.release()
+        # 3. Search the pre-released collection after load
+        collection_w.load()
+        log.info("test_search_collection_awith_non_default_data_after_release_load: searching after load")
+        vectors = [[random.random() for _ in range(dim)] for _ in range(nq)]
+        collection_w.search(vectors[:nq], default_search_field, default_search_params,
+                            default_limit, default_search_exp, _async=_async,
+                            output_fields = [ct.default_float_field_name, ct.default_string_field_name],
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": nq,
+                                         "ids": insert_ids,
+                                         "limit": default_limit,
+                                         "_async": _async,
+                                         "output_fields": [ct.default_float_field_name,
+                                                           ct.default_string_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.tags(CaseLabel.GPU)
+    @pytest.mark.skip(reason="issue #36184")
+    def test_search_after_different_index_with_params_none_default_data(self, varchar_scalar_index, numeric_scalar_index,
+                                                                        null_data_percent, _async):
+        """
+        target: test search after different index
+        method: test search after different index and corresponding search params
+        expected: search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w, _, _, insert_ids = self.init_collection_general(prefix, True, 5000, partition_num=1,
+                                                                      is_all_data_type=True, dim=default_dim, is_index=False,
+                                                                      nullable_fields={ct.default_string_field_name: null_data_percent},
+                                                                      default_value_fields={ct.default_float_field_name: np.float32(10.0)})[0:4]
+        # 2. create index on vector field and load
+        index = "HNSW"
+        params = cf.get_index_params_params(index)
+        default_index = {"index_type": index, "params": params, "metric_type": "COSINE"}
+        vector_name_list = cf.extract_vector_field_name_list(collection_w)
+        vector_name_list.append(ct.default_float_vec_field_name)
+        for vector_name in vector_name_list:
+            collection_w.create_index(vector_name, default_index)
+        # 3. create index on scalar field with None data
+        scalar_index_params = {"index_type": varchar_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_string_field_name, scalar_index_params)
+        # 4. create index on scalar field with default data
+        scalar_index_params = {"index_type": numeric_scalar_index, "params": {}}
+        collection_w.create_index(ct.default_float_field_name, scalar_index_params)
+        collection_w.load()
+        # 5. search
+        search_params = cf.gen_search_param(index, "COSINE")
+        limit = search_params[0]["params"]["ef"]
+        log.info("Searching with search params: {}".format(search_params[0]))
+        vectors = [[random.random() for _ in range(default_dim)] for _ in range(default_nq)]
+        collection_w.search(vectors[:default_nq], default_search_field,
+                            search_param, limit, default_search_exp, _async=_async,
+                            output_fields=[ct.default_string_field_name, ct.default_float_field_name],
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": default_nq,
+                                         "ids": insert_ids,
+                                         "limit": limit,
+                                         "_async": _async,
+                                         "output_fields": [ct.default_string_field_name,
+                                                           ct.default_float_field_name]})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_search_iterator_with_none_data(self, batch_size, null_data_percent):
+        """
+        target: test search iterator normal
+        method: 1. search iterator
+                2. check the result, expect pk
+        expected: search successfully
+        """
+        # 1. initialize with data
+        dim = 64
+        collection_w = self.init_collection_general(prefix, True, dim=dim, is_index=False,
+                                                    nullable_fields={ct.default_string_field_name: null_data_percent})[0]
+        collection_w.create_index(field_name, {"metric_type": "L2"})
+        collection_w.load()
+        # 2. search iterator
+        search_params = {"metric_type": "L2"}
+        vectors = cf.gen_vectors_based_on_vector_type(1, dim, "FLOAT_VECTOR")
+        collection_w.search_iterator(vectors[:1], field_name, search_params, batch_size,
+                                     check_task=CheckTasks.check_search_iterator,
+                                     check_items={"batch_size": batch_size})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_search_normal_none_data_partition_key(self, is_flush, enable_dynamic_field, vector_data_type, null_data_percent):
+        """
+        target: test search normal case with none data inserted
+        method: create connection, collection with nullable fields, insert data including none, and search
+        expected: 1. search successfully with limit(topK)
+        """
+        # 1. initialize with data
+        collection_w, _, _, insert_ids, time_stamp = \
+            self.init_collection_general(prefix, True, dim=default_dim, is_flush=is_flush,
+                                         enable_dynamic_field=enable_dynamic_field,
+                                         vector_data_type=vector_data_type,
+                                         nullable_fields={ct.default_float_field_name: null_data_percent},
+                                         is_partition_key=ct.default_float_field_name)[0:5]
+        # 2. generate search data
+        vectors = cf.gen_vectors_based_on_vector_type(default_nq, default_dim, vector_data_type)
+        # 3. search after insert
+        collection_w.search(vectors[:default_nq], default_search_field,
+                            default_search_params, default_limit,
+                            default_search_exp,
+                            output_fields=[default_int64_field_name,
+                                           default_float_field_name],
+                            guarantee_timestamp=0,
+                            check_task=CheckTasks.check_search_results,
+                            check_items={"nq": default_nq,
+                                         "ids": insert_ids,
+                                         "limit": default_limit,
+                                         "output_fields": [default_int64_field_name,
+                                                           default_float_field_name]})
+

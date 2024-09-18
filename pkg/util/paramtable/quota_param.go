@@ -132,28 +132,35 @@ type quotaConfig struct {
 	MaxOutputSize                  ParamItem `refreshable:"true"`
 	MaxInsertSize                  ParamItem `refreshable:"true"`
 	MaxResourceGroupNumOfQueryNode ParamItem `refreshable:"true"`
+	MaxGroupSize                   ParamItem `refreshable:"true"`
 
 	// limit writing
-	ForceDenyWriting                     ParamItem `refreshable:"true"`
-	TtProtectionEnabled                  ParamItem `refreshable:"true"`
-	MaxTimeTickDelay                     ParamItem `refreshable:"true"`
-	MemProtectionEnabled                 ParamItem `refreshable:"true"`
-	DataNodeMemoryLowWaterLevel          ParamItem `refreshable:"true"`
-	DataNodeMemoryHighWaterLevel         ParamItem `refreshable:"true"`
-	QueryNodeMemoryLowWaterLevel         ParamItem `refreshable:"true"`
-	QueryNodeMemoryHighWaterLevel        ParamItem `refreshable:"true"`
-	GrowingSegmentsSizeProtectionEnabled ParamItem `refreshable:"true"`
-	GrowingSegmentsSizeMinRateRatio      ParamItem `refreshable:"true"`
-	GrowingSegmentsSizeLowWaterLevel     ParamItem `refreshable:"true"`
-	GrowingSegmentsSizeHighWaterLevel    ParamItem `refreshable:"true"`
-	DiskProtectionEnabled                ParamItem `refreshable:"true"`
-	DiskQuota                            ParamItem `refreshable:"true"`
-	DiskQuotaPerDB                       ParamItem `refreshable:"true"`
-	DiskQuotaPerCollection               ParamItem `refreshable:"true"`
-	DiskQuotaPerPartition                ParamItem `refreshable:"true"`
-	L0SegmentRowCountProtectionEnabled   ParamItem `refreshable:"true"`
-	L0SegmentRowCountLowWaterLevel       ParamItem `refreshable:"true"`
-	L0SegmentRowCountHighWaterLevel      ParamItem `refreshable:"true"`
+	ForceDenyWriting                      ParamItem `refreshable:"true"`
+	TtProtectionEnabled                   ParamItem `refreshable:"true"`
+	MaxTimeTickDelay                      ParamItem `refreshable:"true"`
+	MemProtectionEnabled                  ParamItem `refreshable:"true"`
+	DataNodeMemoryLowWaterLevel           ParamItem `refreshable:"true"`
+	DataNodeMemoryHighWaterLevel          ParamItem `refreshable:"true"`
+	QueryNodeMemoryLowWaterLevel          ParamItem `refreshable:"true"`
+	QueryNodeMemoryHighWaterLevel         ParamItem `refreshable:"true"`
+	GrowingSegmentsSizeProtectionEnabled  ParamItem `refreshable:"true"`
+	GrowingSegmentsSizeMinRateRatio       ParamItem `refreshable:"true"`
+	GrowingSegmentsSizeLowWaterLevel      ParamItem `refreshable:"true"`
+	GrowingSegmentsSizeHighWaterLevel     ParamItem `refreshable:"true"`
+	DiskProtectionEnabled                 ParamItem `refreshable:"true"`
+	DiskQuota                             ParamItem `refreshable:"true"`
+	DiskQuotaPerDB                        ParamItem `refreshable:"true"`
+	DiskQuotaPerCollection                ParamItem `refreshable:"true"`
+	DiskQuotaPerPartition                 ParamItem `refreshable:"true"`
+	L0SegmentRowCountProtectionEnabled    ParamItem `refreshable:"true"`
+	L0SegmentRowCountLowWaterLevel        ParamItem `refreshable:"true"`
+	L0SegmentRowCountHighWaterLevel       ParamItem `refreshable:"true"`
+	DeleteBufferRowCountProtectionEnabled ParamItem `refreshable:"true"`
+	DeleteBufferRowCountLowWaterLevel     ParamItem `refreshable:"true"`
+	DeleteBufferRowCountHighWaterLevel    ParamItem `refreshable:"true"`
+	DeleteBufferSizeProtectionEnabled     ParamItem `refreshable:"true"`
+	DeleteBufferSizeLowWaterLevel         ParamItem `refreshable:"true"`
+	DeleteBufferSizeHighWaterLevel        ParamItem `refreshable:"true"`
 
 	// limit reading
 	ForceDenyReading ParamItem `refreshable:"true"`
@@ -1582,6 +1589,15 @@ Check https://milvus.io/docs/limitations.md for more details.`,
 	}
 	p.MaxResourceGroupNumOfQueryNode.Init(base.mgr)
 
+	p.MaxGroupSize = ParamItem{
+		Key:          "quotaAndLimits.limits.maxGroupSize",
+		Version:      "2.5.0",
+		Doc:          `maximum size for one single group when doing search group by`,
+		DefaultValue: "10",
+		Export:       true,
+	}
+	p.MaxGroupSize.Init(base.mgr)
+
 	// limit writing
 	p.ForceDenyWriting = ParamItem{
 		Key:          "quotaAndLimits.limitWriting.forceDeny",
@@ -1891,7 +1907,7 @@ but the rate will not be lower than minRateRatio * dmlRate.`,
 	p.L0SegmentRowCountLowWaterLevel = ParamItem{
 		Key:          "quotaAndLimits.limitWriting.l0SegmentsRowCountProtection.lowWaterLevel",
 		Version:      "2.4.7",
-		DefaultValue: "32768",
+		DefaultValue: "30000000",
 		Doc:          "l0 segment row count quota, low water level",
 		Export:       true,
 	}
@@ -1900,11 +1916,65 @@ but the rate will not be lower than minRateRatio * dmlRate.`,
 	p.L0SegmentRowCountHighWaterLevel = ParamItem{
 		Key:          "quotaAndLimits.limitWriting.l0SegmentsRowCountProtection.highWaterLevel",
 		Version:      "2.4.7",
-		DefaultValue: "65536",
-		Doc:          "l0 segment row count quota, low water level",
+		DefaultValue: "50000000",
+		Doc:          "l0 segment row count quota, high water level",
 		Export:       true,
 	}
 	p.L0SegmentRowCountHighWaterLevel.Init(base.mgr)
+
+	p.DeleteBufferRowCountProtectionEnabled = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferRowCountProtection.enabled",
+		Version:      "2.4.11",
+		DefaultValue: "false",
+		Doc:          "switch to enable delete buffer row count quota",
+		Export:       true,
+	}
+	p.DeleteBufferRowCountProtectionEnabled.Init(base.mgr)
+
+	p.DeleteBufferRowCountLowWaterLevel = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferRowCountProtection.lowWaterLevel",
+		Version:      "2.4.11",
+		DefaultValue: "32768",
+		Doc:          "delete buffer row count quota, low water level",
+		Export:       true,
+	}
+	p.DeleteBufferRowCountLowWaterLevel.Init(base.mgr)
+
+	p.DeleteBufferRowCountHighWaterLevel = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferRowCountProtection.highWaterLevel",
+		Version:      "2.4.11",
+		DefaultValue: "65536",
+		Doc:          "delete buffer row count quota, high water level",
+		Export:       true,
+	}
+	p.DeleteBufferRowCountHighWaterLevel.Init(base.mgr)
+
+	p.DeleteBufferSizeProtectionEnabled = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferSizeProtection.enabled",
+		Version:      "2.4.11",
+		DefaultValue: "false",
+		Doc:          "switch to enable delete buffer size quota",
+		Export:       true,
+	}
+	p.DeleteBufferSizeProtectionEnabled.Init(base.mgr)
+
+	p.DeleteBufferSizeLowWaterLevel = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferSizeProtection.lowWaterLevel",
+		Version:      "2.4.11",
+		DefaultValue: "134217728", // 128MB
+		Doc:          "delete buffer size quota, low water level",
+		Export:       true,
+	}
+	p.DeleteBufferSizeLowWaterLevel.Init(base.mgr)
+
+	p.DeleteBufferSizeHighWaterLevel = ParamItem{
+		Key:          "quotaAndLimits.limitWriting.deleteBufferSizeProtection.highWaterLevel",
+		Version:      "2.4.11",
+		DefaultValue: "268435456", // 256MB
+		Doc:          "delete buffer size quota, high water level",
+		Export:       true,
+	}
+	p.DeleteBufferSizeHighWaterLevel.Init(base.mgr)
 
 	// limit reading
 	p.ForceDenyReading = ParamItem{
