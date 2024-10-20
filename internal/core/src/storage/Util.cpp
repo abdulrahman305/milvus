@@ -29,6 +29,9 @@
 #ifdef AZURE_BUILD_DIR
 #include "storage/azure/AzureChunkManager.h"
 #endif
+#ifdef ENABLE_GCP_NATIVE
+#include "storage/gcp-native-storage/GcpNativeChunkManager.h"
+#endif
 #include "storage/ChunkManager.h"
 #include "storage/DiskFileManagerImpl.h"
 #include "storage/InsertData.h"
@@ -59,6 +62,7 @@ enum class CloudProviderType : int8_t {
     ALIYUN = 3,
     AZURE = 4,
     TENCENTCLOUD = 5,
+    GCPNATIVE = 6,
 };
 
 std::map<std::string, CloudProviderType> CloudProviderType_Map = {
@@ -66,7 +70,8 @@ std::map<std::string, CloudProviderType> CloudProviderType_Map = {
     {"gcp", CloudProviderType::GCP},
     {"aliyun", CloudProviderType::ALIYUN},
     {"azure", CloudProviderType::AZURE},
-    {"tencent", CloudProviderType::TENCENTCLOUD}};
+    {"tencent", CloudProviderType::TENCENTCLOUD},
+    {"gcpnative", CloudProviderType::GCPNATIVE}};
 
 std::map<std::string, int> ReadAheadPolicy_Map = {
     {"normal", MADV_NORMAL},
@@ -534,12 +539,15 @@ GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id) {
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
-                            const std::string& file) {
+                            const std::string& file,
+                            bool is_field_data) {
     auto fileSize = chunk_manager->Size(file);
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
     chunk_manager->Read(file, buf.get(), fileSize);
 
-    return DeserializeFileData(buf, fileSize);
+    auto res = DeserializeFileData(buf, fileSize, is_field_data);
+    res->SetData(buf);
+    return res;
 }
 
 std::pair<std::string, size_t>
@@ -594,7 +602,7 @@ GetObjectData(ChunkManager* remote_chunk_manager,
     futures.reserve(remote_files.size());
     for (auto& file : remote_files) {
         futures.emplace_back(pool.Submit(
-            DownloadAndDecodeRemoteFile, remote_chunk_manager, file));
+            DownloadAndDecodeRemoteFile, remote_chunk_manager, file, true));
     }
     return futures;
 }
@@ -712,6 +720,12 @@ CreateChunkManager(const StorageConfig& storage_config) {
 #ifdef AZURE_BUILD_DIR
                 case CloudProviderType::AZURE: {
                     return std::make_shared<AzureChunkManager>(storage_config);
+                }
+#endif
+#ifdef ENABLE_GCP_NATIVE
+                case CloudProviderType::GCPNATIVE: {
+                    return std::make_shared<GcpNativeChunkManager>(
+                        storage_config);
                 }
 #endif
                 default: {

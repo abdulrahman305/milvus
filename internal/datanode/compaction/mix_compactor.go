@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
@@ -55,6 +56,8 @@ type mixCompactionTask struct {
 	targetSize   int64
 	maxRows      int64
 	pkID         int64
+
+	bm25FieldIDs []int64
 
 	done chan struct{}
 	tr   *timerecord.TimeRecorder
@@ -96,6 +99,7 @@ func (t *mixCompactionTask) preCompact() error {
 	t.collectionID = t.plan.GetSegmentBinlogs()[0].GetCollectionID()
 	t.partitionID = t.plan.GetSegmentBinlogs()[0].GetPartitionID()
 	t.targetSize = t.plan.GetMaxSize()
+	t.bm25FieldIDs = GetBM25FieldIDs(t.plan.GetSchema())
 
 	currSize := int64(0)
 	for _, segmentBinlog := range t.plan.GetSegmentBinlogs() {
@@ -115,9 +119,10 @@ func (t *mixCompactionTask) preCompact() error {
 	outputSegmentCount := int64(math.Ceil(float64(currSize) / float64(t.targetSize)))
 	log.Info("preCompaction analyze",
 		zap.Int64("planID", t.GetPlanID()),
-		zap.Int64("currSize", currSize),
+		zap.Int64("inputSize", currSize),
 		zap.Int64("targetSize", t.targetSize),
-		zap.Int64("estimatedSegmentCount", outputSegmentCount),
+		zap.Int("inputSegmentCount", len(t.plan.GetSegmentBinlogs())),
+		zap.Int64("estimatedOutputSegmentCount", outputSegmentCount),
 	)
 
 	return nil
@@ -138,18 +143,7 @@ func (t *mixCompactionTask) mergeSplit(
 	segIDAlloc := allocator.NewLocalAllocator(t.plan.GetPreAllocatedSegmentIDs().GetBegin(), t.plan.GetPreAllocatedSegmentIDs().GetEnd())
 	logIDAlloc := allocator.NewLocalAllocator(t.plan.GetBeginLogID(), math.MaxInt64)
 	compAlloc := NewCompactionAllocator(segIDAlloc, logIDAlloc)
-	mWriter := NewMultiSegmentWriter(t.binlogIO, compAlloc, t.plan, t.maxRows, t.partitionID, t.collectionID)
-
-	isValueDeleted := func(v *storage.Value) bool {
-		ts, ok := delta[v.PK.GetValue()]
-		// insert task and delete task has the same ts when upsert
-		// here should be < instead of <=
-		// to avoid the upsert data to be deleted after compact
-		if ok && uint64(v.Timestamp) < ts {
-			return true
-		}
-		return false
-	}
+	mWriter := NewMultiSegmentWriter(t.binlogIO, compAlloc, t.plan, t.maxRows, t.partitionID, t.collectionID, t.bm25FieldIDs)
 
 	deletedRowCount := int64(0)
 	expiredRowCount := int64(0)
@@ -160,50 +154,9 @@ func (t *mixCompactionTask) mergeSplit(
 		return nil, err
 	}
 	for _, paths := range binlogPaths {
-		log := log.With(zap.Strings("paths", paths))
-		allValues, err := t.binlogIO.Download(ctx, paths)
+		err := t.dealBinlogPaths(ctx, delta, mWriter, pkField, paths, &deletedRowCount, &expiredRowCount)
 		if err != nil {
-			log.Warn("compact wrong, fail to download insertLogs", zap.Error(err))
 			return nil, err
-		}
-
-		blobs := lo.Map(allValues, func(v []byte, i int) *storage.Blob {
-			return &storage.Blob{Key: paths[i], Value: v}
-		})
-
-		iter, err := storage.NewBinlogDeserializeReader(blobs, pkField.GetFieldID())
-		if err != nil {
-			log.Warn("compact wrong, failed to new insert binlogs reader", zap.Error(err))
-			return nil, err
-		}
-
-		for {
-			err := iter.Next()
-			if err != nil {
-				if err == sio.EOF {
-					break
-				} else {
-					log.Warn("compact wrong, failed to iter through data", zap.Error(err))
-					return nil, err
-				}
-			}
-			v := iter.Value()
-			if isValueDeleted(v) {
-				deletedRowCount++
-				continue
-			}
-
-			// Filtering expired entity
-			if isExpiredEntity(t.plan.GetCollectionTtl(), t.currentTs, typeutil.Timestamp(v.Timestamp)) {
-				expiredRowCount++
-				continue
-			}
-
-			err = mWriter.Write(v)
-			if err != nil {
-				log.Warn("compact wrong, failed to writer row", zap.Error(err))
-				return nil, err
-			}
 		}
 	}
 	res, err := mWriter.Finish()
@@ -220,6 +173,70 @@ func (t *mixCompactionTask) mergeSplit(
 		zap.Duration("total elapse", totalElapse))
 
 	return res, nil
+}
+
+func isValueDeleted(v *storage.Value, delta map[interface{}]typeutil.Timestamp) bool {
+	ts, ok := delta[v.PK.GetValue()]
+	// insert task and delete task has the same ts when upsert
+	// here should be < instead of <=
+	// to avoid the upsert data to be deleted after compact
+	if ok && uint64(v.Timestamp) < ts {
+		return true
+	}
+	return false
+}
+
+func (t *mixCompactionTask) dealBinlogPaths(ctx context.Context, delta map[interface{}]typeutil.Timestamp, mWriter *MultiSegmentWriter, pkField *schemapb.FieldSchema, paths []string, deletedRowCount, expiredRowCount *int64) error {
+	log := log.With(zap.Strings("paths", paths))
+	allValues, err := t.binlogIO.Download(ctx, paths)
+	if err != nil {
+		log.Warn("compact wrong, fail to download insertLogs", zap.Error(err))
+		return err
+	}
+
+	blobs := lo.Map(allValues, func(v []byte, i int) *storage.Blob {
+		return &storage.Blob{Key: paths[i], Value: v}
+	})
+
+	iter, err := storage.NewBinlogDeserializeReader(blobs, pkField.GetFieldID())
+	if err != nil {
+		log.Warn("compact wrong, failed to new insert binlogs reader", zap.Error(err))
+		return err
+	}
+	defer iter.Close()
+
+	for {
+		err := iter.Next()
+		if err != nil {
+			if err == sio.EOF {
+				break
+			} else {
+				log.Warn("compact wrong, failed to iter through data", zap.Error(err))
+				return err
+			}
+		}
+		v := iter.Value()
+		if isValueDeleted(v, delta) {
+			oldDeletedRowCount := *deletedRowCount
+			*deletedRowCount = oldDeletedRowCount + 1
+			continue
+		}
+
+		// Filtering expired entity
+		if isExpiredEntity(t.plan.GetCollectionTtl(), t.currentTs, typeutil.Timestamp(v.Timestamp)) {
+			oldExpiredRowCount := *expiredRowCount
+			*expiredRowCount = oldExpiredRowCount + 1
+			continue
+		}
+
+		err = mWriter.Write(v)
+		if err != nil {
+			log.Warn("compact wrong, failed to writer row", zap.Error(err))
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
@@ -271,7 +288,7 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 	if allSorted && len(t.plan.GetSegmentBinlogs()) > 1 {
 		log.Info("all segments are sorted, use merge sort")
 		res, err = mergeSortMultipleSegments(ctxTimeout, t.plan, t.collectionID, t.partitionID, t.maxRows, t.binlogIO,
-			t.plan.GetSegmentBinlogs(), deltaPk2Ts, t.tr, t.currentTs, t.plan.GetCollectionTtl())
+			t.plan.GetSegmentBinlogs(), deltaPk2Ts, t.tr, t.currentTs, t.plan.GetCollectionTtl(), t.bm25FieldIDs)
 		if err != nil {
 			log.Warn("compact wrong, fail to merge sort segments", zap.Error(err))
 			return nil, err
@@ -326,4 +343,13 @@ func (t *mixCompactionTask) GetCollection() typeutil.UniqueID {
 
 func (t *mixCompactionTask) GetSlotUsage() int64 {
 	return t.plan.GetSlotUsage()
+}
+
+func GetBM25FieldIDs(coll *schemapb.CollectionSchema) []int64 {
+	return lo.FilterMap(coll.GetFunctions(), func(function *schemapb.FunctionSchema, _ int) (int64, bool) {
+		if function.GetType() == schemapb.FunctionType_BM25 {
+			return function.GetOutputFieldIds()[0], true
+		}
+		return 0, false
+	})
 }

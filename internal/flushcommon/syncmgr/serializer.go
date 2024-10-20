@@ -41,12 +41,15 @@ type SyncPack struct {
 	// data
 	insertData []*storage.InsertData
 	deltaData  *storage.DeleteData
+	bm25Stats  map[int64]*storage.BM25Stats
+
 	// statistics
 	tsFrom        typeutil.Timestamp
 	tsTo          typeutil.Timestamp
 	startPosition *msgpb.MsgPosition
 	checkpoint    *msgpb.MsgPosition
 	batchSize     int64 // batchSize is the row number of this sync task,not the total num of rows of segemnt
+	dataSource    string
 	isFlush       bool
 	isDrop        bool
 	// metadata
@@ -68,6 +71,11 @@ func (p *SyncPack) WithInsertData(insertData []*storage.InsertData) *SyncPack {
 
 func (p *SyncPack) WithDeleteData(deltaData *storage.DeleteData) *SyncPack {
 	p.deltaData = deltaData
+	return p
+}
+
+func (p *SyncPack) WithBM25Stats(stats map[int64]*storage.BM25Stats) *SyncPack {
+	p.bm25Stats = stats
 	return p
 }
 
@@ -128,5 +136,10 @@ func (p *SyncPack) WithLevel(level datapb.SegmentLevel) *SyncPack {
 
 func (p *SyncPack) WithErrorHandler(handler func(err error)) *SyncPack {
 	p.errHandler = handler
+	return p
+}
+
+func (p *SyncPack) WithDataSource(source string) *SyncPack {
+	p.dataSource = source
 	return p
 }

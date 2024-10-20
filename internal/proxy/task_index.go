@@ -28,6 +28,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
@@ -136,24 +137,11 @@ func (cit *createIndexTask) parseFunctionParamsToIndex(indexParamsMap map[string
 	}
 
 	switch cit.functionSchema.GetType() {
+	case schemapb.FunctionType_Unknown:
+		return fmt.Errorf("unknown function type encountered")
+
 	case schemapb.FunctionType_BM25:
-		for _, kv := range cit.functionSchema.GetParams() {
-			switch kv.GetKey() {
-			case "bm25_k1":
-				if _, ok := indexParamsMap["bm25_k1"]; !ok {
-					indexParamsMap["bm25_k1"] = kv.GetValue()
-				}
-			case "bm25_b":
-				if _, ok := indexParamsMap["bm25_b"]; !ok {
-					indexParamsMap["bm25_b"] = kv.GetValue()
-				}
-			case "bm25_avgdl":
-				if _, ok := indexParamsMap["bm25_avgdl"]; !ok {
-					indexParamsMap["bm25_avgdl"] = kv.GetValue()
-				}
-			}
-		}
-		// set default avgdl
+		// set default BM25 params if not provided in index params
 		if _, ok := indexParamsMap["bm25_k1"]; !ok {
 			indexParamsMap["bm25_k1"] = "1.2"
 		}
@@ -165,8 +153,15 @@ func (cit *createIndexTask) parseFunctionParamsToIndex(indexParamsMap map[string
 		if _, ok := indexParamsMap["bm25_avgdl"]; !ok {
 			indexParamsMap["bm25_avgdl"] = "100"
 		}
+
+		if metricType, ok := indexParamsMap["metric_type"]; !ok {
+			indexParamsMap["metric_type"] = metric.BM25
+		} else if metricType != metric.BM25 {
+			return fmt.Errorf("index metric type of BM25 function output field must be BM25, got %s", metricType)
+		}
+
 	default:
-		return fmt.Errorf("parse unknown type function params to index")
+		return nil
 	}
 
 	return nil
@@ -190,11 +185,6 @@ func (cit *createIndexTask) parseIndexParams() error {
 		} else {
 			indexParamsMap[kv.Key] = kv.Value
 		}
-	}
-
-	// fill index param for bm25 function
-	if err := cit.parseFunctionParamsToIndex(indexParamsMap); err != nil {
-		return err
 	}
 
 	if err := ValidateAutoIndexMmapConfig(isVecIndex, indexParamsMap); err != nil {
@@ -342,11 +332,16 @@ func (cit *createIndexTask) parseIndexParams() error {
 			}
 		}
 
+		// fill index param for Functions
+		if err := cit.parseFunctionParamsToIndex(indexParamsMap); err != nil {
+			return err
+		}
+
 		indexType, exist := indexParamsMap[common.IndexTypeKey]
 		if !exist {
 			return fmt.Errorf("IndexType not specified")
 		}
-		if indexType == indexparamcheck.IndexDISKANN {
+		if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexType) {
 			err := indexparams.FillDiskIndexParams(Params, indexParamsMap)
 			if err != nil {
 				return err
@@ -361,8 +356,12 @@ func (cit *createIndexTask) parseIndexParams() error {
 				return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "float vector index does not support metric type: "+metricType)
 			}
 		} else if typeutil.IsSparseFloatVectorType(cit.fieldSchema.DataType) {
-			if metricType != metric.IP {
-				return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "only IP is the supported metric type for sparse index")
+			if metricType != metric.IP && metricType != metric.BM25 {
+				return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "only IP&BM25 is the supported metric type for sparse index")
+			}
+
+			if metricType == metric.BM25 && cit.functionSchema.GetType() != schemapb.FunctionType_BM25 {
+				return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "only BM25 Function output field support BM25 metric type")
 			}
 		} else if typeutil.IsBinaryVectorType(cit.fieldSchema.DataType) {
 			if !funcutil.SliceContain(indexparamcheck.BinaryVectorMetrics, metricType) {

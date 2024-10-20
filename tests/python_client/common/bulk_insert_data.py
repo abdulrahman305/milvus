@@ -34,6 +34,7 @@ class DataField:
     fp16_vec_field = "float16_vec_field"
     int_field = "int_scalar"
     string_field = "string_scalar"
+    text_field = "text_scalar"
     bool_field = "bool_scalar"
     float_field = "float_scalar"
     double_field = "double_scalar"
@@ -388,14 +389,34 @@ def gen_vectors_in_numpy_file(dir, data_field, float_vector, rows, dim, vector_t
     return file_name
 
 
-def gen_string_in_numpy_file(dir, data_field, rows, start=0, force=False):
+def gen_string_in_numpy_file(dir, data_field, rows, start=0, force=False, **kwargs):
+    file_name = f"{data_field}.npy"
+    file = f"{dir}/{file_name}"
+    shuffle_pk = kwargs.get("shuffle_pk", False)
+    if not os.path.exists(file) or force:
+        # non vector columns
+        data = []
+        if rows > 0:
+            data = [gen_unique_str(str(i)) for i in range(start, rows+start)]
+        arr = np.array(data)
+        # print(f"file_name: {file_name} data type: {arr.dtype}")
+        if shuffle_pk:
+            np.random.shuffle(arr)
+        log.info(f"file_name: {file_name} data type: {arr.dtype} data shape: {arr.shape}, shuffle_pk: {shuffle_pk}")
+        np.save(file, arr)
+    return file_name
+
+
+def gen_text_in_numpy_file(dir, data_field, rows, start=0, force=False, nullable=False):
     file_name = f"{data_field}.npy"
     file = f"{dir}/{file_name}"
     if not os.path.exists(file) or force:
         # non vector columns
         data = []
         if rows > 0:
-            data = [gen_unique_str(str(i)) for i in range(start, rows+start)]
+            data = [fake.text() + " milvus " for i in range(start, rows+start)]
+            if nullable:
+                data = [None if random.random() < 0.5 else fake.text() + " milvus "  for _ in range(rows)]
         arr = np.array(data)
         # print(f"file_name: {file_name} data type: {arr.dtype}")
         log.info(f"file_name: {file_name} data type: {arr.dtype} data shape: {arr.shape}")
@@ -445,9 +466,10 @@ def gen_json_in_numpy_file(dir, data_field, rows, start=0, force=False):
     return file_name
 
 
-def gen_int_or_float_in_numpy_file(dir, data_field, rows, start=0, force=False, nullable=False):
+def gen_int_or_float_in_numpy_file(dir, data_field, rows, start=0, force=False, nullable=False, **kwargs):
     file_name = f"{data_field}.npy"
     file = f"{dir}/{file_name}"
+    shuffle_pk = kwargs.get("shuffle_pk", False)
     if not os.path.exists(file) or force:
         # non vector columns
         data = []
@@ -459,13 +481,15 @@ def gen_int_or_float_in_numpy_file(dir, data_field, rows, start=0, force=False, 
                 data = [np.float64(random.random()) for _ in range(rows)]
             elif data_field == DataField.pk_field:
                 data = [i for i in range(start, start + rows)]
+                if shuffle_pk:
+                    random.shuffle(data)
             elif data_field == DataField.int_field:
                 if not nullable:
                     data = [random.randint(-999999, 9999999) for _ in range(rows)]
                 else:
                     data = [None for _ in range(rows)]
             arr = np.array(data)
-            log.info(f"file_name: {file_name} data type: {arr.dtype} data shape: {arr.shape}")
+            log.info(f"file_name: {file_name} data type: {arr.dtype} data shape: {arr.shape}, shuffle_pk: {shuffle_pk}")
             np.save(file, arr)
     return file_name
 
@@ -553,6 +577,11 @@ def gen_data_by_data_field(data_field, rows, start=0, float_vector=True, dim=128
                 data = [gen_unique_str(str(i)) for i in range(start, rows + start)]
             else:
                 data = [None for _ in range(start, rows + start)]
+        elif data_field == DataField.text_field:
+            if not nullable:
+                data = [fake.text() + " milvus " for i in range(start, rows + start)]
+            else:
+                data = [None if random.random() < 0.5 else  fake.text() + " milvus " for _ in range(start, rows + start)]
         elif data_field == DataField.bool_field:
             if not nullable:
                 data = [random.choice([True, False]) for i in range(start, rows + start)]
@@ -566,38 +595,39 @@ def gen_data_by_data_field(data_field, rows, start=0, float_vector=True, dim=128
             else:
                 data = pd.Series([json.dumps({
                     gen_unique_str(): None}) for _ in range(start, rows + start)])
+                data =[json.dumps({gen_unique_str():None}) for _ in range(start, rows + start)]
         elif data_field == DataField.array_bool_field:
             if not nullable:
                 data = pd.Series(
                     [np.array([random.choice([True, False]) for _ in range(array_length)], dtype=np.dtype("bool"))
                      for i in range(start, rows + start)])
             else:
-                data = pd.Series(
-                    [np.array(None) for i in range(start, rows + start)])
+                data = [None for _ in range(start, rows + start)]
         elif data_field == DataField.array_int_field:
             if not nullable:
                 data = pd.Series(
                     [np.array([random.randint(-999999, 9999999) for _ in range(array_length)], dtype=np.dtype("int64"))
                      for i in range(start, rows + start)])
             else:
-                data = pd.Series(
-                    [np.array(None) for i in range(start, rows + start)])
+                data = [None for _ in range(start, rows + start)]
         elif data_field == DataField.array_float_field:
             if not nullable:
                 data = pd.Series(
                     [np.array([random.random() for _ in range(array_length)], dtype=np.dtype("float32"))
                      for i in range(start, rows + start)])
             else:
-                data = pd.Series(
-                    [np.array(None) for i in range(start, rows + start)])
+                data = [None for _ in range(start, rows + start)]
+
         elif data_field == DataField.array_string_field:
             if not nullable:
                 data = pd.Series(
                     [np.array([gen_unique_str(str(i)) for _ in range(array_length)], dtype=np.dtype("str"))
                      for i in range(start, rows + start)])
             else:
-                data = pd.Series(
-                    [np.array(None) for i in range(start, rows + start)])
+                data = [None for _ in range(start, rows + start)]
+        else:
+            raise Exception("unsupported field name")
+
     return data
 
 
@@ -670,6 +700,7 @@ def gen_json_files(is_row_based, rows, dim, auto_id, str_pk,
 
 def gen_dict_data_by_data_field(data_fields, rows, start=0, float_vector=True, dim=128, array_length=None, enable_dynamic_field=False, **kwargs):
     schema = kwargs.get("schema", None)
+    shuffle = kwargs.get("shuffle", False)
     schema = schema.to_dict() if schema is not None else None
     data = []
     nullable = False
@@ -714,6 +745,14 @@ def gen_dict_data_by_data_field(data_fields, rows, start=0, float_vector=True, d
             elif data_field == DataField.string_field:
                 if not nullable:
                     d[data_field] = gen_unique_str(str(r + start))
+            elif data_field == DataField.text_field:
+                if not nullable:
+                    d[data_field] = fake.text() + " milvus "
+                else:
+                    if random.random() < 0.5:
+                         d[data_field] = None
+                    else:
+                        d[data_field] = fake.text() + " milvus "
             elif data_field == DataField.bool_field:
                 if not nullable:
                     d[data_field] = random.choice([True, False])
@@ -746,12 +785,16 @@ def gen_dict_data_by_data_field(data_fields, rows, start=0, float_vector=True, d
                     d[data_field] = [gen_unique_str(str(i)) for i in range(array_length)]
                 else:
                     d[data_field] = None
+            else:
+                raise Exception("unsupported field name")
         if enable_dynamic_field:
             d[str(r+start)] = r+start
             d["name"] = fake.name()
             d["address"] = fake.address()
         data.append(d)
-
+    if shuffle:
+        random.shuffle(data)
+    log.info(f"shuffle={shuffle}")
     return data
 
 
@@ -816,6 +859,7 @@ def gen_npy_files(float_vector, rows, dim, data_fields, file_size=None, file_num
     files = []
     start_uid = 0
     nullable = False
+    shuffle_pk = kwargs.get("shuffle_pk", False)
     if file_nums == 1:
         # gen the numpy file without subfolders if only one set of files
         for data_field in data_fields:
@@ -844,14 +888,16 @@ def gen_npy_files(float_vector, rows, dim, data_fields, file_size=None, file_num
                 file_name = gen_vectors_in_numpy_file(dir=data_source_new, data_field=data_field, float_vector=float_vector,
                                                       vector_type=vector_type, rows=rows, dim=dim, force=force)
             elif data_field == DataField.string_field:  # string field for numpy not supported yet at 2022-10-17
-                file_name = gen_string_in_numpy_file(dir=data_source_new, data_field=data_field, rows=rows, force=force)
+                file_name = gen_string_in_numpy_file(dir=data_source_new, data_field=data_field, rows=rows, force=force, shuffle_pk=shuffle_pk)
+            elif data_field == DataField.text_field:
+                file_name = gen_text_in_numpy_file(dir=data_source_new, data_field=data_field, rows=rows, force=force, nullable=nullable)
             elif data_field == DataField.bool_field:
                 file_name = gen_bool_in_numpy_file(dir=data_source_new, data_field=data_field, rows=rows, force=force)
             elif data_field == DataField.json_field:
                 file_name = gen_json_in_numpy_file(dir=data_source_new, data_field=data_field, rows=rows, force=force)
             else:
                 file_name = gen_int_or_float_in_numpy_file(dir=data_source_new, data_field=data_field,
-                                                           rows=rows, force=force, nullable=nullable)
+                                                           rows=rows, force=force, nullable=nullable, shuffle_pk=shuffle_pk)
             files.append(file_name)
         if enable_dynamic_field and include_meta:
             file_name = gen_dynamic_field_in_numpy_file(dir=data_source_new, rows=rows, force=force)

@@ -127,7 +127,7 @@ func (st *statsTask) GetFailReason() string {
 	return st.taskInfo.GetFailReason()
 }
 
-func (st *statsTask) UpdateVersion(ctx context.Context, meta *meta) error {
+func (st *statsTask) UpdateVersion(ctx context.Context, nodeID int64, meta *meta) error {
 	// mark compacting
 	if exist, canDo := meta.CheckAndSetSegmentsCompacting([]UniqueID{st.segmentID}); !exist || !canDo {
 		log.Warn("segment is not exist or is compacting, skip stats",
@@ -136,12 +136,15 @@ func (st *statsTask) UpdateVersion(ctx context.Context, meta *meta) error {
 		return fmt.Errorf("mark segment compacting failed, isCompacting: %v", !canDo)
 	}
 
-	return meta.statsTaskMeta.UpdateVersion(st.taskID)
+	if err := meta.statsTaskMeta.UpdateVersion(st.taskID, nodeID); err != nil {
+		return err
+	}
+	st.nodeID = nodeID
+	return nil
 }
 
-func (st *statsTask) UpdateMetaBuildingState(nodeID int64, meta *meta) error {
-	st.nodeID = nodeID
-	return meta.statsTaskMeta.UpdateBuildingTask(st.taskID, nodeID)
+func (st *statsTask) UpdateMetaBuildingState(meta *meta) error {
+	return meta.statsTaskMeta.UpdateBuildingTask(st.taskID)
 }
 
 func (st *statsTask) PreCheck(ctx context.Context, dependency *taskScheduler) bool {
@@ -175,7 +178,9 @@ func (st *statsTask) PreCheck(ctx context.Context, dependency *taskScheduler) bo
 		return false
 	}
 
-	start, end, err := dependency.allocator.AllocN(segment.getSegmentSize() / Params.DataNodeCfg.BinLogMaxSize.GetAsInt64() * int64(len(collInfo.Schema.GetFields())) * 2)
+	binlogNum := (segment.getSegmentSize()/Params.DataNodeCfg.BinLogMaxSize.GetAsInt64() + 1) * int64(len(collInfo.Schema.GetFields())) * 100
+	// binlogNum + BM25logNum + statslogNum
+	start, end, err := dependency.allocator.AllocN(binlogNum + int64(len(collInfo.Schema.GetFunctions())) + 1)
 	if err != nil {
 		log.Warn("stats task alloc logID failed", zap.Int64("collectionID", segment.GetCollectionID()), zap.Error(err))
 		st.SetState(indexpb.JobState_JobStateInit, err.Error())

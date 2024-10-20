@@ -2507,7 +2507,7 @@ func (node *Proxy) Insert(ctx context.Context, request *milvuspb.InsertRequest) 
 	tr := timerecord.NewTimeRecorder(method)
 	metrics.GetStats(ctx).
 		SetNodeID(paramtable.GetNodeID()).
-		SetInboundLabel(method).
+		SetInboundLabel(metrics.InsertLabel).
 		SetCollectionName(request.GetCollectionName())
 	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.TotalLabel, request.GetDbName(), request.GetCollectionName()).Inc()
 
@@ -2642,7 +2642,7 @@ func (node *Proxy) Delete(ctx context.Context, request *milvuspb.DeleteRequest) 
 
 	metrics.GetStats(ctx).
 		SetNodeID(paramtable.GetNodeID()).
-		SetInboundLabel(method).
+		SetInboundLabel(metrics.DeleteLabel).
 		SetCollectionName(request.GetCollectionName())
 
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
@@ -2702,7 +2702,6 @@ func (node *Proxy) Delete(ctx context.Context, request *milvuspb.DeleteRequest) 
 
 	dbName := request.DbName
 	nodeID := paramtable.GetStringNodeID()
-	metrics.ProxyDeleteVectors.WithLabelValues(nodeID, dbName).Add(float64(successCnt))
 
 	username := GetCurUserFromContextOrDefault(ctx)
 	collectionName := request.CollectionName
@@ -2751,7 +2750,7 @@ func (node *Proxy) Upsert(ctx context.Context, request *milvuspb.UpsertRequest) 
 
 	metrics.GetStats(ctx).
 		SetNodeID(paramtable.GetNodeID()).
-		SetInboundLabel(method).
+		SetInboundLabel(metrics.UpsertLabel).
 		SetCollectionName(request.GetCollectionName())
 
 	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.TotalLabel, request.GetDbName(), request.GetCollectionName()).Inc()
@@ -4111,6 +4110,7 @@ func (node *Proxy) GetPersistentSegmentInfo(ctx context.Context, req *milvuspb.G
 			NumRows:      info.NumOfRows,
 			State:        info.State,
 			Level:        commonpb.SegmentLevel(info.Level),
+			IsSorted:     info.GetIsSorted(),
 		}
 	}
 	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method,
@@ -4184,6 +4184,7 @@ func (node *Proxy) GetQuerySegmentInfo(ctx context.Context, req *milvuspb.GetQue
 			State:        info.SegmentState,
 			NodeIds:      info.NodeIds,
 			Level:        commonpb.SegmentLevel(info.Level),
+			IsSorted:     info.GetIsSorted(),
 		}
 	}
 

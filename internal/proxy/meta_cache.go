@@ -113,7 +113,6 @@ type collectionInfo struct {
 type databaseInfo struct {
 	dbID             typeutil.UniqueID
 	createdTimestamp uint64
-	properties       map[string]string
 }
 
 // schemaInfo is a helper function wraps *schemapb.CollectionSchema
@@ -470,6 +469,9 @@ func (m *MetaCache) update(ctx context.Context, database, collectionName string,
 	})
 
 	collectionName = collection.Schema.GetName()
+	if database == "" {
+		log.Warn("database is empty, use default database name", zap.String("collectionName", collectionName), zap.Stack("stack"))
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, dbOk := m.collInfo[database]
@@ -1210,7 +1212,6 @@ func (m *MetaCache) GetDatabaseInfo(ctx context.Context, database string) (*data
 		dbInfo := &databaseInfo{
 			dbID:             resp.GetDbID(),
 			createdTimestamp: resp.GetCreatedTimestamp(),
-			properties:       funcutil.KeyValuePair2Map(resp.GetProperties()),
 		}
 		m.dbInfo[database] = dbInfo
 		return dbInfo, nil

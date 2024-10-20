@@ -37,10 +37,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
@@ -263,7 +263,7 @@ func NewCollection(collectionID int64, schema *schemapb.CollectionSchema, indexM
 
 		for _, indexMeta := range indexMeta.GetIndexMetas() {
 			isGpuIndex = lo.ContainsBy(indexMeta.GetIndexParams(), func(param *commonpb.KeyValuePair) bool {
-				return param.Key == common.IndexTypeKey && indexparamcheck.IsGpuIndex(param.Value)
+				return param.Key == common.IndexTypeKey && vecindexmgr.GetVecIndexMgrInstance().IsGPUVecIndex(param.Value)
 			})
 			if isGpuIndex {
 				break
@@ -297,6 +297,18 @@ func NewCollectionWithoutSchema(collectionID int64, loadType querypb.LoadType) *
 		loadType:   loadType,
 		refCount:   atomic.NewUint32(0),
 	}
+}
+
+// new collection without segcore prepare
+// ONLY FOR TEST
+func NewCollectionWithoutSegcoreForTest(collectionID int64, schema *schemapb.CollectionSchema) *Collection {
+	coll := &Collection{
+		id:         collectionID,
+		partitions: typeutil.NewConcurrentSet[int64](),
+		refCount:   atomic.NewUint32(0),
+	}
+	coll.schema.Store(schema)
+	return coll
 }
 
 // deleteCollection delete collection and free the collection memory

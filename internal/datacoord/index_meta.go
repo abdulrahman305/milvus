@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/workerpb"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
@@ -697,11 +698,11 @@ func (m *indexMeta) IsIndexExist(collID, indexID UniqueID) bool {
 }
 
 // UpdateVersion updates the version and nodeID of the index meta, whenever the task is built once, the version will be updated once.
-func (m *indexMeta) UpdateVersion(buildID UniqueID) error {
+func (m *indexMeta) UpdateVersion(buildID, nodeID UniqueID) error {
 	m.Lock()
 	defer m.Unlock()
 
-	log.Debug("IndexCoord metaTable UpdateVersion receive", zap.Int64("buildID", buildID))
+	log.Info("IndexCoord metaTable UpdateVersion receive", zap.Int64("buildID", buildID), zap.Int64("nodeID", nodeID))
 	segIdx, ok := m.buildID2SegmentIndex[buildID]
 	if !ok {
 		return fmt.Errorf("there is no index with buildID: %d", buildID)
@@ -709,6 +710,7 @@ func (m *indexMeta) UpdateVersion(buildID UniqueID) error {
 
 	updateFunc := func(segIdx *model.SegmentIndex) error {
 		segIdx.IndexVersion++
+		segIdx.NodeID = nodeID
 		return m.alterSegmentIndexes([]*model.SegmentIndex{segIdx})
 	}
 
@@ -771,7 +773,7 @@ func (m *indexMeta) DeleteTask(buildID int64) error {
 }
 
 // BuildIndex set the index state to be InProgress. It means IndexNode is building the index.
-func (m *indexMeta) BuildIndex(buildID, nodeID UniqueID) error {
+func (m *indexMeta) BuildIndex(buildID UniqueID) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -781,7 +783,6 @@ func (m *indexMeta) BuildIndex(buildID, nodeID UniqueID) error {
 	}
 
 	updateFunc := func(segIdx *model.SegmentIndex) error {
-		segIdx.NodeID = nodeID
 		segIdx.IndexState = commonpb.IndexState_InProgress
 
 		err := m.alterSegmentIndexes([]*model.SegmentIndex{segIdx})
@@ -810,6 +811,25 @@ func (m *indexMeta) GetAllSegIndexes() map[int64]*model.SegmentIndex {
 		segIndexes[buildID] = model.CloneSegmentIndex(segIndex)
 	}
 	return segIndexes
+}
+
+// SetStoredIndexFileSizeMetric returns the total index files size of all segment for each collection.
+func (m *indexMeta) SetStoredIndexFileSizeMetric(collections map[UniqueID]*collectionInfo) uint64 {
+	m.RLock()
+	defer m.RUnlock()
+
+	var total uint64
+	metrics.DataCoordStoredIndexFilesSize.Reset()
+
+	for _, segmentIdx := range m.buildID2SegmentIndex {
+		coll, ok := collections[segmentIdx.CollectionID]
+		if ok {
+			metrics.DataCoordStoredIndexFilesSize.WithLabelValues(coll.DatabaseName,
+				fmt.Sprint(segmentIdx.CollectionID), fmt.Sprint(segmentIdx.SegmentID)).Set(float64(segmentIdx.IndexSize))
+			total += segmentIdx.IndexSize
+		}
+	}
+	return total
 }
 
 func (m *indexMeta) RemoveSegmentIndex(collID, partID, segID, indexID, buildID UniqueID) error {
@@ -961,11 +981,25 @@ func (m *indexMeta) AreAllDiskIndex(collectionID int64, schema *schemapb.Collect
 	})
 	vectorFieldsWithDiskIndex := lo.Filter(vectorFields, func(field *schemapb.FieldSchema, _ int) bool {
 		if indexType, ok := fieldIndexTypes[field.FieldID]; ok {
-			return indexparamcheck.IsDiskIndex(indexType)
+			return vecindexmgr.GetVecIndexMgrInstance().IsDiskVecIndex(indexType)
 		}
 		return false
 	})
 
 	allDiskIndex := len(vectorFields) == len(vectorFieldsWithDiskIndex)
 	return allDiskIndex
+}
+
+func (m *indexMeta) HasIndex(collectionID int64) bool {
+	m.RLock()
+	defer m.RUnlock()
+	indexes, ok := m.indexes[collectionID]
+	if ok {
+		for _, index := range indexes {
+			if !index.IsDeleted {
+				return true
+			}
+		}
+	}
+	return false
 }

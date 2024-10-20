@@ -33,10 +33,10 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/workerpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/util/indexparams"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
@@ -210,7 +210,7 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 		zap.Int32("currentIndexVersion", it.req.GetCurrentIndexVersion()))
 
 	indexType := it.newIndexParams[common.IndexTypeKey]
-	if indexType == indexparamcheck.IndexDISKANN {
+	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexType) {
 		// check index node support disk index
 		if !Params.IndexNodeCfg.EnableDisk.GetAsBool() {
 			log.Warn("IndexNode don't support build disk index",
@@ -248,20 +248,21 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 	}
 
 	storageConfig := &indexcgopb.StorageConfig{
-		Address:          it.req.GetStorageConfig().GetAddress(),
-		AccessKeyID:      it.req.GetStorageConfig().GetAccessKeyID(),
-		SecretAccessKey:  it.req.GetStorageConfig().GetSecretAccessKey(),
-		UseSSL:           it.req.GetStorageConfig().GetUseSSL(),
-		BucketName:       it.req.GetStorageConfig().GetBucketName(),
-		RootPath:         it.req.GetStorageConfig().GetRootPath(),
-		UseIAM:           it.req.GetStorageConfig().GetUseIAM(),
-		IAMEndpoint:      it.req.GetStorageConfig().GetIAMEndpoint(),
-		StorageType:      it.req.GetStorageConfig().GetStorageType(),
-		UseVirtualHost:   it.req.GetStorageConfig().GetUseVirtualHost(),
-		Region:           it.req.GetStorageConfig().GetRegion(),
-		CloudProvider:    it.req.GetStorageConfig().GetCloudProvider(),
-		RequestTimeoutMs: it.req.GetStorageConfig().GetRequestTimeoutMs(),
-		SslCACert:        it.req.GetStorageConfig().GetSslCACert(),
+		Address:           it.req.GetStorageConfig().GetAddress(),
+		AccessKeyID:       it.req.GetStorageConfig().GetAccessKeyID(),
+		SecretAccessKey:   it.req.GetStorageConfig().GetSecretAccessKey(),
+		UseSSL:            it.req.GetStorageConfig().GetUseSSL(),
+		BucketName:        it.req.GetStorageConfig().GetBucketName(),
+		RootPath:          it.req.GetStorageConfig().GetRootPath(),
+		UseIAM:            it.req.GetStorageConfig().GetUseIAM(),
+		IAMEndpoint:       it.req.GetStorageConfig().GetIAMEndpoint(),
+		StorageType:       it.req.GetStorageConfig().GetStorageType(),
+		UseVirtualHost:    it.req.GetStorageConfig().GetUseVirtualHost(),
+		Region:            it.req.GetStorageConfig().GetRegion(),
+		CloudProvider:     it.req.GetStorageConfig().GetCloudProvider(),
+		RequestTimeoutMs:  it.req.GetStorageConfig().GetRequestTimeoutMs(),
+		SslCACert:         it.req.GetStorageConfig().GetSslCACert(),
+		GcpCredentialJSON: it.req.GetStorageConfig().GetGcpCredentialJSON(),
 	}
 
 	optFields := make([]*indexcgopb.OptionalFieldInfo, 0, len(it.req.GetOptionalScalarFields()))

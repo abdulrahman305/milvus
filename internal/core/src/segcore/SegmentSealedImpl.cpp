@@ -198,8 +198,9 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
                 if (!is_sorted_by_pk_ && insert_record_.empty_pks() &&
                     int64_index->HasRawData()) {
                     for (int i = 0; i < row_count; ++i) {
-                        insert_record_.insert_pk(int64_index->Reverse_Lookup(i),
-                                                 i);
+                        auto raw = int64_index->Reverse_Lookup(i);
+                        AssertInfo(raw.has_value(), "Primary key not found");
+                        insert_record_.insert_pk(raw.value(), i);
                     }
                     insert_record_.seal_pks();
                 }
@@ -212,8 +213,9 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
                 if (!is_sorted_by_pk_ && insert_record_.empty_pks() &&
                     string_index->HasRawData()) {
                     for (int i = 0; i < row_count; ++i) {
-                        insert_record_.insert_pk(
-                            string_index->Reverse_Lookup(i), i);
+                        auto raw = string_index->Reverse_Lookup(i);
+                        AssertInfo(raw.has_value(), "Primary key not found");
+                        insert_record_.insert_pk(raw.value(), i);
                     }
                     insert_record_.seal_pks();
                 }
@@ -345,43 +347,43 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                        : DEFAULT_MEM_VRCOL_BLOCK_SIZE;
         };
 
-        std::shared_ptr<ColumnBase> column{};
+        std::shared_ptr<SingleChunkColumnBase> column{};
         if (IsVariableDataType(data_type)) {
             int64_t field_data_size = 0;
             switch (data_type) {
                 case milvus::DataType::STRING:
                 case milvus::DataType::VARCHAR: {
-                    auto var_column =
-                        std::make_shared<VariableColumn<std::string>>(
-                            num_rows, field_meta, get_block_size());
+                    auto var_column = std::make_shared<
+                        SingleChunkVariableColumn<std::string>>(
+                        num_rows, field_meta, get_block_size());
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
-                    field_data_size = var_column->ByteSize();
-                    stats_.mem_size += var_column->ByteSize();
+                    field_data_size = var_column->DataByteSize();
+                    stats_.mem_size += var_column->MemoryUsageBytes();
                     LoadStringSkipIndex(field_id, 0, *var_column);
                     column = std::move(var_column);
                     break;
                 }
                 case milvus::DataType::JSON: {
-                    auto var_column =
-                        std::make_shared<VariableColumn<milvus::Json>>(
-                            num_rows, field_meta, get_block_size());
+                    auto var_column = std::make_shared<
+                        SingleChunkVariableColumn<milvus::Json>>(
+                        num_rows, field_meta, get_block_size());
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
-                    stats_.mem_size += var_column->ByteSize();
-                    field_data_size = var_column->ByteSize();
+                    stats_.mem_size += var_column->MemoryUsageBytes();
+                    field_data_size = var_column->DataByteSize();
                     column = std::move(var_column);
                     break;
                 }
                 case milvus::DataType::ARRAY: {
-                    auto var_column =
-                        std::make_shared<ArrayColumn>(num_rows, field_meta);
+                    auto var_column = std::make_shared<SingleChunkArrayColumn>(
+                        num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
                         for (auto i = 0; i < field_data->get_num_rows(); i++) {
@@ -407,7 +409,8 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                     break;
                 }
                 case milvus::DataType::VECTOR_SPARSE_FLOAT: {
-                    auto col = std::make_shared<SparseFloatColumn>(field_meta);
+                    auto col = std::make_shared<SingleChunkSparseFloatColumn>(
+                        field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
                         stats_.mem_size += field_data->Size();
@@ -426,7 +429,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
             SegmentInternalInterface::set_field_avg_size(
                 field_id, num_rows, field_data_size);
         } else {
-            column = std::make_shared<Column>(num_rows, field_meta);
+            column = std::make_shared<SingleChunkColumn>(num_rows, field_meta);
             FieldDataPtr field_data;
             while (data.channel->pop(field_data)) {
                 column->AppendBatch(field_data);
@@ -516,24 +519,25 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
                        valid_data);
     }
     WriteFieldPadding(file, data_type, total_written);
-    std::shared_ptr<ColumnBase> column{};
+    std::shared_ptr<SingleChunkColumnBase> column{};
     auto num_rows = data.row_count;
     if (IsVariableDataType(data_type)) {
         switch (data_type) {
             case milvus::DataType::STRING:
             case milvus::DataType::VARCHAR: {
-                auto var_column = std::make_shared<VariableColumn<std::string>>(
-                    file,
-                    total_written,
-                    field_meta,
-                    DEFAULT_MMAP_VRCOL_BLOCK_SIZE);
+                auto var_column =
+                    std::make_shared<SingleChunkVariableColumn<std::string>>(
+                        file,
+                        total_written,
+                        field_meta,
+                        DEFAULT_MMAP_VRCOL_BLOCK_SIZE);
                 var_column->Seal(std::move(indices));
                 column = std::move(var_column);
                 break;
             }
             case milvus::DataType::JSON: {
                 auto var_column =
-                    std::make_shared<VariableColumn<milvus::Json>>(
+                    std::make_shared<SingleChunkVariableColumn<milvus::Json>>(
                         file,
                         total_written,
                         field_meta,
@@ -543,7 +547,7 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
                 break;
             }
             case milvus::DataType::ARRAY: {
-                auto arr_column = std::make_shared<ArrayColumn>(
+                auto arr_column = std::make_shared<SingleChunkArrayColumn>(
                     file, total_written, field_meta);
                 arr_column->Seal(std::move(indices),
                                  std::move(element_indices));
@@ -551,9 +555,9 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
                 break;
             }
             case milvus::DataType::VECTOR_SPARSE_FLOAT: {
-                auto sparse_column = std::make_shared<SparseFloatColumn>(
-                    file, total_written, field_meta);
-                sparse_column->Seal(std::move(indices));
+                auto sparse_column =
+                    std::make_shared<SingleChunkSparseFloatColumn>(
+                        file, total_written, field_meta, std::move(indices));
                 column = std::move(sparse_column);
                 break;
             }
@@ -563,7 +567,8 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
             }
         }
     } else {
-        column = std::make_shared<Column>(file, total_written, field_meta);
+        column = std::make_shared<SingleChunkColumn>(
+            file, total_written, field_meta);
     }
 
     column->SetValidData(std::move(valid_data));
@@ -572,6 +577,11 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
         std::unique_lock lck(mutex_);
         fields_.emplace(field_id, column);
         mmap_fields_.insert(field_id);
+    }
+
+    {
+        std::unique_lock lck(mutex_);
+        update_row_count(num_rows);
     }
 
     auto ok = unlink(filepath.c_str());
@@ -589,8 +599,19 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
         insert_record_.seal_pks();
     }
 
-    std::unique_lock lck(mutex_);
-    set_bit(field_data_ready_bitset_, field_id, true);
+    bool use_interim_index = false;
+    if (generate_interim_index(field_id)) {
+        std::unique_lock lck(mutex_);
+        // mmap_fields is useless, no change
+        fields_.erase(field_id);
+        set_bit(field_data_ready_bitset_, field_id, false);
+        use_interim_index = true;
+    }
+
+    if (!use_interim_index) {
+        std::unique_lock lck(mutex_);
+        set_bit(field_data_ready_bitset_, field_id, true);
+    }
 }
 
 void
@@ -665,7 +686,7 @@ SegmentSealedImpl::num_chunk_data(FieldId field_id) const {
 }
 
 int64_t
-SegmentSealedImpl::num_chunk() const {
+SegmentSealedImpl::num_chunk(FieldId field_id) const {
     return 1;
 }
 
@@ -791,9 +812,8 @@ SegmentSealedImpl::search_pk(const PkType& pk, Timestamp timestamp) const {
         case DataType::VARCHAR: {
             auto target = std::get<std::string>(pk);
             // get varchar pks
-            auto var_column =
-                std::dynamic_pointer_cast<VariableColumn<std::string>>(
-                    pk_column);
+            auto var_column = std::dynamic_pointer_cast<
+                SingleChunkVariableColumn<std::string>>(pk_column);
             auto views = var_column->Views();
             auto it = std::lower_bound(views.begin(), views.end(), target);
             for (; it != views.end() && *it == target; it++) {
@@ -844,9 +864,8 @@ SegmentSealedImpl::search_pk(const PkType& pk, int64_t insert_barrier) const {
         case DataType::VARCHAR: {
             auto target = std::get<std::string>(pk);
             // get varchar pks
-            auto var_column =
-                std::dynamic_pointer_cast<VariableColumn<std::string>>(
-                    pk_column);
+            auto var_column = std::dynamic_pointer_cast<
+                SingleChunkVariableColumn<std::string>>(pk_column);
             auto views = var_column->Views();
             auto it = std::lower_bound(views.begin(), views.end(), target);
             while (it != views.end() && *it == target) {
@@ -1058,17 +1077,24 @@ SegmentSealedImpl::GetFieldDataPath(FieldId field_id, int64_t offset) const {
     return {data_path, offset_in_binlog};
 }
 
-std::tuple<std::string, std::shared_ptr<ColumnBase>> static ReadFromChunkCache(
-    const storage::ChunkCachePtr& cc,
-    const std::string& data_path,
-    const storage::MmapChunkDescriptorPtr& descriptor) {
+std::tuple<
+    std::string,
+    std::shared_ptr<
+        SingleChunkColumnBase>> static ReadFromChunkCache(const storage::
+                                                              ChunkCachePtr& cc,
+                                                          const std::string&
+                                                              data_path,
+                                                          const storage::
+                                                              MmapChunkDescriptorPtr&
+                                                                  descriptor) {
     // For mmap mode, field_meta is unused, so just construct a fake field meta.
     auto fm =
         FieldMeta(FieldName(""), FieldId(0), milvus::DataType::NONE, false);
     // TODO: add Load() interface for chunk cache when support retrieve_enable, make Read() raise error if cache miss
     auto column = cc->Read(data_path, descriptor, fm, true);
     cc->Prefetch(data_path);
-    return {data_path, column};
+    return {data_path,
+            std::dynamic_pointer_cast<SingleChunkColumnBase>(column)};
 }
 
 std::unique_ptr<DataArray>
@@ -1116,7 +1142,8 @@ SegmentSealedImpl::get_vector(FieldId field_id,
     auto id_to_data_path =
         std::unordered_map<std::int64_t, std::tuple<std::string, int64_t>>{};
     auto path_to_column =
-        std::unordered_map<std::string, std::shared_ptr<ColumnBase>>{};
+        std::unordered_map<std::string,
+                           std::shared_ptr<SingleChunkColumnBase>>{};
     for (auto i = 0; i < count; i++) {
         const auto& tuple = GetFieldDataPath(field_id, ids[i]);
         id_to_data_path.emplace(ids[i], tuple);
@@ -1125,8 +1152,8 @@ SegmentSealedImpl::get_vector(FieldId field_id,
 
     // read and prefetch
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
-    std::vector<
-        std::future<std::tuple<std::string, std::shared_ptr<ColumnBase>>>>
+    std::vector<std::future<
+        std::tuple<std::string, std::shared_ptr<SingleChunkColumnBase>>>>
         futures;
     futures.reserve(path_to_column.size());
     for (const auto& iter : path_to_column) {
@@ -1153,7 +1180,7 @@ SegmentSealedImpl::get_vector(FieldId field_id,
                 column->NumRows(),
                 data_path);
             auto sparse_column =
-                std::dynamic_pointer_cast<SparseFloatColumn>(column);
+                std::dynamic_pointer_cast<SingleChunkSparseFloatColumn>(column);
             AssertInfo(sparse_column, "incorrect column created");
             buf[i] = static_cast<const knowhere::sparse::SparseRow<float>*>(
                 static_cast<const void*>(
@@ -1173,10 +1200,10 @@ SegmentSealedImpl::get_vector(FieldId field_id,
                        "column not found");
             const auto& column = path_to_column.at(data_path);
             AssertInfo(
-                offset_in_binlog * row_bytes < column->ByteSize(),
+                offset_in_binlog < column->NumRows(),
                 "column idx out of range, idx: {}, size: {}, data_path: {}",
-                offset_in_binlog * row_bytes,
-                column->ByteSize(),
+                offset_in_binlog,
+                column->NumRows(),
                 data_path);
             auto vector = &column->Data()[offset_in_binlog * row_bytes];
             std::memcpy(buf.data() + i * row_bytes, vector, row_bytes);
@@ -1345,11 +1372,11 @@ SegmentSealedImpl::bulk_subscript_impl(const void* src_raw,
 
 template <typename S, typename T>
 void
-SegmentSealedImpl::bulk_subscript_impl(const ColumnBase* column,
+SegmentSealedImpl::bulk_subscript_impl(const SingleChunkColumnBase* column,
                                        const int64_t* seg_offsets,
                                        int64_t count,
                                        void* dst_raw) {
-    auto field = reinterpret_cast<const VariableColumn<S>*>(column);
+    auto field = reinterpret_cast<const SingleChunkVariableColumn<S>*>(column);
     auto dst = reinterpret_cast<T*>(dst_raw);
     for (int64_t i = 0; i < count; ++i) {
         auto offset = seg_offsets[i];
@@ -1360,11 +1387,11 @@ SegmentSealedImpl::bulk_subscript_impl(const ColumnBase* column,
 template <typename S, typename T>
 void
 SegmentSealedImpl::bulk_subscript_ptr_impl(
-    const ColumnBase* column,
+    const SingleChunkColumnBase* column,
     const int64_t* seg_offsets,
     int64_t count,
     google::protobuf::RepeatedPtrField<T>* dst) {
-    auto field = reinterpret_cast<const VariableColumn<S>*>(column);
+    auto field = reinterpret_cast<const SingleChunkVariableColumn<S>*>(column);
     for (int64_t i = 0; i < count; ++i) {
         auto offset = seg_offsets[i];
         dst->at(i) = std::move(T(field->RawAt(offset)));
@@ -1374,11 +1401,11 @@ SegmentSealedImpl::bulk_subscript_ptr_impl(
 template <typename T>
 void
 SegmentSealedImpl::bulk_subscript_array_impl(
-    const ColumnBase* column,
+    const SingleChunkColumnBase* column,
     const int64_t* seg_offsets,
     int64_t count,
     google::protobuf::RepeatedPtrField<T>* dst) {
-    auto field = reinterpret_cast<const ArrayColumn*>(column);
+    auto field = reinterpret_cast<const SingleChunkArrayColumn*>(column);
     for (int64_t i = 0; i < count; ++i) {
         auto offset = seg_offsets[i];
         dst->at(i) = std::move(field->RawAt(offset));
@@ -1631,7 +1658,7 @@ SegmentSealedImpl::bulk_subscript(FieldId field_id,
     if (HasIndex(field_id)) {
         // if field has load scalar index, reverse raw data from index
         if (!IsVectorDataType(field_meta.get_data_type())) {
-            AssertInfo(num_chunk() == 1,
+            AssertInfo(num_chunk(field_id) == 1,
                        "num chunk not equal to 1 for sealed segment");
             auto index = chunk_index_impl(field_id, 0);
             if (index->HasRawData()) {
@@ -1670,7 +1697,8 @@ SegmentSealedImpl::bulk_subscript(
         }
     }
     auto dst = ret->mutable_scalars()->mutable_json_data()->mutable_data();
-    auto field = reinterpret_cast<const VariableColumn<Json>*>(column.get());
+    auto field =
+        reinterpret_cast<const SingleChunkVariableColumn<Json>*>(column.get());
     for (int64_t i = 0; i < count; ++i) {
         auto offset = seg_offsets[i];
         dst->at(i) = ExtractSubJson(std::string(field->RawAt(offset)),
@@ -1922,12 +1950,18 @@ SegmentSealedImpl::generate_interim_index(const FieldId field_id) {
     bool is_sparse =
         field_meta.get_data_type() == DataType::VECTOR_SPARSE_FLOAT;
 
+    bool enable_growing_mmap = storage::MmapManager::GetInstance()
+                                   .GetMmapConfig()
+                                   .GetEnableGrowingMmap();
+
     auto enable_binlog_index = [&]() {
-        // checkout config
-        if (!segcore_config_.get_enable_interim_segment_index()) {
+        // check milvus config
+        if (!segcore_config_.get_enable_interim_segment_index() ||
+            enable_growing_mmap) {
             return false;
         }
         // check data type
+        // TODO: QianYa when add other data type, please check the SupportInterimIndexDataType method in the go code
         if (field_meta.get_data_type() != DataType::VECTOR_FLOAT &&
             !is_sparse) {
             return false;
@@ -1965,14 +1999,16 @@ SegmentSealedImpl::generate_interim_index(const FieldId field_id) {
         if (row_count < field_binlog_config->GetBuildThreshold()) {
             return false;
         }
-        std::shared_ptr<ColumnBase> vec_data{};
+        std::shared_ptr<SingleChunkColumnBase> vec_data{};
         {
             std::shared_lock lck(mutex_);
             vec_data = fields_.at(field_id);
         }
-        auto dim = is_sparse
-                       ? dynamic_cast<SparseFloatColumn*>(vec_data.get())->Dim()
-                       : field_meta.get_dim();
+        auto dim =
+            is_sparse
+                ? dynamic_cast<SingleChunkSparseFloatColumn*>(vec_data.get())
+                      ->Dim()
+                : field_meta.get_dim();
 
         auto build_config = field_binlog_config->GetBuildBaseParams();
         build_config[knowhere::meta::DIM] = std::to_string(dim);
@@ -2031,7 +2067,7 @@ SegmentSealedImpl::CreateTextIndex(FieldId field_id) {
     const auto& field_meta = schema_->operator[](field_id);
     auto& cfg = storage::MmapManager::GetInstance().GetMmapConfig();
     std::unique_ptr<index::TextMatchIndex> index;
-    if (!cfg.GetEnableMmap()) {
+    if (!cfg.GetScalarIndexEnableMmap()) {
         // build text index in ram.
         index = std::make_unique<index::TextMatchIndex>(
             std::numeric_limits<int64_t>::max(),
@@ -2049,9 +2085,8 @@ SegmentSealedImpl::CreateTextIndex(FieldId field_id) {
         // build
         auto iter = fields_.find(field_id);
         if (iter != fields_.end()) {
-            auto column =
-                std::dynamic_pointer_cast<VariableColumn<std::string>>(
-                    iter->second);
+            auto column = std::dynamic_pointer_cast<
+                SingleChunkVariableColumn<std::string>>(iter->second);
             AssertInfo(
                 column != nullptr,
                 "failed to create text index, field is not of text type: {}",
@@ -2075,7 +2110,11 @@ SegmentSealedImpl::CreateTextIndex(FieldId field_id) {
                        "converted to string index");
             auto n = impl->Size();
             for (size_t i = 0; i < n; i++) {
-                index->AddText(impl->Reverse_Lookup(i), i);
+                auto raw = impl->Reverse_Lookup(i);
+                if (!raw.has_value()) {
+                    continue;
+                }
+                index->AddText(raw.value(), i);
             }
         }
     }

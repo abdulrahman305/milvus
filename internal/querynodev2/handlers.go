@@ -60,6 +60,7 @@ func loadL0Segments(ctx context.Context, delegator delegator.ShardDelegator, req
 				NumOfRows:     segmentInfo.NumOfRows,
 				Statslogs:     segmentInfo.Statslogs,
 				Deltalogs:     segmentInfo.Deltalogs,
+				Bm25Logs:      segmentInfo.Bm25Statslogs,
 				InsertChannel: segmentInfo.InsertChannel,
 				StartPosition: segmentInfo.GetStartPosition(),
 				Level:         segmentInfo.GetLevel(),
@@ -95,13 +96,16 @@ func loadGrowingSegments(ctx context.Context, delegator delegator.ShardDelegator
 			if len(segmentInfo.GetBinlogs()) > 0 {
 				growingSegments = append(growingSegments, &querypb.SegmentLoadInfo{
 					SegmentID:     segmentInfo.ID,
+					Level:         segmentInfo.GetLevel(),
 					PartitionID:   segmentInfo.PartitionID,
 					CollectionID:  segmentInfo.CollectionID,
 					BinlogPaths:   segmentInfo.Binlogs,
 					NumOfRows:     segmentInfo.NumOfRows,
 					Statslogs:     segmentInfo.Statslogs,
 					Deltalogs:     segmentInfo.Deltalogs,
+					Bm25Logs:      segmentInfo.Bm25Statslogs,
 					InsertChannel: segmentInfo.InsertChannel,
+					StartPosition: segmentInfo.GetStartPosition(),
 				})
 			} else {
 				log.Info("skip segment which binlog is empty", zap.Int64("segmentID", segmentInfo.ID))

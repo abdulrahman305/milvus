@@ -70,7 +70,6 @@ func (h *spyCompactionHandler) enqueueCompaction(task *datapb.CompactionTask) er
 	}
 	alloc := newMock0Allocator(h.t)
 	t.allocator = alloc
-	t.ResultSegments = []int64{100, 200}
 	plan, err := t.BuildCompactionRequest()
 	h.spyChan <- plan
 	return err
@@ -95,6 +94,100 @@ func newMockVersionManager() IndexEngineVersionManager {
 }
 
 var _ compactionPlanContext = (*spyCompactionHandler)(nil)
+
+func Test_compactionTrigger_force_without_index(t *testing.T) {
+	catalog := mocks.NewDataCoordCatalog(t)
+	catalog.EXPECT().AlterSegments(mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	collectionID := int64(11)
+	binlogs := []*datapb.FieldBinlog{
+		{
+			Binlogs: []*datapb.Binlog{
+				{EntriesNum: 5, LogID: 1},
+			},
+		},
+	}
+	deltaLogs := []*datapb.FieldBinlog{
+		{
+			Binlogs: []*datapb.Binlog{
+				{EntriesNum: 5, LogID: 1},
+			},
+		},
+	}
+
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:  101,
+				DataType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DimKey,
+						Value: "128",
+					},
+				},
+			},
+		},
+	}
+
+	m := &meta{
+		catalog:    catalog,
+		channelCPs: newChannelCps(),
+		segments: &SegmentsInfo{
+			segments: map[int64]*SegmentInfo{
+				1: {
+					SegmentInfo: &datapb.SegmentInfo{
+						ID:             1,
+						CollectionID:   collectionID,
+						PartitionID:    1,
+						LastExpireTime: 100,
+						NumOfRows:      100,
+						MaxRowNum:      300,
+						InsertChannel:  "ch1",
+						State:          commonpb.SegmentState_Flushed,
+						Binlogs:        binlogs,
+						Deltalogs:      deltaLogs,
+						IsSorted:       true,
+					},
+				},
+			},
+		},
+		indexMeta: &indexMeta{
+			segmentIndexes: map[UniqueID]map[UniqueID]*model.SegmentIndex{},
+			indexes:        map[UniqueID]map[UniqueID]*model.Index{},
+		},
+		collections: map[int64]*collectionInfo{
+			collectionID: {
+				ID:     collectionID,
+				Schema: schema,
+			},
+		},
+	}
+
+	compactionHandler := &spyCompactionHandler{t: t, spyChan: make(chan *datapb.CompactionPlan, 1), meta: m}
+	tr := &compactionTrigger{
+		meta:              m,
+		handler:           newMockHandlerWithMeta(m),
+		allocator:         newMock0Allocator(t),
+		signals:           nil,
+		compactionHandler: compactionHandler,
+		globalTrigger:     nil,
+		closeCh:           lifetime.NewSafeChan(),
+		testingOnly:       true,
+	}
+
+	_, err := tr.triggerManualCompaction(collectionID)
+	assert.NoError(t, err)
+
+	select {
+	case val := <-compactionHandler.spyChan:
+		assert.Equal(t, 1, len(val.SegmentBinlogs))
+		return
+	case <-time.After(3 * time.Second):
+		assert.Fail(t, "failed to get plan")
+		return
+	}
+}
 
 func Test_compactionTrigger_force(t *testing.T) {
 	paramtable.Init()
@@ -438,7 +531,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 			},
 			[]*datapb.CompactionPlan{
 				{
-					PlanID: 0,
+					PlanID: 100,
 					SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
 						{
 							SegmentID: 1,
@@ -486,13 +579,13 @@ func Test_compactionTrigger_force(t *testing.T) {
 						},
 					},
 					// StartTime:        0,
+					BeginLogID:             100,
 					TimeoutInSeconds:       Params.DataCoordCfg.CompactionTimeoutInSeconds.GetAsInt32(),
 					Type:                   datapb.CompactionType_MixCompaction,
 					Channel:                "ch1",
 					TotalRows:              200,
 					Schema:                 schema,
-					PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 100, End: 200},
-					SlotUsage:              8,
+					PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 101, End: 200},
 					MaxSize:                1342177280,
 				},
 			},
@@ -785,6 +878,7 @@ func Test_compactionTrigger_force_maxSegmentLimit(t *testing.T) {
 							IsSorted: true,
 						},
 					},
+					BeginLogID:       100,
 					StartTime:        3,
 					TimeoutInSeconds: Params.DataCoordCfg.CompactionTimeoutInSeconds.GetAsInt32(),
 					Type:             datapb.CompactionType_MixCompaction,
@@ -849,6 +943,9 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 	Params.DataCoordCfg.MinSegmentToMerge.DefaultValue = "4"
 	vecFieldID := int64(201)
 	mock0Allocator := newMockAllocator(t)
+	im := newSegmentIndexMeta(nil)
+	im.indexes[2] = make(map[UniqueID]*model.Index)
+
 	tests := []struct {
 		name      string
 		fields    fields
@@ -860,7 +957,7 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 			"test no plan",
 			fields{
 				&meta{
-					indexMeta: newSegmentIndexMeta(nil),
+					indexMeta: im,
 					// 4 segment
 					channelCPs: newChannelCps(),
 

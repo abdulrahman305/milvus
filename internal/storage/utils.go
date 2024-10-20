@@ -358,7 +358,7 @@ func readDoubleArray(blobReaders []io.Reader) []float64 {
 	return ret
 }
 
-func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemapb.CollectionSchema) (idata *InsertData, err error) {
+func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemapb.CollectionSchema, skipFunction bool) (idata *InsertData, err error) {
 	blobReaders := make([]io.Reader, 0)
 	for _, blob := range msg.RowData {
 		blobReaders = append(blobReaders, bytes.NewReader(blob.GetValue()))
@@ -371,6 +371,10 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 	}
 
 	for _, field := range collSchema.Fields {
+		if skipFunction && field.GetIsFunctionOutput() {
+			continue
+		}
+
 		switch field.DataType {
 		case schemapb.DataType_FloatVector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -482,7 +486,7 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 // ColumnBasedInsertMsgToInsertData converts an InsertMsg msg into InsertData based
 // on provided CollectionSchema collSchema.
 //
-// This function checks whether all fields are provided in the collSchema.Fields.
+// This function checks whether all fields are provided in the collSchema.Fields and not function output.
 // If any field is missing in the msg, an error will be returned.
 //
 // This funcion also checks the length of each column. All columns shall have the same length.
@@ -499,6 +503,10 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 	}
 	length := 0
 	for _, field := range collSchema.Fields {
+		if field.GetIsFunctionOutput() {
+			continue
+		}
+
 		srcField, ok := srcFields[field.GetFieldID()]
 		if !ok && field.GetFieldID() >= common.StartOfUserFieldID {
 			return nil, merr.WrapErrFieldNotFound(field.GetFieldID(), fmt.Sprintf("field %s not found when converting insert msg to insert data", field.GetName()))
@@ -688,7 +696,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 
 func InsertMsgToInsertData(msg *msgstream.InsertMsg, schema *schemapb.CollectionSchema) (idata *InsertData, err error) {
 	if msg.IsRowBased() {
-		return RowBasedInsertMsgToInsertData(msg, schema)
+		return RowBasedInsertMsgToInsertData(msg, schema, true)
 	}
 	return ColumnBasedInsertMsgToInsertData(msg, schema)
 }
@@ -1264,7 +1272,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 
 func TransferInsertMsgToInsertRecord(schema *schemapb.CollectionSchema, msg *msgstream.InsertMsg) (*segcorepb.InsertRecord, error) {
 	if msg.IsRowBased() {
-		insertData, err := RowBasedInsertMsgToInsertData(msg, schema)
+		insertData, err := RowBasedInsertMsgToInsertData(msg, schema, false)
 		if err != nil {
 			return nil, err
 		}
@@ -1273,7 +1281,8 @@ func TransferInsertMsgToInsertRecord(schema *schemapb.CollectionSchema, msg *msg
 
 	// column base insert msg
 	insertRecord := &segcorepb.InsertRecord{
-		NumRows: int64(msg.NumRows),
+		NumRows:    int64(msg.NumRows),
+		FieldsData: make([]*schemapb.FieldData, 0),
 	}
 
 	insertRecord.FieldsData = append(insertRecord.FieldsData, msg.FieldsData...)

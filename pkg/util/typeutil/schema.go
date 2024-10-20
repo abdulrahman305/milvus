@@ -196,6 +196,8 @@ func CalcColumnSize(column *schemapb.FieldData) int {
 		for _, str := range column.GetScalars().GetJsonData().GetData() {
 			res += len(str)
 		}
+	default:
+		panic("Unknown data type:" + column.Type.String())
 	}
 	return res
 }
@@ -244,6 +246,8 @@ func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int) (int, e
 			// counting only the size of the vector data, ignoring other
 			// bytes used in proto.
 			res += len(vec.Contents[rowOffset])
+		default:
+			panic("Unknown data type:" + fs.GetType().String())
 		}
 	}
 	return res, nil
@@ -1265,6 +1269,44 @@ func AppendSystemFields(schema *schemapb.CollectionSchema) *schemapb.CollectionS
 	return newSchema
 }
 
+func GetId(src *schemapb.IDs, idx int) (int, any) {
+	switch src.IdField.(type) {
+	case *schemapb.IDs_IntId:
+		return 8, src.GetIntId().Data[idx]
+	case *schemapb.IDs_StrId:
+		return len(src.GetStrId().Data[idx]), src.GetStrId().Data[idx]
+	default:
+		panic("unknown pk type")
+	}
+}
+
+func AppendID(dst *schemapb.IDs, src any) {
+	switch value := src.(type) {
+	case int64:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: []int64{value},
+				},
+			}
+		} else {
+			dst.GetIntId().Data = append(dst.GetIntId().Data, value)
+		}
+	case string:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{
+					Data: []string{value},
+				},
+			}
+		} else {
+			dst.GetStrId().Data = append(dst.GetStrId().Data, value)
+		}
+	default:
+		// TODO
+	}
+}
+
 func AppendIDs(dst *schemapb.IDs, src *schemapb.IDs, idx int) {
 	switch src.IdField.(type) {
 	case *schemapb.IDs_IntId:
@@ -1692,6 +1734,18 @@ func SortSparseFloatRow(indices []uint32, values []float32) ([]uint32, []float32
 	}
 
 	return sortedIndices, sortedValues
+}
+
+func CreateAndSortSparseFloatRow(sparse map[uint32]float32) []byte {
+	row := make([]byte, len(sparse)*8)
+	data := lo.MapToSlice(sparse, func(indices uint32, value float32) Pair[uint32, float32] {
+		return Pair[uint32, float32]{indices, value}
+	})
+	sort.Slice(data, func(i, j int) bool { return data[i].A < data[j].A })
+	for i := 0; i < len(data); i++ {
+		SparseFloatRowSetAt(row, i, data[i].A, data[i].B)
+	}
+	return row
 }
 
 func CreateSparseFloatRow(indices []uint32, values []float32) []byte {

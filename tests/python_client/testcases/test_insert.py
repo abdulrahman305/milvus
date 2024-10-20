@@ -60,7 +60,7 @@ class TestInsertParams(TestcaseBase):
         data = cf.gen_default_list_data(ct.default_nb)
         mutation_res, _ = collection_w.insert(data=data)
         assert mutation_res.insert_count == ct.default_nb
-        assert mutation_res.primary_keys == data[0]
+        assert mutation_res.primary_keys == data[0].tolist()
         assert collection_w.num_entities == ct.default_nb
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -214,7 +214,7 @@ class TestInsertParams(TestcaseBase):
         data = cf.gen_default_list_data(nb=1)
         mutation_res, _ = collection_w.insert(data=data)
         assert mutation_res.insert_count == 1
-        assert mutation_res.primary_keys == data[0]
+        assert mutation_res.primary_keys == data[0].tolist()
         assert collection_w.num_entities == 1
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -387,11 +387,11 @@ class TestInsertParams(TestcaseBase):
         """
         c_name = cf.gen_unique_str(prefix)
         collection_w = self.init_collection_wrap(name=c_name)
-        data = cf.gen_default_list_data(nb=100)
-        data[0][1] = 1.0
+        data = cf.gen_default_rows_data(nb=100)
+        data[0][ct.default_int64_field_name] = 1.0
         error = {ct.err_code: 999,
                  ct.err_msg: "The Input data type is inconsistent with defined schema, {%s} field should be a int64, "
-                             "but got a {<class 'int'>} instead." % ct.default_int64_field_name}
+                             "but got a {<class 'float'>} instead." % ct.default_int64_field_name}
         collection_w.insert(data, check_task=CheckTasks.err_res, check_items=error)
 
 
@@ -1417,7 +1417,7 @@ class TestInsertString(TestcaseBase):
         data = cf.gen_default_list_data(ct.default_nb)
         mutation_res, _ = collection_w.insert(data=data)
         assert mutation_res.insert_count == ct.default_nb
-        assert mutation_res.primary_keys == data[2]
+        assert mutation_res.primary_keys == data[2].tolist()
 
     @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("string_fields", [[cf.gen_string_field(name="string_field1")],
@@ -1820,23 +1820,30 @@ class TestUpsertValid(TestcaseBase):
         assert res[0]["count(*)"] == upsert_nb * 10 - step * 9
 
     @pytest.mark.tags(CaseLabel.L2)
-    def test_upsert_enable_dynamic_field(self):
+    @pytest.mark.parametrize("auto_id", [True, False])
+    def test_upsert_in_row_with_enable_dynamic_field(self, auto_id):
         """
-        target: test upsert when enable dynamic field is True
+        target: test upsert in rows when enable dynamic field is True
         method: 1. create a collection and insert data
-                2. upsert
-        expected: not raise exception
+                2. upsert in rows
+        expected: upsert successfully
         """
         upsert_nb = ct.default_nb
         start = ct.default_nb // 2
-        collection_w = self.init_collection_general(pre_upsert, True, enable_dynamic_field=True)[0]
+        collection_w = self.init_collection_general(pre_upsert, insert_data=True, auto_id=auto_id,
+                                                    enable_dynamic_field=True)[0]
         upsert_data = cf.gen_default_rows_data(start=start)
         for i in range(start, start + upsert_nb):
             upsert_data[i - start]["new"] = [i, i + 1]
         collection_w.upsert(data=upsert_data)
-        exp = f"int64 >= {start} && int64 <= {upsert_nb + start}"
-        res = collection_w.query(exp, output_fields=["new"])[0]
-        assert len(res[0]["new"]) == 2
+        expr = f"float >= {start} && float <= {upsert_nb + start}"
+        extra_num = start if auto_id is True else 0  # upsert equals insert in this case if auto_id is True
+        res = collection_w.query(expr=expr, output_fields=['count(*)'])[0]
+        assert res[0].get('count(*)') == upsert_nb + extra_num
+        res = collection_w.query(expr, output_fields=["new"])[0]
+        assert len(res[upsert_nb + extra_num - 1]["new"]) == 2
+        res = collection_w.query(expr="", output_fields=['count(*)'])[0]
+        assert res[0].get('count(*)') == start + upsert_nb + extra_num
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.skip("not support default_value now")
