@@ -14,13 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <string>
+#include "arrow/type.h"
 #include <boost/lexical_cast.hpp>
 #include <google/protobuf/text_format.h>
+#include <memory>
 
 #include "Schema.h"
 #include "SystemProperty.h"
+#include "arrow/util/key_value_metadata.h"
+#include "milvus-storage/common/constants.h"
 #include "protobuf_utils.h"
 
 namespace milvus {
@@ -34,8 +40,7 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
 
     // NOTE: only two system
 
-    for (const milvus::proto::schema::FieldSchema& child :
-         schema_proto.fields()) {
+    auto process_field = [&schema, &schema_proto](const auto& child) {
         auto field_id = FieldId(child.fieldid());
 
         auto f = FieldMeta::ParseFrom(child);
@@ -53,6 +58,18 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
                        "repetitive dynamic field");
             schema->set_dynamic_field_id(field_id);
         }
+    };
+
+    for (const milvus::proto::schema::FieldSchema& child :
+         schema_proto.fields()) {
+        process_field(child);
+    }
+
+    for (const milvus::proto::schema::StructArrayFieldSchema& child :
+         schema_proto.struct_array_fields()) {
+        for (const auto& sub_field : child.fields()) {
+            process_field(sub_field);
+        }
     }
 
     AssertInfo(schema->get_primary_field_id().has_value(),
@@ -61,9 +78,40 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
     return schema;
 }
 
-const FieldMeta FieldMeta::RowIdMeta(FieldName("RowID"),
-                                     RowFieldID,
-                                     DataType::INT64,
-                                     false);
+const FieldMeta FieldMeta::RowIdMeta(
+    FieldName("RowID"), RowFieldID, DataType::INT64, false, std::nullopt);
+
+const ArrowSchemaPtr
+Schema::ConvertToArrowSchema() const {
+    arrow::FieldVector arrow_fields;
+    for (auto& field : fields_) {
+        auto meta = field.second;
+        int dim = IsVectorDataType(meta.get_data_type()) &&
+                          !IsSparseFloatVectorDataType(meta.get_data_type())
+                      ? meta.get_dim()
+                      : 1;
+        auto arrow_field = std::make_shared<arrow::Field>(
+            meta.get_name().get(),
+            GetArrowDataType(meta.get_data_type(), dim),
+            meta.is_nullable(),
+            arrow::key_value_metadata({milvus_storage::ARROW_FIELD_ID_KEY},
+                                      {std::to_string(meta.get_id().get())}));
+        arrow_fields.push_back(arrow_field);
+    }
+    return arrow::schema(arrow_fields);
+}
+
+std::unique_ptr<std::vector<FieldMeta>>
+Schema::AbsentFields(Schema& old_schema) const {
+    std::vector<FieldMeta> result;
+    for (const auto& [field_id, field_meta] : fields_) {
+        auto it = old_schema.fields_.find(field_id);
+        if (it == old_schema.fields_.end()) {
+            result.emplace_back(field_meta);
+        }
+    }
+
+    return std::make_unique<std::vector<FieldMeta>>(result);
+}
 
 }  // namespace milvus

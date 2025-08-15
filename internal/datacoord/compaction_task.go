@@ -17,10 +17,12 @@
 package datacoord
 
 import (
+	"github.com/milvus-io/milvus/internal/datacoord/task"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 )
 
 type CompactionTask interface {
+	task.Task
 	// Process performs the task's state machine
 	//
 	// Returns:
@@ -44,7 +46,6 @@ type CompactionTask interface {
 	NeedReAssignNodeID() bool
 	SaveTaskMeta() error
 
-	PreparePlan() bool
 	CheckCompactionContainsSegment(segmentID int64) bool
 }
 

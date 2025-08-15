@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -65,7 +66,7 @@ func (b *RowCountBasedBalancer) AssignSegment(ctx context.Context, collectionID 
 		return segments[i].GetNumOfRows() > segments[j].GetNumOfRows()
 	})
 
-	balanceBatchSize := paramtable.Get().QueryCoordCfg.CollectionBalanceSegmentBatchSize.GetAsInt()
+	balanceBatchSize := paramtable.Get().QueryCoordCfg.BalanceSegmentBatchSize.GetAsInt()
 	plans := make([]SegmentAssignPlan, 0, len(segments))
 	for _, s := range segments {
 		// pick the node with the least row count and allocate to it.
@@ -150,9 +151,9 @@ func (b *RowCountBasedBalancer) convertToNodeItemsBySegment(nodeIDs []int64) []*
 		}
 
 		// calculate growing segment row count on node
-		views := b.dist.LeaderViewManager.GetByFilter(meta.WithNodeID2LeaderView(node))
-		for _, view := range views {
-			rowcnt += int(view.NumOfGrowingRows)
+		channels := b.dist.ChannelDistManager.GetByFilter(meta.WithNodeID2Channel(node))
+		for _, channel := range channels {
+			rowcnt += int(channel.View.NumOfGrowingRows)
 		}
 
 		// calculate executing task cost in scheduler
@@ -208,12 +209,12 @@ func (b *RowCountBasedBalancer) BalanceReplica(ctx context.Context, replica *met
 func (b *RowCountBasedBalancer) balanceChannels(ctx context.Context, br *balanceReport, replica *meta.Replica, stoppingBalance bool) []ChannelAssignPlan {
 	var rwNodes, roNodes []int64
 	if streamingutil.IsStreamingServiceEnabled() {
-		rwNodes, roNodes = replica.GetRWSQNodes(), replica.GetROSQNodes()
+		rwNodes, roNodes = utils.GetChannelRWAndRONodesFor260(replica, b.nodeManager)
 	} else {
 		rwNodes, roNodes = replica.GetRWNodes(), replica.GetRONodes()
 	}
 
-	if len(rwNodes) == 0 || !b.permitBalanceChannel(replica.GetCollectionID()) {
+	if len(rwNodes) == 0 {
 		return nil
 	}
 	if len(roNodes) != 0 {
@@ -234,7 +235,7 @@ func (b *RowCountBasedBalancer) balanceSegments(ctx context.Context, replica *me
 	rwNodes := replica.GetRWNodes()
 	roNodes := replica.GetRONodes()
 
-	if len(rwNodes) == 0 || !b.permitBalanceSegment(replica.GetCollectionID()) {
+	if len(rwNodes) == 0 {
 		return nil
 	}
 	// print current distribution before generating plans
@@ -365,6 +366,7 @@ func (b *RowCountBasedBalancer) genChannelPlan(ctx context.Context, br *balanceR
 		channelsToMove := make([]*meta.DmChannel, 0)
 		for _, node := range rwNodes {
 			channels := b.dist.ChannelDistManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(node))
+			channels = sortIfChannelAtWALLocated(channels)
 
 			if len(channels) <= average {
 				nodeWithLessChannel = append(nodeWithLessChannel, node)

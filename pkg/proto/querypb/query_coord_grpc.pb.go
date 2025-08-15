@@ -22,18 +22,15 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	QueryCoord_GetComponentStates_FullMethodName         = "/milvus.proto.query.QueryCoord/GetComponentStates"
-	QueryCoord_GetTimeTickChannel_FullMethodName         = "/milvus.proto.query.QueryCoord/GetTimeTickChannel"
-	QueryCoord_GetStatisticsChannel_FullMethodName       = "/milvus.proto.query.QueryCoord/GetStatisticsChannel"
-	QueryCoord_ShowCollections_FullMethodName            = "/milvus.proto.query.QueryCoord/ShowCollections"
-	QueryCoord_ShowPartitions_FullMethodName             = "/milvus.proto.query.QueryCoord/ShowPartitions"
+	QueryCoord_ShowLoadCollections_FullMethodName        = "/milvus.proto.query.QueryCoord/ShowLoadCollections"
+	QueryCoord_ShowLoadPartitions_FullMethodName         = "/milvus.proto.query.QueryCoord/ShowLoadPartitions"
 	QueryCoord_LoadPartitions_FullMethodName             = "/milvus.proto.query.QueryCoord/LoadPartitions"
 	QueryCoord_ReleasePartitions_FullMethodName          = "/milvus.proto.query.QueryCoord/ReleasePartitions"
 	QueryCoord_LoadCollection_FullMethodName             = "/milvus.proto.query.QueryCoord/LoadCollection"
 	QueryCoord_ReleaseCollection_FullMethodName          = "/milvus.proto.query.QueryCoord/ReleaseCollection"
 	QueryCoord_SyncNewCreatedPartition_FullMethodName    = "/milvus.proto.query.QueryCoord/SyncNewCreatedPartition"
 	QueryCoord_GetPartitionStates_FullMethodName         = "/milvus.proto.query.QueryCoord/GetPartitionStates"
-	QueryCoord_GetSegmentInfo_FullMethodName             = "/milvus.proto.query.QueryCoord/GetSegmentInfo"
+	QueryCoord_GetLoadSegmentInfo_FullMethodName         = "/milvus.proto.query.QueryCoord/GetLoadSegmentInfo"
 	QueryCoord_LoadBalance_FullMethodName                = "/milvus.proto.query.QueryCoord/LoadBalance"
 	QueryCoord_ShowConfigurations_FullMethodName         = "/milvus.proto.query.QueryCoord/ShowConfigurations"
 	QueryCoord_GetMetrics_FullMethodName                 = "/milvus.proto.query.QueryCoord/GetMetrics"
@@ -47,6 +44,7 @@ const (
 	QueryCoord_TransferReplica_FullMethodName            = "/milvus.proto.query.QueryCoord/TransferReplica"
 	QueryCoord_ListResourceGroups_FullMethodName         = "/milvus.proto.query.QueryCoord/ListResourceGroups"
 	QueryCoord_DescribeResourceGroup_FullMethodName      = "/milvus.proto.query.QueryCoord/DescribeResourceGroup"
+	QueryCoord_ListLoadedSegments_FullMethodName         = "/milvus.proto.query.QueryCoord/ListLoadedSegments"
 	QueryCoord_ListCheckers_FullMethodName               = "/milvus.proto.query.QueryCoord/ListCheckers"
 	QueryCoord_ActivateChecker_FullMethodName            = "/milvus.proto.query.QueryCoord/ActivateChecker"
 	QueryCoord_DeactivateChecker_FullMethodName          = "/milvus.proto.query.QueryCoord/DeactivateChecker"
@@ -67,18 +65,15 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type QueryCoordClient interface {
-	GetComponentStates(ctx context.Context, in *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error)
-	GetTimeTickChannel(ctx context.Context, in *internalpb.GetTimeTickChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error)
-	GetStatisticsChannel(ctx context.Context, in *internalpb.GetStatisticsChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error)
-	ShowCollections(ctx context.Context, in *ShowCollectionsRequest, opts ...grpc.CallOption) (*ShowCollectionsResponse, error)
-	ShowPartitions(ctx context.Context, in *ShowPartitionsRequest, opts ...grpc.CallOption) (*ShowPartitionsResponse, error)
+	ShowLoadCollections(ctx context.Context, in *ShowCollectionsRequest, opts ...grpc.CallOption) (*ShowCollectionsResponse, error)
+	ShowLoadPartitions(ctx context.Context, in *ShowPartitionsRequest, opts ...grpc.CallOption) (*ShowPartitionsResponse, error)
 	LoadPartitions(ctx context.Context, in *LoadPartitionsRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	ReleasePartitions(ctx context.Context, in *ReleasePartitionsRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	LoadCollection(ctx context.Context, in *LoadCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	ReleaseCollection(ctx context.Context, in *ReleaseCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	SyncNewCreatedPartition(ctx context.Context, in *SyncNewCreatedPartitionRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	GetPartitionStates(ctx context.Context, in *GetPartitionStatesRequest, opts ...grpc.CallOption) (*GetPartitionStatesResponse, error)
-	GetSegmentInfo(ctx context.Context, in *GetSegmentInfoRequest, opts ...grpc.CallOption) (*GetSegmentInfoResponse, error)
+	GetLoadSegmentInfo(ctx context.Context, in *GetSegmentInfoRequest, opts ...grpc.CallOption) (*GetSegmentInfoResponse, error)
 	LoadBalance(ctx context.Context, in *LoadBalanceRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	ShowConfigurations(ctx context.Context, in *internalpb.ShowConfigurationsRequest, opts ...grpc.CallOption) (*internalpb.ShowConfigurationsResponse, error)
 	// https://wiki.lfaidata.foundation/display/MIL/MEP+8+--+Add+metrics+for+proxy
@@ -94,6 +89,7 @@ type QueryCoordClient interface {
 	TransferReplica(ctx context.Context, in *TransferReplicaRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	ListResourceGroups(ctx context.Context, in *milvuspb.ListResourceGroupsRequest, opts ...grpc.CallOption) (*milvuspb.ListResourceGroupsResponse, error)
 	DescribeResourceGroup(ctx context.Context, in *DescribeResourceGroupRequest, opts ...grpc.CallOption) (*DescribeResourceGroupResponse, error)
+	ListLoadedSegments(ctx context.Context, in *ListLoadedSegmentsRequest, opts ...grpc.CallOption) (*ListLoadedSegmentsResponse, error)
 	// ops interfaces
 	ListCheckers(ctx context.Context, in *ListCheckersRequest, opts ...grpc.CallOption) (*ListCheckersResponse, error)
 	ActivateChecker(ctx context.Context, in *ActivateCheckerRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
@@ -119,45 +115,18 @@ func NewQueryCoordClient(cc grpc.ClientConnInterface) QueryCoordClient {
 	return &queryCoordClient{cc}
 }
 
-func (c *queryCoordClient) GetComponentStates(ctx context.Context, in *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error) {
-	out := new(milvuspb.ComponentStates)
-	err := c.cc.Invoke(ctx, QueryCoord_GetComponentStates_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *queryCoordClient) GetTimeTickChannel(ctx context.Context, in *internalpb.GetTimeTickChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
-	out := new(milvuspb.StringResponse)
-	err := c.cc.Invoke(ctx, QueryCoord_GetTimeTickChannel_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *queryCoordClient) GetStatisticsChannel(ctx context.Context, in *internalpb.GetStatisticsChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
-	out := new(milvuspb.StringResponse)
-	err := c.cc.Invoke(ctx, QueryCoord_GetStatisticsChannel_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *queryCoordClient) ShowCollections(ctx context.Context, in *ShowCollectionsRequest, opts ...grpc.CallOption) (*ShowCollectionsResponse, error) {
+func (c *queryCoordClient) ShowLoadCollections(ctx context.Context, in *ShowCollectionsRequest, opts ...grpc.CallOption) (*ShowCollectionsResponse, error) {
 	out := new(ShowCollectionsResponse)
-	err := c.cc.Invoke(ctx, QueryCoord_ShowCollections_FullMethodName, in, out, opts...)
+	err := c.cc.Invoke(ctx, QueryCoord_ShowLoadCollections_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *queryCoordClient) ShowPartitions(ctx context.Context, in *ShowPartitionsRequest, opts ...grpc.CallOption) (*ShowPartitionsResponse, error) {
+func (c *queryCoordClient) ShowLoadPartitions(ctx context.Context, in *ShowPartitionsRequest, opts ...grpc.CallOption) (*ShowPartitionsResponse, error) {
 	out := new(ShowPartitionsResponse)
-	err := c.cc.Invoke(ctx, QueryCoord_ShowPartitions_FullMethodName, in, out, opts...)
+	err := c.cc.Invoke(ctx, QueryCoord_ShowLoadPartitions_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -218,9 +187,9 @@ func (c *queryCoordClient) GetPartitionStates(ctx context.Context, in *GetPartit
 	return out, nil
 }
 
-func (c *queryCoordClient) GetSegmentInfo(ctx context.Context, in *GetSegmentInfoRequest, opts ...grpc.CallOption) (*GetSegmentInfoResponse, error) {
+func (c *queryCoordClient) GetLoadSegmentInfo(ctx context.Context, in *GetSegmentInfoRequest, opts ...grpc.CallOption) (*GetSegmentInfoResponse, error) {
 	out := new(GetSegmentInfoResponse)
-	err := c.cc.Invoke(ctx, QueryCoord_GetSegmentInfo_FullMethodName, in, out, opts...)
+	err := c.cc.Invoke(ctx, QueryCoord_GetLoadSegmentInfo_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -338,6 +307,15 @@ func (c *queryCoordClient) ListResourceGroups(ctx context.Context, in *milvuspb.
 func (c *queryCoordClient) DescribeResourceGroup(ctx context.Context, in *DescribeResourceGroupRequest, opts ...grpc.CallOption) (*DescribeResourceGroupResponse, error) {
 	out := new(DescribeResourceGroupResponse)
 	err := c.cc.Invoke(ctx, QueryCoord_DescribeResourceGroup_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *queryCoordClient) ListLoadedSegments(ctx context.Context, in *ListLoadedSegmentsRequest, opts ...grpc.CallOption) (*ListLoadedSegmentsResponse, error) {
+	out := new(ListLoadedSegmentsResponse)
+	err := c.cc.Invoke(ctx, QueryCoord_ListLoadedSegments_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -474,18 +452,15 @@ func (c *queryCoordClient) UpdateLoadConfig(ctx context.Context, in *UpdateLoadC
 // All implementations should embed UnimplementedQueryCoordServer
 // for forward compatibility
 type QueryCoordServer interface {
-	GetComponentStates(context.Context, *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error)
-	GetTimeTickChannel(context.Context, *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error)
-	GetStatisticsChannel(context.Context, *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error)
-	ShowCollections(context.Context, *ShowCollectionsRequest) (*ShowCollectionsResponse, error)
-	ShowPartitions(context.Context, *ShowPartitionsRequest) (*ShowPartitionsResponse, error)
+	ShowLoadCollections(context.Context, *ShowCollectionsRequest) (*ShowCollectionsResponse, error)
+	ShowLoadPartitions(context.Context, *ShowPartitionsRequest) (*ShowPartitionsResponse, error)
 	LoadPartitions(context.Context, *LoadPartitionsRequest) (*commonpb.Status, error)
 	ReleasePartitions(context.Context, *ReleasePartitionsRequest) (*commonpb.Status, error)
 	LoadCollection(context.Context, *LoadCollectionRequest) (*commonpb.Status, error)
 	ReleaseCollection(context.Context, *ReleaseCollectionRequest) (*commonpb.Status, error)
 	SyncNewCreatedPartition(context.Context, *SyncNewCreatedPartitionRequest) (*commonpb.Status, error)
 	GetPartitionStates(context.Context, *GetPartitionStatesRequest) (*GetPartitionStatesResponse, error)
-	GetSegmentInfo(context.Context, *GetSegmentInfoRequest) (*GetSegmentInfoResponse, error)
+	GetLoadSegmentInfo(context.Context, *GetSegmentInfoRequest) (*GetSegmentInfoResponse, error)
 	LoadBalance(context.Context, *LoadBalanceRequest) (*commonpb.Status, error)
 	ShowConfigurations(context.Context, *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// https://wiki.lfaidata.foundation/display/MIL/MEP+8+--+Add+metrics+for+proxy
@@ -501,6 +476,7 @@ type QueryCoordServer interface {
 	TransferReplica(context.Context, *TransferReplicaRequest) (*commonpb.Status, error)
 	ListResourceGroups(context.Context, *milvuspb.ListResourceGroupsRequest) (*milvuspb.ListResourceGroupsResponse, error)
 	DescribeResourceGroup(context.Context, *DescribeResourceGroupRequest) (*DescribeResourceGroupResponse, error)
+	ListLoadedSegments(context.Context, *ListLoadedSegmentsRequest) (*ListLoadedSegmentsResponse, error)
 	// ops interfaces
 	ListCheckers(context.Context, *ListCheckersRequest) (*ListCheckersResponse, error)
 	ActivateChecker(context.Context, *ActivateCheckerRequest) (*commonpb.Status, error)
@@ -522,20 +498,11 @@ type QueryCoordServer interface {
 type UnimplementedQueryCoordServer struct {
 }
 
-func (UnimplementedQueryCoordServer) GetComponentStates(context.Context, *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetComponentStates not implemented")
+func (UnimplementedQueryCoordServer) ShowLoadCollections(context.Context, *ShowCollectionsRequest) (*ShowCollectionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ShowLoadCollections not implemented")
 }
-func (UnimplementedQueryCoordServer) GetTimeTickChannel(context.Context, *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetTimeTickChannel not implemented")
-}
-func (UnimplementedQueryCoordServer) GetStatisticsChannel(context.Context, *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetStatisticsChannel not implemented")
-}
-func (UnimplementedQueryCoordServer) ShowCollections(context.Context, *ShowCollectionsRequest) (*ShowCollectionsResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ShowCollections not implemented")
-}
-func (UnimplementedQueryCoordServer) ShowPartitions(context.Context, *ShowPartitionsRequest) (*ShowPartitionsResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ShowPartitions not implemented")
+func (UnimplementedQueryCoordServer) ShowLoadPartitions(context.Context, *ShowPartitionsRequest) (*ShowPartitionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ShowLoadPartitions not implemented")
 }
 func (UnimplementedQueryCoordServer) LoadPartitions(context.Context, *LoadPartitionsRequest) (*commonpb.Status, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LoadPartitions not implemented")
@@ -555,8 +522,8 @@ func (UnimplementedQueryCoordServer) SyncNewCreatedPartition(context.Context, *S
 func (UnimplementedQueryCoordServer) GetPartitionStates(context.Context, *GetPartitionStatesRequest) (*GetPartitionStatesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPartitionStates not implemented")
 }
-func (UnimplementedQueryCoordServer) GetSegmentInfo(context.Context, *GetSegmentInfoRequest) (*GetSegmentInfoResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetSegmentInfo not implemented")
+func (UnimplementedQueryCoordServer) GetLoadSegmentInfo(context.Context, *GetSegmentInfoRequest) (*GetSegmentInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLoadSegmentInfo not implemented")
 }
 func (UnimplementedQueryCoordServer) LoadBalance(context.Context, *LoadBalanceRequest) (*commonpb.Status, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LoadBalance not implemented")
@@ -596,6 +563,9 @@ func (UnimplementedQueryCoordServer) ListResourceGroups(context.Context, *milvus
 }
 func (UnimplementedQueryCoordServer) DescribeResourceGroup(context.Context, *DescribeResourceGroupRequest) (*DescribeResourceGroupResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DescribeResourceGroup not implemented")
+}
+func (UnimplementedQueryCoordServer) ListLoadedSegments(context.Context, *ListLoadedSegmentsRequest) (*ListLoadedSegmentsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListLoadedSegments not implemented")
 }
 func (UnimplementedQueryCoordServer) ListCheckers(context.Context, *ListCheckersRequest) (*ListCheckersResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListCheckers not implemented")
@@ -651,92 +621,38 @@ func RegisterQueryCoordServer(s grpc.ServiceRegistrar, srv QueryCoordServer) {
 	s.RegisterService(&QueryCoord_ServiceDesc, srv)
 }
 
-func _QueryCoord_GetComponentStates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(milvuspb.GetComponentStatesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QueryCoordServer).GetComponentStates(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QueryCoord_GetComponentStates_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).GetComponentStates(ctx, req.(*milvuspb.GetComponentStatesRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QueryCoord_GetTimeTickChannel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(internalpb.GetTimeTickChannelRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QueryCoordServer).GetTimeTickChannel(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QueryCoord_GetTimeTickChannel_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).GetTimeTickChannel(ctx, req.(*internalpb.GetTimeTickChannelRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QueryCoord_GetStatisticsChannel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(internalpb.GetStatisticsChannelRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QueryCoordServer).GetStatisticsChannel(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QueryCoord_GetStatisticsChannel_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).GetStatisticsChannel(ctx, req.(*internalpb.GetStatisticsChannelRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QueryCoord_ShowCollections_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _QueryCoord_ShowLoadCollections_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ShowCollectionsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(QueryCoordServer).ShowCollections(ctx, in)
+		return srv.(QueryCoordServer).ShowLoadCollections(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: QueryCoord_ShowCollections_FullMethodName,
+		FullMethod: QueryCoord_ShowLoadCollections_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).ShowCollections(ctx, req.(*ShowCollectionsRequest))
+		return srv.(QueryCoordServer).ShowLoadCollections(ctx, req.(*ShowCollectionsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _QueryCoord_ShowPartitions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _QueryCoord_ShowLoadPartitions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ShowPartitionsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(QueryCoordServer).ShowPartitions(ctx, in)
+		return srv.(QueryCoordServer).ShowLoadPartitions(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: QueryCoord_ShowPartitions_FullMethodName,
+		FullMethod: QueryCoord_ShowLoadPartitions_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).ShowPartitions(ctx, req.(*ShowPartitionsRequest))
+		return srv.(QueryCoordServer).ShowLoadPartitions(ctx, req.(*ShowPartitionsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -849,20 +765,20 @@ func _QueryCoord_GetPartitionStates_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _QueryCoord_GetSegmentInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _QueryCoord_GetLoadSegmentInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSegmentInfoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(QueryCoordServer).GetSegmentInfo(ctx, in)
+		return srv.(QueryCoordServer).GetLoadSegmentInfo(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: QueryCoord_GetSegmentInfo_FullMethodName,
+		FullMethod: QueryCoord_GetLoadSegmentInfo_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QueryCoordServer).GetSegmentInfo(ctx, req.(*GetSegmentInfoRequest))
+		return srv.(QueryCoordServer).GetLoadSegmentInfo(ctx, req.(*GetSegmentInfoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1097,6 +1013,24 @@ func _QueryCoord_DescribeResourceGroup_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(QueryCoordServer).DescribeResourceGroup(ctx, req.(*DescribeResourceGroupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _QueryCoord_ListLoadedSegments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListLoadedSegmentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(QueryCoordServer).ListLoadedSegments(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: QueryCoord_ListLoadedSegments_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(QueryCoordServer).ListLoadedSegments(ctx, req.(*ListLoadedSegmentsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1361,24 +1295,12 @@ var QueryCoord_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*QueryCoordServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "GetComponentStates",
-			Handler:    _QueryCoord_GetComponentStates_Handler,
+			MethodName: "ShowLoadCollections",
+			Handler:    _QueryCoord_ShowLoadCollections_Handler,
 		},
 		{
-			MethodName: "GetTimeTickChannel",
-			Handler:    _QueryCoord_GetTimeTickChannel_Handler,
-		},
-		{
-			MethodName: "GetStatisticsChannel",
-			Handler:    _QueryCoord_GetStatisticsChannel_Handler,
-		},
-		{
-			MethodName: "ShowCollections",
-			Handler:    _QueryCoord_ShowCollections_Handler,
-		},
-		{
-			MethodName: "ShowPartitions",
-			Handler:    _QueryCoord_ShowPartitions_Handler,
+			MethodName: "ShowLoadPartitions",
+			Handler:    _QueryCoord_ShowLoadPartitions_Handler,
 		},
 		{
 			MethodName: "LoadPartitions",
@@ -1405,8 +1327,8 @@ var QueryCoord_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _QueryCoord_GetPartitionStates_Handler,
 		},
 		{
-			MethodName: "GetSegmentInfo",
-			Handler:    _QueryCoord_GetSegmentInfo_Handler,
+			MethodName: "GetLoadSegmentInfo",
+			Handler:    _QueryCoord_GetLoadSegmentInfo_Handler,
 		},
 		{
 			MethodName: "LoadBalance",
@@ -1459,6 +1381,10 @@ var QueryCoord_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DescribeResourceGroup",
 			Handler:    _QueryCoord_DescribeResourceGroup_Handler,
+		},
+		{
+			MethodName: "ListLoadedSegments",
+			Handler:    _QueryCoord_ListLoadedSegments_Handler,
 		},
 		{
 			MethodName: "ListCheckers",
@@ -1547,6 +1473,8 @@ const (
 	QueryNode_SyncDistribution_FullMethodName     = "/milvus.proto.query.QueryNode/SyncDistribution"
 	QueryNode_Delete_FullMethodName               = "/milvus.proto.query.QueryNode/Delete"
 	QueryNode_DeleteBatch_FullMethodName          = "/milvus.proto.query.QueryNode/DeleteBatch"
+	QueryNode_UpdateSchema_FullMethodName         = "/milvus.proto.query.QueryNode/UpdateSchema"
+	QueryNode_RunAnalyzer_FullMethodName          = "/milvus.proto.query.QueryNode/RunAnalyzer"
 )
 
 // QueryNodeClient is the client API for QueryNode service.
@@ -1581,6 +1509,8 @@ type QueryNodeClient interface {
 	// DeleteBatch is the API to apply same delete data into multiple segments.
 	// it's basically same as `Delete` but cost less memory pressure.
 	DeleteBatch(ctx context.Context, in *DeleteBatchRequest, opts ...grpc.CallOption) (*DeleteBatchResponse, error)
+	UpdateSchema(ctx context.Context, in *UpdateSchemaRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
+	RunAnalyzer(ctx context.Context, in *RunAnalyzerRequest, opts ...grpc.CallOption) (*milvuspb.RunAnalyzerResponse, error)
 }
 
 type queryNodeClient struct {
@@ -1862,6 +1792,24 @@ func (c *queryNodeClient) DeleteBatch(ctx context.Context, in *DeleteBatchReques
 	return out, nil
 }
 
+func (c *queryNodeClient) UpdateSchema(ctx context.Context, in *UpdateSchemaRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	out := new(commonpb.Status)
+	err := c.cc.Invoke(ctx, QueryNode_UpdateSchema_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *queryNodeClient) RunAnalyzer(ctx context.Context, in *RunAnalyzerRequest, opts ...grpc.CallOption) (*milvuspb.RunAnalyzerResponse, error) {
+	out := new(milvuspb.RunAnalyzerResponse)
+	err := c.cc.Invoke(ctx, QueryNode_RunAnalyzer_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // QueryNodeServer is the server API for QueryNode service.
 // All implementations should embed UnimplementedQueryNodeServer
 // for forward compatibility
@@ -1894,6 +1842,8 @@ type QueryNodeServer interface {
 	// DeleteBatch is the API to apply same delete data into multiple segments.
 	// it's basically same as `Delete` but cost less memory pressure.
 	DeleteBatch(context.Context, *DeleteBatchRequest) (*DeleteBatchResponse, error)
+	UpdateSchema(context.Context, *UpdateSchemaRequest) (*commonpb.Status, error)
+	RunAnalyzer(context.Context, *RunAnalyzerRequest) (*milvuspb.RunAnalyzerResponse, error)
 }
 
 // UnimplementedQueryNodeServer should be embedded to have forward compatible implementations.
@@ -1974,6 +1924,12 @@ func (UnimplementedQueryNodeServer) Delete(context.Context, *DeleteRequest) (*co
 }
 func (UnimplementedQueryNodeServer) DeleteBatch(context.Context, *DeleteBatchRequest) (*DeleteBatchResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteBatch not implemented")
+}
+func (UnimplementedQueryNodeServer) UpdateSchema(context.Context, *UpdateSchemaRequest) (*commonpb.Status, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateSchema not implemented")
+}
+func (UnimplementedQueryNodeServer) RunAnalyzer(context.Context, *RunAnalyzerRequest) (*milvuspb.RunAnalyzerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunAnalyzer not implemented")
 }
 
 // UnsafeQueryNodeServer may be embedded to opt out of forward compatibility for this service.
@@ -2443,6 +2399,42 @@ func _QueryNode_DeleteBatch_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _QueryNode_UpdateSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSchemaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(QueryNodeServer).UpdateSchema(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: QueryNode_UpdateSchema_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(QueryNodeServer).UpdateSchema(ctx, req.(*UpdateSchemaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _QueryNode_RunAnalyzer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunAnalyzerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(QueryNodeServer).RunAnalyzer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: QueryNode_RunAnalyzer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(QueryNodeServer).RunAnalyzer(ctx, req.(*RunAnalyzerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // QueryNode_ServiceDesc is the grpc.ServiceDesc for QueryNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2541,6 +2533,14 @@ var QueryNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteBatch",
 			Handler:    _QueryNode_DeleteBatch_Handler,
+		},
+		{
+			MethodName: "UpdateSchema",
+			Handler:    _QueryNode_UpdateSchema_Handler,
+		},
+		{
+			MethodName: "RunAnalyzer",
+			Handler:    _QueryNode_RunAnalyzer_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

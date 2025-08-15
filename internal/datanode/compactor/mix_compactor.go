@@ -63,6 +63,8 @@ type mixCompactionTask struct {
 
 	done chan struct{}
 	tr   *timerecord.TimeRecorder
+
+	compactionParams compaction.Params
 }
 
 var _ Compactor = (*mixCompactionTask)(nil)
@@ -71,16 +73,18 @@ func NewMixCompactionTask(
 	ctx context.Context,
 	binlogIO io.BinlogIO,
 	plan *datapb.CompactionPlan,
+	compactionParams compaction.Params,
 ) *mixCompactionTask {
 	ctx1, cancel := context.WithCancel(ctx)
 	return &mixCompactionTask{
-		ctx:         ctx1,
-		cancel:      cancel,
-		binlogIO:    binlogIO,
-		plan:        plan,
-		tr:          timerecord.NewTimeRecorder("mergeSplit compaction"),
-		currentTime: time.Now(),
-		done:        make(chan struct{}, 1),
+		ctx:              ctx1,
+		cancel:           cancel,
+		binlogIO:         binlogIO,
+		plan:             plan,
+		tr:               timerecord.NewTimeRecorder("mergeSplit compaction"),
+		currentTime:      time.Now(),
+		done:             make(chan struct{}, 1),
+		compactionParams: compactionParams,
 	}
 }
 
@@ -141,9 +145,12 @@ func (t *mixCompactionTask) mergeSplit(
 	log := log.With(zap.Int64("planID", t.GetPlanID()))
 
 	segIDAlloc := allocator.NewLocalAllocator(t.plan.GetPreAllocatedSegmentIDs().GetBegin(), t.plan.GetPreAllocatedSegmentIDs().GetEnd())
-	logIDAlloc := allocator.NewLocalAllocator(t.plan.GetBeginLogID(), math.MaxInt64)
+	logIDAlloc := allocator.NewLocalAllocator(t.plan.GetPreAllocatedLogIDs().GetBegin(), t.plan.GetPreAllocatedLogIDs().GetEnd())
 	compAlloc := NewCompactionAllocator(segIDAlloc, logIDAlloc)
-	mWriter := NewMultiSegmentWriter(ctx, t.binlogIO, compAlloc, t.plan.GetMaxSize(), t.plan.GetSchema(), t.maxRows, t.partitionID, t.collectionID, t.GetChannelName(), 4096)
+	mWriter, err := NewMultiSegmentWriter(ctx, t.binlogIO, compAlloc, t.plan.GetMaxSize(), t.plan.GetSchema(), t.compactionParams, t.maxRows, t.partitionID, t.collectionID, t.GetChannelName(), 4096, storage.WithStorageConfig(t.compactionParams.StorageConfig))
+	if err != nil {
+		return nil, err
+	}
 
 	deletedRowCount := int64(0)
 	expiredRowCount := int64(0)
@@ -157,6 +164,7 @@ func (t *mixCompactionTask) mergeSplit(
 	for _, seg := range t.plan.GetSegmentBinlogs() {
 		del, exp, err := t.writeSegment(ctx, seg, mWriter, pkField)
 		if err != nil {
+			mWriter.Close()
 			return nil, err
 		}
 		deletedRowCount += del
@@ -206,23 +214,19 @@ func (t *mixCompactionTask) writeSegment(ctx context.Context,
 	}
 	entityFilter := compaction.NewEntityFilter(delta, t.plan.GetCollectionTtl(), t.currentTime)
 
-	reader, err := storage.NewBinlogRecordReader(ctx, seg.GetFieldBinlogs(), t.plan.GetSchema(), storage.WithDownloader(t.binlogIO.Download))
+	reader, err := storage.NewBinlogRecordReader(ctx,
+		seg.GetFieldBinlogs(),
+		t.plan.GetSchema(),
+		storage.WithDownloader(t.binlogIO.Download),
+		storage.WithVersion(seg.GetStorageVersion()),
+		storage.WithStorageConfig(t.compactionParams.StorageConfig),
+	)
 	if err != nil {
 		log.Warn("compact wrong, failed to new insert binlogs reader", zap.Error(err))
 		return
 	}
 	defer reader.Close()
 
-	writeSlice := func(r storage.Record, start, end int) error {
-		sliced := r.Slice(start, end)
-		defer sliced.Release()
-		err = mWriter.Write(sliced)
-		if err != nil {
-			log.Warn("compact wrong, failed to writer row", zap.Error(err))
-			return err
-		}
-		return nil
-	}
 	for {
 		var r storage.Record
 		r, err = reader.Next()
@@ -235,12 +239,15 @@ func (t *mixCompactionTask) writeSegment(ctx context.Context,
 				return
 			}
 		}
-		pkArray := r.Column(pkField.FieldID)
-		tsArray := r.Column(common.TimeStampField).(*array.Int64)
 
-		sliceStart := -1
-		rows := r.Len()
-		for i := 0; i < rows; i++ {
+		var (
+			pkArray    = r.Column(pkField.FieldID)
+			tsArray    = r.Column(common.TimeStampField).(*array.Int64)
+			sliceStart = -1
+			rb         *storage.RecordBuilder
+		)
+
+		for i := range r.Len() {
 			// Filtering deleted entities
 			var pk any
 			switch pkField.DataType {
@@ -253,13 +260,13 @@ func (t *mixCompactionTask) writeSegment(ctx context.Context,
 			}
 			ts := typeutil.Timestamp(tsArray.Value(i))
 			if entityFilter.Filtered(pk, ts) {
-				if sliceStart != -1 {
-					err = writeSlice(r, sliceStart, i)
-					if err != nil {
-						return
-					}
-					sliceStart = -1
+				if rb == nil {
+					rb = storage.NewRecordBuilder(t.plan.GetSchema())
 				}
+				if sliceStart != -1 {
+					rb.Append(r, sliceStart, i)
+				}
+				sliceStart = -1
 				continue
 			}
 
@@ -268,10 +275,24 @@ func (t *mixCompactionTask) writeSegment(ctx context.Context,
 			}
 		}
 
-		if sliceStart != -1 {
-			err = writeSlice(r, sliceStart, r.Len())
+		if rb != nil {
+			if sliceStart != -1 {
+				rb.Append(r, sliceStart, r.Len())
+			}
+			if rb.GetRowNum() > 0 {
+				err := func() error {
+					rec := rb.Build()
+					defer rec.Release()
+					return mWriter.Write(rec)
+				}()
+				if err != nil {
+					return 0, 0, err
+				}
+			}
+		} else {
+			err := mWriter.Write(r)
 			if err != nil {
-				return
+				return 0, 0, err
 			}
 		}
 	}
@@ -307,27 +328,23 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 
 	log.Info("compact start")
 	// Decompress compaction binlogs first
-	if err := binlog.DecompressCompactionBinlogs(t.plan.SegmentBinlogs); err != nil {
+	if err := binlog.DecompressCompactionBinlogsWithRootPath(t.compactionParams.StorageConfig.GetRootPath(), t.plan.SegmentBinlogs); err != nil {
 		log.Warn("compact wrong, fail to decompress compaction binlogs", zap.Error(err))
 		return nil, err
 	}
 	// Unable to deal with all empty segments cases, so return error
-	isEmpty := func() bool {
-		for _, seg := range t.plan.GetSegmentBinlogs() {
-			for _, field := range seg.GetFieldBinlogs() {
-				if len(field.GetBinlogs()) > 0 {
-					return false
-				}
-			}
-		}
-		return true
-	}()
+	isEmpty := lo.EveryBy(lo.FlatMap(t.plan.GetSegmentBinlogs(), func(seg *datapb.CompactionSegmentBinlogs, _ int) []*datapb.FieldBinlog {
+		return seg.GetFieldBinlogs()
+	}), func(field *datapb.FieldBinlog) bool {
+		return len(field.GetBinlogs()) == 0
+	})
+
 	if isEmpty {
 		log.Warn("compact wrong, all segments' binlogs are empty")
 		return nil, errors.New("illegal compaction plan")
 	}
 
-	sortMergeAppicable := paramtable.Get().DataNodeCfg.UseMergeSort.GetAsBool()
+	sortMergeAppicable := t.compactionParams.UseMergeSort
 	if sortMergeAppicable {
 		for _, segment := range t.plan.GetSegmentBinlogs() {
 			if !segment.GetIsSorted() {
@@ -336,7 +353,7 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 			}
 		}
 		if len(t.plan.GetSegmentBinlogs()) <= 1 ||
-			len(t.plan.GetSegmentBinlogs()) > paramtable.Get().DataNodeCfg.MaxSegmentMergeSort.GetAsInt() {
+			len(t.plan.GetSegmentBinlogs()) > t.compactionParams.MaxSegmentMergeSort {
 			// sort merge is not applicable if there is only one segment or too many segments
 			sortMergeAppicable = false
 		}
@@ -345,9 +362,10 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 	var res []*datapb.CompactionSegment
 	var err error
 	if sortMergeAppicable {
+		// TODO: the implementation of mergeSortMultipleSegments is not correct, also see issue: https://github.com/milvus-io/milvus/issues/43034
 		log.Info("compact by merge sort")
 		res, err = mergeSortMultipleSegments(ctxTimeout, t.plan, t.collectionID, t.partitionID, t.maxRows, t.binlogIO,
-			t.plan.GetSegmentBinlogs(), t.tr, t.currentTime, t.plan.GetCollectionTtl())
+			t.plan.GetSegmentBinlogs(), t.tr, t.currentTime, t.plan.GetCollectionTtl(), t.compactionParams)
 		if err != nil {
 			log.Warn("compact wrong, fail to merge sort segments", zap.Error(err))
 			return nil, err
@@ -360,7 +378,7 @@ func (t *mixCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 		}
 	}
 
-	log.Info("compact done", zap.Duration("compact elapse", time.Since(compactStart)))
+	log.Info("compact done", zap.Duration("compact elapse", time.Since(compactStart)), zap.Any("res", res))
 
 	metrics.DataNodeCompactionLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), t.plan.GetType().String()).Observe(float64(t.tr.ElapseSpan().Milliseconds()))
 	metrics.DataNodeCompactionLatencyInQueue.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(durInQueue.Milliseconds()))

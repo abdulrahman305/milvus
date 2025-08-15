@@ -9,7 +9,7 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/writebuffer"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/segment/stats"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
 	tinspector "github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/timetick/inspector"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/vchantempstore"
 	"github.com/milvus-io/milvus/internal/types"
@@ -19,9 +19,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-var r = &resourceImpl{
-	logger: log.With(log.FieldModule(typeutil.StreamingNodeRole)),
-} // singleton resource instance
+var r *resourceImpl // singleton resource instance
 
 // optResourceInit is the option to initialize the resource.
 type optResourceInit func(r *resourceImpl)
@@ -41,19 +39,12 @@ func OptChunkManager(chunkManager storage.ChunkManager) optResourceInit {
 }
 
 // OptRootCoordClient provides the root coordinator client to the resource.
-func OptRootCoordClient(rootCoordClient *syncutil.Future[types.RootCoordClient]) optResourceInit {
+func OptMixCoordClient(mixCoordClient *syncutil.Future[types.MixCoordClient]) optResourceInit {
 	return func(r *resourceImpl) {
-		r.rootCoordClient = rootCoordClient
-		r.timestampAllocator = idalloc.NewTSOAllocator(r.rootCoordClient)
-		r.idAllocator = idalloc.NewIDAllocator(r.rootCoordClient)
-		r.vchannelTempStorage = vchantempstore.NewVChannelTempStorage(r.rootCoordClient)
-	}
-}
-
-// OptDataCoordClient provides the data coordinator client to the resource.
-func OptDataCoordClient(dataCoordClient *syncutil.Future[types.DataCoordClient]) optResourceInit {
-	return func(r *resourceImpl) {
-		r.dataCoordClient = dataCoordClient
+		r.mixCoordClient = mixCoordClient
+		r.timestampAllocator = idalloc.NewTSOAllocator(r.mixCoordClient)
+		r.idAllocator = idalloc.NewIDAllocator(r.mixCoordClient)
+		r.vchannelTempStorage = vchantempstore.NewVChannelTempStorage(r.mixCoordClient)
 	}
 }
 
@@ -73,21 +64,27 @@ func Apply(opts ...optResourceInit) {
 }
 
 // Done finish all initialization of resources.
-func Done() {
-	r.segmentAssignStatsManager = stats.NewStatsManager()
-	r.timeTickInspector = tinspector.NewTimeTickSyncInspector()
-	r.syncMgr = syncmgr.NewSyncManager(r.chunkManager)
-	r.wbMgr = writebuffer.NewManager(r.syncMgr)
-	r.wbMgr.Start()
-	assertNotNil(r.ChunkManager())
-	assertNotNil(r.TSOAllocator())
-	assertNotNil(r.RootCoordClient())
-	assertNotNil(r.DataCoordClient())
-	assertNotNil(r.StreamingNodeCatalog())
-	assertNotNil(r.SegmentAssignStatsManager())
-	assertNotNil(r.TimeTickInspector())
-	assertNotNil(r.SyncManager())
-	assertNotNil(r.WriteBufferManager())
+func Init(opts ...optResourceInit) {
+	newR := &resourceImpl{}
+	for _, opt := range opts {
+		opt(newR)
+	}
+
+	newR.logger = log.With(log.FieldModule(typeutil.StreamingNodeRole))
+	newR.segmentStatsManager = stats.NewStatsManager()
+	newR.timeTickInspector = tinspector.NewTimeTickSyncInspector()
+	newR.syncMgr = syncmgr.NewSyncManager(newR.chunkManager)
+	newR.wbMgr = writebuffer.NewManager(newR.syncMgr)
+	newR.wbMgr.Start()
+	assertNotNil(newR.ChunkManager())
+	assertNotNil(newR.TSOAllocator())
+	assertNotNil(newR.MixCoordClient())
+	assertNotNil(newR.StreamingNodeCatalog())
+	assertNotNil(newR.SegmentStatsManager())
+	assertNotNil(newR.TimeTickInspector())
+	assertNotNil(newR.SyncManager())
+	assertNotNil(newR.WriteBufferManager())
+	r = newR
 }
 
 // Release releases the singleton of resources.
@@ -104,17 +101,16 @@ func Resource() *resourceImpl {
 // resourceImpl is a basic resource dependency for streamingnode server.
 // All utility on it is concurrent-safe and singleton.
 type resourceImpl struct {
-	logger                    *log.MLogger
-	timestampAllocator        idalloc.Allocator
-	idAllocator               idalloc.Allocator
-	etcdClient                *clientv3.Client
-	chunkManager              storage.ChunkManager
-	rootCoordClient           *syncutil.Future[types.RootCoordClient]
-	dataCoordClient           *syncutil.Future[types.DataCoordClient]
-	streamingNodeCatalog      metastore.StreamingNodeCataLog
-	segmentAssignStatsManager *stats.StatsManager
-	timeTickInspector         tinspector.TimeTickSyncInspector
-	vchannelTempStorage       *vchantempstore.VChannelTempStorage
+	logger               *log.MLogger
+	timestampAllocator   idalloc.Allocator
+	idAllocator          idalloc.Allocator
+	etcdClient           *clientv3.Client
+	chunkManager         storage.ChunkManager
+	mixCoordClient       *syncutil.Future[types.MixCoordClient]
+	streamingNodeCatalog metastore.StreamingNodeCataLog
+	segmentStatsManager  *stats.StatsManager
+	timeTickInspector    tinspector.TimeTickSyncInspector
+	vchannelTempStorage  *vchantempstore.VChannelTempStorage
 
 	// TODO: Global flusher components, should be removed afteer flushering in wal refactoring.
 	syncMgr syncmgr.SyncManager
@@ -152,13 +148,8 @@ func (r *resourceImpl) WriteBufferManager() writebuffer.BufferManager {
 }
 
 // RootCoordClient returns the root coordinator client.
-func (r *resourceImpl) RootCoordClient() *syncutil.Future[types.RootCoordClient] {
-	return r.rootCoordClient
-}
-
-// DataCoordClient returns the data coordinator client.
-func (r *resourceImpl) DataCoordClient() *syncutil.Future[types.DataCoordClient] {
-	return r.dataCoordClient
+func (r *resourceImpl) MixCoordClient() *syncutil.Future[types.MixCoordClient] {
+	return r.mixCoordClient
 }
 
 // StreamingNodeCataLog returns the streaming node catalog.
@@ -166,9 +157,8 @@ func (r *resourceImpl) StreamingNodeCatalog() metastore.StreamingNodeCataLog {
 	return r.streamingNodeCatalog
 }
 
-// SegmentAssignStatManager returns the segment assign stats manager.
-func (r *resourceImpl) SegmentAssignStatsManager() *stats.StatsManager {
-	return r.segmentAssignStatsManager
+func (r *resourceImpl) SegmentStatsManager() *stats.StatsManager {
+	return r.segmentStatsManager
 }
 
 func (r *resourceImpl) TimeTickInspector() tinspector.TimeTickSyncInspector {

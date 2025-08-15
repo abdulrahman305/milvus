@@ -30,7 +30,8 @@ func (w *walImpl) Append(ctx context.Context, msg message.MutableMessage) (messa
 		panic("write on a wal that is not in read-write mode")
 	}
 
-	properties := msg.Properties().ToRawMap()
+	pb := msg.IntoMessageProto()
+	properties := pb.Properties
 	headers := make([]kafka.Header, 0, len(properties))
 	for key, value := range properties {
 		header := kafka.Header{Key: key, Value: []byte(value)}
@@ -41,7 +42,7 @@ func (w *walImpl) Append(ctx context.Context, msg message.MutableMessage) (messa
 
 	if err := w.p.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0},
-		Value:          msg.Payload(),
+		Value:          pb.Payload,
 		Headers:        headers,
 	}, ch); err != nil {
 		return nil, err
@@ -101,6 +102,13 @@ func (w *walImpl) Read(ctx context.Context, opt walimpls.ReadOption) (s walimpls
 		return nil, errors.Wrap(err, "failed to assign kafka consumer")
 	}
 	return newScanner(opt.Name, exclude, c), nil
+}
+
+func (w *walImpl) Truncate(ctx context.Context, id message.MessageID) error {
+	if w.Channel().AccessMode != types.AccessModeRW {
+		panic("truncate on a wal that is not in read-write mode")
+	}
+	return nil
 }
 
 func (w *walImpl) Close() {

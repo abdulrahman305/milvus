@@ -22,7 +22,7 @@
 #include "stdio.h"
 #include <fcntl.h>
 #include "log/Log.h"
-#include "monitor/prometheus_client.h"
+#include "monitor/Monitor.h"
 
 namespace milvus::storage {
 namespace {
@@ -51,18 +51,18 @@ MmapBlock::Init() {
     // create tmp file
     int fd = open(file_name_.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd == -1) {
-        PanicInfo(ErrorCode::FileCreateFailed,
+        ThrowInfo(ErrorCode::FileCreateFailed,
                   "Failed to open mmap tmp file:{}",
                   file_name_);
     }
     // append file size to 'file_size'
     if (lseek(fd, file_size_ - 1, SEEK_SET) == -1) {
-        PanicInfo(ErrorCode::FileReadFailed,
+        ThrowInfo(ErrorCode::FileReadFailed,
                   "Failed to seek mmap tmp file:{}",
                   file_name_);
     }
     if (write(fd, "", 1) == -1) {
-        PanicInfo(ErrorCode::FileWriteFailed,
+        ThrowInfo(ErrorCode::FileWriteFailed,
                   "Failed to write mmap tmp file:{}",
                   file_name_);
     }
@@ -70,7 +70,7 @@ MmapBlock::Init() {
     addr_ = static_cast<char*>(
         mmap(nullptr, file_size_, kMmapDefaultProt, kMmapDefaultFlags, fd, 0));
     if (addr_ == MAP_FAILED) {
-        PanicInfo(ErrorCode::MmapError,
+        ThrowInfo(ErrorCode::MmapError,
                   "Failed to mmap in mmap_block:{}",
                   file_name_);
     }
@@ -95,14 +95,14 @@ MmapBlock::Close() {
     }
     if (addr_ != nullptr) {
         if (munmap(addr_, file_size_) != 0) {
-            PanicInfo(ErrorCode::MemAllocateSizeNotMatch,
+            ThrowInfo(ErrorCode::MemAllocateSizeNotMatch,
                       "Failed to munmap in mmap_block under file:{}",
                       file_name_);
         }
     }
     if (access(file_name_.c_str(), F_OK) == 0) {
         if (remove(file_name_.c_str()) != 0) {
-            PanicInfo(ErrorCode::MmapError,
+            ThrowInfo(ErrorCode::MmapError,
                       "Failed to munmap in mmap_block under file:{}",
                       file_name_);
         }
@@ -146,7 +146,7 @@ MmapBlocksHandler::AllocateFixSizeBlock() {
     } else {
         // if space not enough for create a new block, clear cache and check again
         if (GetFixFileSize() + Size() > max_disk_limit_) {
-            PanicInfo(ErrorCode::MemAllocateSizeNotMatch,
+            ThrowInfo(ErrorCode::MemAllocateSizeNotMatch,
                       "Failed to create a new mmap_block, not enough disk for "
                       "create a new mmap block. Allocated size: {}, Max size: "
                       "{} under mmap file_prefix: {}",
@@ -167,7 +167,7 @@ MmapBlocksHandler::AllocateLargeBlock(const uint64_t size) {
         ClearCache();
     }
     if (size + Size() > max_disk_limit_) {
-        PanicInfo(ErrorCode::MemAllocateSizeNotMatch,
+        ThrowInfo(ErrorCode::MemAllocateSizeNotMatch,
                   "Failed to create a new mmap_block, not enough disk for "
                   "create a new mmap block. To Allocate:{} Allocated size: {}, "
                   "Max size: {} "
@@ -236,38 +236,44 @@ MmapChunkManager::~MmapChunkManager() {
     }
 }
 
-void
-MmapChunkManager::Register(const MmapChunkDescriptorPtr descriptor) {
-    if (HasRegister(descriptor)) {
-        LOG_WARN("descriptor has exist in MmapChunkManager");
-        return;
-    }
-    AssertInfo(
-        descriptor->segment_type == SegmentType::Growing ||
-            descriptor->segment_type == SegmentType::Sealed,
-        "only register for growing or sealed segment in MmapChunkManager");
+MmapChunkDescriptorPtr
+MmapChunkManager::Register() {
     std::unique_lock<std::shared_mutex> lck(mtx_);
-    blocks_table_.emplace(*descriptor.get(), std::vector<MmapBlockPtr>());
-    return;
+    auto new_descriptor = std::shared_ptr<MmapChunkDescriptor>(
+        new MmapChunkDescriptor(descriptor_counter_.load()),
+        [this](MmapChunkDescriptor* ptr) {
+            UnRegister(ptr->GetId());
+            delete ptr;
+        });
+    descriptor_counter_.fetch_add(1);
+    blocks_table_.emplace(new_descriptor->GetId(), std::vector<MmapBlockPtr>());
+    return new_descriptor;
 }
 
 void
 MmapChunkManager::UnRegister(const MmapChunkDescriptorPtr descriptor) {
+    AssertInfo(descriptor != nullptr, "fail to unregister a nullptr.");
+    MmapChunkDescriptor::ID blocks_table_key = descriptor->GetId();
+    UnRegister(blocks_table_key);
+}
+
+void
+MmapChunkManager::UnRegister(
+    const MmapChunkDescriptor::ID descriptor_inner_id) {
     std::unique_lock<std::shared_mutex> lck(mtx_);
-    MmapChunkDescriptor blocks_table_key = *descriptor.get();
-    if (blocks_table_.find(blocks_table_key) != blocks_table_.end()) {
-        auto& blocks = blocks_table_[blocks_table_key];
+    if (blocks_table_.find(descriptor_inner_id) != blocks_table_.end()) {
+        auto& blocks = blocks_table_[descriptor_inner_id];
         for (auto i = 0; i < blocks.size(); i++) {
             blocks_handler_->Deallocate(std::move(blocks[i]));
         }
-        blocks_table_.erase(blocks_table_key);
+        blocks_table_.erase(descriptor_inner_id);
     }
 }
 
 bool
 MmapChunkManager::HasRegister(const MmapChunkDescriptorPtr descriptor) {
     std::shared_lock<std::shared_mutex> lck(mtx_);
-    return (blocks_table_.find(*descriptor.get()) != blocks_table_.end());
+    return (blocks_table_.find(descriptor->GetId()) != blocks_table_.end());
 }
 
 void*
@@ -275,9 +281,9 @@ MmapChunkManager::Allocate(const MmapChunkDescriptorPtr descriptor,
                            const uint64_t size) {
     AssertInfo(HasRegister(descriptor),
                "descriptor {} has not been register.",
-               descriptor->segment_id);
+               descriptor->GetId());
     std::unique_lock<std::shared_mutex> lck(mtx_);
-    auto blocks_table_key = *descriptor.get();
+    auto blocks_table_key = descriptor->GetId();
     if (size < blocks_handler_->GetFixFileSize()) {
         // find a place to fit in
         for (auto block_id = 0;
@@ -319,6 +325,7 @@ MmapChunkManager::MmapChunkManager(std::string root_path,
         cm->RemoveDir(root_path);
     }
     cm->CreateDir(root_path);
+    this->descriptor_counter_.store(0);
     LOG_INFO(
         "Init MappChunkManager with: Path {}, MaxDiskSize {} MB, "
         "FixedFileSize {} MB.",

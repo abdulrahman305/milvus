@@ -24,6 +24,56 @@
 #include <memory>
 #include "common/EasyAssert.h"
 #include "common/type_c.h"
+#include "monitor/scope_metric.h"
+
+CStatus
+NewPackedReaderWithStorageConfig(char** paths,
+                                 int64_t num_paths,
+                                 struct ArrowSchema* schema,
+                                 const int64_t buffer_size,
+                                 CStorageConfig c_storage_config,
+                                 CPackedReader* c_packed_reader) {
+    SCOPE_CGO_CALL_METRIC();
+
+    try {
+        auto truePaths = std::vector<std::string>(paths, paths + num_paths);
+
+        milvus_storage::ArrowFileSystemConfig conf;
+        conf.address = std::string(c_storage_config.address);
+        conf.bucket_name = std::string(c_storage_config.bucket_name);
+        conf.access_key_id = std::string(c_storage_config.access_key_id);
+        conf.access_key_value = std::string(c_storage_config.access_key_value);
+        conf.root_path = std::string(c_storage_config.root_path);
+        conf.storage_type = std::string(c_storage_config.storage_type);
+        conf.cloud_provider = std::string(c_storage_config.cloud_provider);
+        conf.iam_endpoint = std::string(c_storage_config.iam_endpoint);
+        conf.log_level = std::string(c_storage_config.log_level);
+        conf.region = std::string(c_storage_config.region);
+        conf.useSSL = c_storage_config.useSSL;
+        conf.sslCACert = std::string(c_storage_config.sslCACert);
+        conf.useIAM = c_storage_config.useIAM;
+        conf.useVirtualHost = c_storage_config.useVirtualHost;
+        conf.requestTimeoutMs = c_storage_config.requestTimeoutMs;
+        conf.gcp_credential_json =
+            std::string(c_storage_config.gcp_credential_json);
+        conf.use_custom_part_upload = c_storage_config.use_custom_part_upload;
+        milvus_storage::ArrowFileSystemSingleton::GetInstance().Init(conf);
+        auto trueFs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
+                          .GetArrowFileSystem();
+        if (!trueFs) {
+            return milvus::FailureCStatus(
+                milvus::ErrorCode::FileReadFailed,
+                "[StorageV2] Failed to get filesystem");
+        }
+        auto trueSchema = arrow::ImportSchema(schema).ValueOrDie();
+        auto reader = std::make_unique<milvus_storage::PackedRecordBatchReader>(
+            trueFs, truePaths, trueSchema, buffer_size);
+        *c_packed_reader = reader.release();
+        return milvus::SuccessCStatus();
+    } catch (std::exception& e) {
+        return milvus::FailureCStatus(&e);
+    }
+}
 
 CStatus
 NewPackedReader(char** paths,
@@ -31,21 +81,20 @@ NewPackedReader(char** paths,
                 struct ArrowSchema* schema,
                 const int64_t buffer_size,
                 CPackedReader* c_packed_reader) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto truePaths = std::vector<std::string>(paths, paths + num_paths);
         auto trueFs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                           .GetArrowFileSystem();
         if (!trueFs) {
-            return milvus::FailureCStatus(milvus::ErrorCode::FileReadFailed,
-                                          "Failed to get filesystem");
+            return milvus::FailureCStatus(
+                milvus::ErrorCode::FileReadFailed,
+                "[StorageV2] Failed to get filesystem");
         }
         auto trueSchema = arrow::ImportSchema(schema).ValueOrDie();
-        std::set<int> needed_columns;
-        for (int i = 0; i < trueSchema->num_fields(); i++) {
-            needed_columns.emplace(i);
-        }
         auto reader = std::make_unique<milvus_storage::PackedRecordBatchReader>(
-            trueFs, truePaths, trueSchema, needed_columns, buffer_size);
+            trueFs, truePaths, trueSchema, buffer_size);
         *c_packed_reader = reader.release();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
@@ -57,6 +106,8 @@ CStatus
 ReadNext(CPackedReader c_packed_reader,
          CArrowArray* out_array,
          CArrowSchema* out_schema) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto packed_reader =
             static_cast<milvus_storage::PackedRecordBatchReader*>(
@@ -92,10 +143,13 @@ ReadNext(CPackedReader c_packed_reader,
 
 CStatus
 CloseReader(CPackedReader c_packed_reader) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto packed_reader =
             static_cast<milvus_storage::PackedRecordBatchReader*>(
                 c_packed_reader);
+        packed_reader->Close();
         delete packed_reader;
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {

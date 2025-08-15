@@ -16,6 +16,7 @@
 #include <parquet/arrow/reader.h>
 #include <unistd.h>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "boost/filesystem/operations.hpp"
@@ -40,7 +41,9 @@ TEST(chunk, test_int64_field) {
         milvus::storage::CreateFieldData(storage::DataType::INT64);
     field_data->FillFieldData(data.data(), data.size());
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -57,10 +60,15 @@ TEST(chunk, test_int64_field) {
     s = arrow_reader->GetRecordBatchReader(&rb_reader);
     EXPECT_TRUE(s.ok());
 
-    FieldMeta field_meta(
-        FieldName("a"), milvus::FieldId(1), DataType::INT64, false);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto span = std::dynamic_pointer_cast<FixedWidthChunk>(chunk)->Span();
+    FieldMeta field_meta(FieldName("a"),
+                         milvus::FieldId(1),
+                         DataType::INT64,
+                         false,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto fixed_chunk = static_cast<FixedWidthChunk*>(chunk.get());
+    auto span = fixed_chunk->Span();
     EXPECT_EQ(span.row_count(), data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         auto n = *(int64_t*)((char*)span.data() + i * span.element_sizeof());
@@ -76,7 +84,9 @@ TEST(chunk, test_variable_field) {
     field_data->FillFieldData(data.data(), data.size());
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -93,11 +103,15 @@ TEST(chunk, test_variable_field) {
     s = arrow_reader->GetRecordBatchReader(&rb_reader);
     EXPECT_TRUE(s.ok());
 
-    FieldMeta field_meta(
-        FieldName("a"), milvus::FieldId(1), DataType::STRING, false);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto views = std::dynamic_pointer_cast<StringChunk>(chunk)->StringViews(
-        std::nullopt);
+    FieldMeta field_meta(FieldName("a"),
+                         milvus::FieldId(1),
+                         DataType::STRING,
+                         false,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto string_chunk = static_cast<StringChunk*>(chunk.get());
+    auto views = string_chunk->StringViews(std::nullopt);
     for (size_t i = 0; i < data.size(); ++i) {
         EXPECT_EQ(views.first[i], data[i]);
     }
@@ -111,11 +125,13 @@ TEST(chunk, test_variable_field_nullable) {
     auto field_data =
         milvus::storage::CreateFieldData(storage::DataType::VARCHAR, true);
     uint8_t* valid_data = new uint8_t[1]{0x15};  // 10101 in binary
-    field_data->FillFieldData(data.data(), valid_data, data.size());
+    field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
     delete[] valid_data;
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -132,11 +148,15 @@ TEST(chunk, test_variable_field_nullable) {
     s = arrow_reader->GetRecordBatchReader(&rb_reader);
     EXPECT_TRUE(s.ok());
 
-    FieldMeta field_meta(
-        FieldName("a"), milvus::FieldId(1), DataType::STRING, true);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto views = std::dynamic_pointer_cast<StringChunk>(chunk)->StringViews(
-        std::nullopt);
+    FieldMeta field_meta(FieldName("a"),
+                         milvus::FieldId(1),
+                         DataType::STRING,
+                         true,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto string_chunk = static_cast<StringChunk*>(chunk.get());
+    auto views = string_chunk->StringViews(std::nullopt);
     for (size_t i = 0; i < data.size(); ++i) {
         EXPECT_EQ(views.second[i], validity[i]);
         if (validity[i]) {
@@ -158,7 +178,9 @@ TEST(chunk, test_json_field) {
     field_data->FillFieldData(data.data(), data.size());
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
 
     auto get_record_batch_reader =
@@ -183,13 +205,16 @@ TEST(chunk, test_json_field) {
     {
         auto rb_reader = get_record_batch_reader();
         // nullable=false
-        FieldMeta field_meta(
-            FieldName("a"), milvus::FieldId(1), DataType::JSON, false);
-        auto chunk = create_chunk(field_meta, 1, rb_reader);
+        FieldMeta field_meta(FieldName("a"),
+                             milvus::FieldId(1),
+                             DataType::JSON,
+                             false,
+                             std::nullopt);
+        arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+        auto chunk = create_chunk(field_meta, array_vec);
+        auto json_chunk = static_cast<JSONChunk*>(chunk.get());
         {
-            auto [views, valid] =
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::nullopt);
+            auto [views, valid] = json_chunk->StringViews(std::nullopt);
             EXPECT_EQ(row_num, views.size());
             for (size_t i = 0; i < row_num; ++i) {
                 EXPECT_EQ(views[i], data[i].data());
@@ -200,8 +225,7 @@ TEST(chunk, test_json_field) {
             auto start = 10;
             auto len = 20;
             auto [views, valid] =
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::make_pair(start, len));
+                json_chunk->StringViews(std::make_pair(start, len));
             EXPECT_EQ(len, views.size());
             for (size_t i = 0; i < len; ++i) {
                 EXPECT_EQ(views[i], data[i].data());
@@ -211,13 +235,16 @@ TEST(chunk, test_json_field) {
     {
         auto rb_reader = get_record_batch_reader();
         // nullable=true
-        FieldMeta field_meta(
-            FieldName("a"), milvus::FieldId(1), DataType::JSON, true);
-        auto chunk = create_chunk(field_meta, 1, rb_reader);
+        FieldMeta field_meta(FieldName("a"),
+                             milvus::FieldId(1),
+                             DataType::JSON,
+                             true,
+                             std::nullopt);
+        arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+        auto chunk = create_chunk(field_meta, array_vec);
+        auto json_chunk = static_cast<JSONChunk*>(chunk.get());
         {
-            auto [views, valid] =
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::nullopt);
+            auto [views, valid] = json_chunk->StringViews(std::nullopt);
             EXPECT_EQ(row_num, views.size());
             for (size_t i = 0; i < row_num; ++i) {
                 EXPECT_EQ(views[i], data[i].data());
@@ -228,8 +255,7 @@ TEST(chunk, test_json_field) {
             auto start = 10;
             auto len = 20;
             auto [views, valid] =
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::make_pair(start, len));
+                json_chunk->StringViews(std::make_pair(start, len));
             EXPECT_EQ(len, views.size());
             for (size_t i = 0; i < len; ++i) {
                 EXPECT_EQ(views[i], data[i].data());
@@ -239,26 +265,20 @@ TEST(chunk, test_json_field) {
         {
             auto start = -1;
             auto len = 5;
-            EXPECT_THROW(
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::make_pair(start, len)),
-                milvus::SegcoreError);
+            EXPECT_THROW(json_chunk->StringViews(std::make_pair(start, len)),
+                         milvus::SegcoreError);
         }
         {
             auto start = 0;
             auto len = row_num + 1;
-            EXPECT_THROW(
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::make_pair(start, len)),
-                milvus::SegcoreError);
+            EXPECT_THROW(json_chunk->StringViews(std::make_pair(start, len)),
+                         milvus::SegcoreError);
         }
         {
             auto start = 95;
             auto len = 11;
-            EXPECT_THROW(
-                std::dynamic_pointer_cast<JSONChunk>(chunk)->StringViews(
-                    std::make_pair(start, len)),
-                milvus::SegcoreError);
+            EXPECT_THROW(json_chunk->StringViews(std::make_pair(start, len)),
+                         milvus::SegcoreError);
         }
     }
 }
@@ -270,11 +290,13 @@ TEST(chunk, test_null_int64) {
 
     // Set up validity bitmap: 10011 (1st, 4th, and 5th are valid)
     uint8_t* valid_data = new uint8_t[1]{0x13};  // 10011 in binary
-    field_data->FillFieldData(data.data(), valid_data, data.size());
+    field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
     delete[] valid_data;
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -291,10 +313,14 @@ TEST(chunk, test_null_int64) {
     s = arrow_reader->GetRecordBatchReader(&rb_reader);
     EXPECT_TRUE(s.ok());
 
-    FieldMeta field_meta(
-        FieldName("a"), milvus::FieldId(1), DataType::INT64, true);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto fixed_chunk = std::dynamic_pointer_cast<FixedWidthChunk>(chunk);
+    FieldMeta field_meta(FieldName("a"),
+                         milvus::FieldId(1),
+                         DataType::INT64,
+                         true,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto fixed_chunk = static_cast<FixedWidthChunk*>(chunk.get());
     auto span = fixed_chunk->Span();
     EXPECT_EQ(span.row_count(), data.size());
 
@@ -328,7 +354,9 @@ TEST(chunk, test_array) {
         milvus::storage::CreateFieldData(storage::DataType::ARRAY);
     field_data->FillFieldData(data.data(), data.size());
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -349,10 +377,12 @@ TEST(chunk, test_array) {
                          milvus::FieldId(1),
                          DataType::ARRAY,
                          DataType::STRING,
-                         false);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto [views, valid] =
-        std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(std::nullopt);
+                         false,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto array_chunk = static_cast<ArrayChunk*>(chunk.get());
+    auto [views, valid] = array_chunk->Views(std::nullopt);
     EXPECT_EQ(views.size(), 1);
     auto& arr = views[0];
     for (size_t i = 0; i < arr.length(); ++i) {
@@ -383,11 +413,13 @@ TEST(chunk, test_null_array) {
 
     // Set up validity bitmap: 10101 (1st, 3rd, and 5th are valid)
     uint8_t* valid_data = new uint8_t[1]{0x15};  // 10101 in binary
-    field_data->FillFieldData(data.data(), valid_data, data.size());
+    field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
     delete[] valid_data;
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -408,10 +440,12 @@ TEST(chunk, test_null_array) {
                          milvus::FieldId(1),
                          DataType::ARRAY,
                          DataType::STRING,
-                         true);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-    auto [views, valid] =
-        std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(std::nullopt);
+                         true,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto array_chunk = static_cast<ArrayChunk*>(chunk.get());
+    auto [views, valid] = array_chunk->Views(std::nullopt);
 
     EXPECT_EQ(views.size(), array_count);
     EXPECT_EQ(valid.size(), array_count);
@@ -457,7 +491,9 @@ TEST(chunk, test_array_views) {
         milvus::storage::CreateFieldData(storage::DataType::ARRAY);
     field_data->FillFieldData(data.data(), data.size());
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -478,12 +514,13 @@ TEST(chunk, test_array_views) {
                          milvus::FieldId(1),
                          DataType::ARRAY,
                          DataType::STRING,
-                         true);
-    auto chunk = create_chunk(field_meta, 1, rb_reader);
-
+                         true,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto array_chunk = static_cast<ArrayChunk*>(chunk.get());
     {
-        auto [views, valid] =
-            std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(std::nullopt);
+        auto [views, valid] = array_chunk->Views(std::nullopt);
         EXPECT_EQ(views.size(), array_count);
         for (auto i = 0; i < array_count; i++) {
             auto& arr = views[i];
@@ -496,9 +533,7 @@ TEST(chunk, test_array_views) {
     {
         auto start = 2;
         auto len = 5;
-        auto [views, valid] =
-            std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(
-                std::make_pair(start, len));
+        auto [views, valid] = array_chunk->Views(std::make_pair(start, len));
         EXPECT_EQ(views.size(), len);
         for (auto i = 0; i < len; i++) {
             auto& arr = views[i];
@@ -511,22 +546,19 @@ TEST(chunk, test_array_views) {
     {
         auto start = -1;
         auto len = 5;
-        EXPECT_THROW(std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(
-                         std::make_pair(start, len)),
+        EXPECT_THROW(array_chunk->Views(std::make_pair(start, len)),
                      milvus::SegcoreError);
     }
     {
         auto start = 0;
         auto len = array_count + 1;
-        EXPECT_THROW(std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(
-                         std::make_pair(start, len)),
+        EXPECT_THROW(array_chunk->Views(std::make_pair(start, len)),
                      milvus::SegcoreError);
     }
     {
         auto start = 5;
         auto len = 7;
-        EXPECT_THROW(std::dynamic_pointer_cast<ArrayChunk>(chunk)->Views(
-                         std::make_pair(start, len)),
+        EXPECT_THROW(array_chunk->Views(std::make_pair(start, len)),
                      milvus::SegcoreError);
     }
 }
@@ -540,7 +572,9 @@ TEST(chunk, test_sparse_float) {
     field_data->FillFieldData(vecs.get(), n_rows);
 
     storage::InsertEventData event_data;
-    event_data.field_data = field_data;
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    event_data.payload_reader = payload_reader;
     auto ser_data = event_data.Serialize();
     auto buffer = std::make_shared<arrow::io::BufferReader>(
         ser_data.data() + 2 * sizeof(milvus::Timestamp),
@@ -562,9 +596,12 @@ TEST(chunk, test_sparse_float) {
                          DataType::VECTOR_SPARSE_FLOAT,
                          kTestSparseDim,
                          "IP",
-                         false);
-    auto chunk = create_chunk(field_meta, kTestSparseDim, rb_reader);
-    auto vec = std::dynamic_pointer_cast<SparseFloatVectorChunk>(chunk)->Vec();
+                         false,
+                         std::nullopt);
+    arrow::ArrayVector array_vec = read_single_column_batches(rb_reader);
+    auto chunk = create_chunk(field_meta, array_vec);
+    auto vec_chunk = static_cast<SparseFloatVectorChunk*>(chunk.get());
+    auto vec = vec_chunk->Vec();
     for (size_t i = 0; i < n_rows; ++i) {
         auto v1 = vec[i];
         auto v2 = vecs[i];
@@ -573,68 +610,4 @@ TEST(chunk, test_sparse_float) {
             EXPECT_EQ(v1[j].val, v2[j].val);
         }
     }
-}
-
-class TempDir {
- public:
-    TempDir() {
-        auto path = boost::filesystem::unique_path("%%%%_%%%%");
-        auto abs_path = boost::filesystem::temp_directory_path() / path;
-        boost::filesystem::create_directory(abs_path);
-        dir_ = abs_path;
-    }
-
-    ~TempDir() {
-        boost::filesystem::remove_all(dir_);
-    }
-
-    std::string
-    dir() {
-        return dir_.string();
-    }
-
- private:
-    boost::filesystem::path dir_;
-};
-
-TEST(chunk, multiple_chunk_mmap) {
-    TempDir temp;
-    std::string temp_dir = temp.dir();
-    auto file = File::Open(temp_dir + "/multi_chunk_mmap", O_CREAT | O_RDWR);
-
-    FixedVector<int64_t> data = {1, 2, 3, 4, 5};
-    auto field_data =
-        milvus::storage::CreateFieldData(storage::DataType::INT64);
-    field_data->FillFieldData(data.data(), data.size());
-    storage::InsertEventData event_data;
-    event_data.field_data = field_data;
-    auto ser_data = event_data.Serialize();
-    auto buffer = std::make_shared<arrow::io::BufferReader>(
-        ser_data.data() + 2 * sizeof(milvus::Timestamp),
-        ser_data.size() - 2 * sizeof(milvus::Timestamp));
-
-    parquet::arrow::FileReaderBuilder reader_builder;
-    auto s = reader_builder.Open(buffer);
-    EXPECT_TRUE(s.ok());
-    std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
-    s = reader_builder.Build(&arrow_reader);
-    EXPECT_TRUE(s.ok());
-
-    std::shared_ptr<::arrow::RecordBatchReader> rb_reader;
-    s = arrow_reader->GetRecordBatchReader(&rb_reader);
-    EXPECT_TRUE(s.ok());
-
-    FieldMeta field_meta(
-        FieldName("a"), milvus::FieldId(1), DataType::INT64, false);
-    int file_offset = 0;
-    auto page_size = sysconf(_SC_PAGESIZE);
-    auto chunk = create_chunk(field_meta, 1, file, file_offset, rb_reader);
-    EXPECT_TRUE(chunk->Size() % page_size == 0);
-    file_offset += chunk->Size();
-
-    std::shared_ptr<::arrow::RecordBatchReader> rb_reader2;
-    s = arrow_reader->GetRecordBatchReader(&rb_reader2);
-    EXPECT_TRUE(s.ok());
-    auto chunk2 = create_chunk(field_meta, 1, file, file_offset, rb_reader2);
-    EXPECT_TRUE(chunk->Size() % page_size == 0);
 }

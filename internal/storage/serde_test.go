@@ -20,6 +20,7 @@ import (
 	"io"
 	"reflect"
 	"testing"
+	"unsafe"
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -27,7 +28,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/v2/common"
 )
 
 type MockRecordWriter struct {
@@ -100,6 +100,8 @@ func TestSerDe(t *testing.T) {
 		{"test bfloat16 vector", args{dt: schemapb.DataType_BFloat16Vector, v: []byte{0xff, 0xff}}, []byte{0xff, 0xff}, true},
 		{"test bfloat16 vector null", args{dt: schemapb.DataType_BFloat16Vector, v: nil}, nil, true},
 		{"test bfloat16 vector negative", args{dt: schemapb.DataType_BFloat16Vector, v: -1}, nil, false},
+		{"test int8 vector", args{dt: schemapb.DataType_Int8Vector, v: []int8{10}}, []int8{10}, true},
+		{"test array of vector", args{dt: schemapb.DataType_ArrayOfVector, v: "{}"}, nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -109,13 +111,62 @@ func TestSerDe(t *testing.T) {
 			serdeMap[dt].serialize(builder, v)
 			// assert.True(t, ok)
 			a := builder.NewArray()
-			got, got1 := serdeMap[dt].deserialize(a, 0)
+			got, got1 := serdeMap[dt].deserialize(a, 0, false)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("deserialize() got = %v, want %v", got, tt.want)
 			}
 			if got1 != tt.want1 {
 				t.Errorf("deserialize() got1 = %v, want %v", got1, tt.want1)
 			}
+		})
+	}
+}
+
+func TestSerDeCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		dt   schemapb.DataType
+		v    any
+	}{
+		{"test string copy", schemapb.DataType_String, "test"},
+		{"test string no copy", schemapb.DataType_String, "test"},
+		{"test binary copy", schemapb.DataType_JSON, []byte{1, 2, 3}},
+		{"test binary no copy", schemapb.DataType_JSON, []byte{1, 2, 3}},
+		{"test bool copy", schemapb.DataType_Bool, true},
+		{"test bool no copy", schemapb.DataType_Bool, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dt := tt.dt
+			v := tt.v
+			builder := array.NewBuilder(memory.DefaultAllocator, serdeMap[dt].arrowType(1))
+			defer builder.Release()
+			serdeMap[dt].serialize(builder, v)
+			a := builder.NewArray()
+
+			// Test deserialize with shouldCopy parameter
+			copy, got1 := serdeMap[dt].deserialize(a, 0, true)
+			if !got1 {
+				t.Errorf("deserialize() failed for %s", tt.name)
+			}
+			if !reflect.DeepEqual(copy, tt.v) {
+				t.Errorf("deserialize() got = %v, want %v", copy, tt.v)
+			}
+			ref, _ := serdeMap[dt].deserialize(a, 0, false)
+			// check the unsafe pointers of copy and ref are different
+			switch v := copy.(type) {
+			case []byte:
+				if unsafe.Pointer(&v[0]) == unsafe.Pointer(&ref.([]byte)[0]) {
+					t.Errorf("deserialize() got same pointer for %v", tt.v)
+				}
+			case string:
+				if unsafe.StringData(v) == unsafe.StringData(ref.(string)) {
+					t.Errorf("deserialize() got same pointer for %v", tt.v)
+				}
+			}
+
+			a.Release()
 		})
 	}
 }
@@ -127,7 +178,7 @@ func BenchmarkDeserializeReader(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		reader, err := NewBinlogDeserializeReader(generateTestSchema(), MakeBlobsReader(blobs))
+		reader, err := NewBinlogDeserializeReader(generateTestSchema(), MakeBlobsReader(blobs), false)
 		assert.NoError(b, err)
 		defer reader.Close()
 		for i := 0; i < len; i++ {
@@ -139,25 +190,6 @@ func BenchmarkDeserializeReader(b *testing.B) {
 	}
 }
 
-func BenchmarkBinlogIterator(b *testing.B) {
-	len := 1000000
-	blobs, err := generateTestData(len)
-	assert.NoError(b, err)
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		itr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(b, err)
-		defer itr.Dispose()
-		for i := 0; i < len; i++ {
-			assert.True(b, itr.HasNext())
-			_, err = itr.Next()
-			assert.NoError(b, err)
-		}
-		assert.False(b, itr.HasNext())
-	}
-}
-
 func TestCalculateArraySize(t *testing.T) {
 	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	defer mem.AssertSize(t, 0)
@@ -165,7 +197,7 @@ func TestCalculateArraySize(t *testing.T) {
 	tests := []struct {
 		name         string
 		arrayBuilder func() arrow.Array
-		expectedSize int
+		expectedSize uint64
 	}{
 		{
 			name: "Empty array",
@@ -184,7 +216,7 @@ func TestCalculateArraySize(t *testing.T) {
 				b.AppendValues([]int32{1, 2, 3, 4}, nil)
 				return b.NewArray()
 			},
-			expectedSize: 17, // 4 elements * 4 bytes + bitmap(1bytes)
+			expectedSize: 20, // 4 elements * 4 bytes + bitmap(4bytes)
 		},
 		{
 			name: "Variable-length string array",
@@ -194,7 +226,9 @@ func TestCalculateArraySize(t *testing.T) {
 				b.AppendValues([]string{"hello", "world"}, nil)
 				return b.NewArray()
 			},
-			expectedSize: 11, // "hello" (5 bytes) + "world" (5 bytes) + bitmap(1bytes)
+			expectedSize: 23, // bytes: "hello" (5 bytes) + "world" (5 bytes)
+			// offsets: 2+1 elements * 4 bytes
+			// bitmap(1 byte)
 		},
 		{
 			name: "Nested list array",
@@ -214,7 +248,9 @@ func TestCalculateArraySize(t *testing.T) {
 
 				return b.NewArray()
 			},
-			expectedSize: 21, // 3 + 2 elements in data buffer, plus bitmap(1bytes)
+			expectedSize: 44, // child buffer: 5 elements * 4 bytes, plus bitmap (4bytes)
+			// offsets: 3+1 elements * 4 bytes
+			// bitmap(4 bytes)
 		},
 	}
 
@@ -223,32 +259,10 @@ func TestCalculateArraySize(t *testing.T) {
 			arr := tt.arrayBuilder()
 			defer arr.Release()
 
-			size := calculateArraySize(arr)
+			size := arr.Data().SizeInBytes()
 			if size != tt.expectedSize {
 				t.Errorf("Expected size %d, got %d", tt.expectedSize, size)
 			}
 		})
-	}
-}
-
-func TestCalculateArraySizeWithOffset(t *testing.T) {
-	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
-	defer mem.AssertSize(t, 0)
-
-	b := array.NewStringBuilder(mem)
-	defer b.Release()
-
-	b.AppendValues([]string{"zero", "one", "two", "three", "four"}, nil)
-	fullArray := b.NewArray()
-	defer fullArray.Release()
-
-	slicedArray := array.NewSlice(fullArray, 1, 4) // Offset = 1, End = 4
-	defer slicedArray.Release()
-
-	size := calculateArraySize(slicedArray)
-	expectedSize := len("one") + len("two") + len("three") + 1 // "one", "two", "three", bitmap(1 bytes)
-
-	if size != expectedSize {
-		t.Errorf("Expected size %d, got %d", expectedSize, size)
 	}
 }

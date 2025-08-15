@@ -72,8 +72,12 @@ func VerifyResponse(response interface{}, err error) error {
 	}
 }
 
-func FilterInIndexedSegments(handler Handler, mt *meta, skipNoIndexCollection bool, segments ...*SegmentInfo) []*SegmentInfo {
+func FilterInIndexedSegments(ctx context.Context, handler Handler, mt *meta, skipNoIndexCollection bool, segments ...*SegmentInfo) []*SegmentInfo {
 	if len(segments) == 0 {
+		return nil
+	}
+
+	if ctx.Err() != nil {
 		return nil
 	}
 
@@ -89,8 +93,9 @@ func FilterInIndexedSegments(handler Handler, mt *meta, skipNoIndexCollection bo
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
-		coll, err := handler.GetCollection(ctx, collection)
+		timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*2)
+
+		coll, err := handler.GetCollection(timeoutCtx, collection)
 		cancel()
 		if err != nil {
 			log.Warn("failed to get collection schema", zap.Error(err))
@@ -285,6 +290,18 @@ func getBinLogIDs(segment *SegmentInfo, fieldID int64) []int64 {
 	return binlogIDs
 }
 
+func getTotalBinlogRows(segment *SegmentInfo, fieldID int64) int64 {
+	var total int64
+	for _, fieldBinLog := range segment.GetBinlogs() {
+		if fieldBinLog.GetFieldID() == fieldID {
+			for _, binLog := range fieldBinLog.GetBinlogs() {
+				total += binLog.EntriesNum
+			}
+		}
+	}
+	return total
+}
+
 func CheckCheckPointsHealth(meta *meta) error {
 	for channel, cp := range meta.GetChannelCheckpoints() {
 		collectionID := funcutil.GetCollectionIDFromVChannel(channel)
@@ -362,4 +379,54 @@ func getSortStatus(sorted bool) string {
 		return "sorted"
 	}
 	return "unsorted"
+}
+
+func calculateIndexTaskSlot(segmentSize int64) int64 {
+	defaultSlots := Params.DataCoordCfg.IndexTaskSlotUsage.GetAsInt64()
+	if segmentSize > 512*1024*1024 {
+		taskSlot := max(segmentSize/512/1024/1024, 1) * defaultSlots
+		return max(taskSlot, 1)
+	} else if segmentSize > 100*1024*1024 {
+		return max(defaultSlots/4, 1)
+	} else if segmentSize > 10*1024*1024 {
+		return max(defaultSlots/16, 1)
+	}
+	return max(defaultSlots/64, 1)
+}
+
+func calculateStatsTaskSlot(segmentSize int64) int64 {
+	defaultSlots := Params.DataCoordCfg.StatsTaskSlotUsage.GetAsInt64()
+	if segmentSize > 512*1024*1024 {
+		taskSlot := max(segmentSize/512/1024/1024, 1) * defaultSlots
+		return max(taskSlot, 1)
+	} else if segmentSize > 100*1024*1024 {
+		return max(defaultSlots/2, 1)
+	} else if segmentSize > 10*1024*1024 {
+		return max(defaultSlots/4, 1)
+	}
+	return max(defaultSlots/8, 1)
+}
+
+func enableSortCompaction() bool {
+	return paramtable.Get().DataCoordCfg.EnableSortCompaction.GetAsBool() && paramtable.Get().DataCoordCfg.EnableCompaction.GetAsBool()
+}
+
+// stringifyBinlogs is used for logging, it's not used for other purposes.
+func stringifyBinlogs(binlogs []*datapb.FieldBinlog) []string {
+	strs := make([]string, 0, len(binlogs))
+	byIDs := lo.GroupBy(binlogs, func(binlog *datapb.FieldBinlog) int64 {
+		return binlog.GetFieldID()
+	})
+	for _, binlogs := range byIDs {
+		fieldsStrs := make([]string, 0, len(binlogs))
+		for _, binlog := range binlogs {
+			for _, b := range binlog.GetBinlogs() {
+				fieldsStrs = append(fieldsStrs,
+					fmt.Sprintf("l%d(e%d,m%d,t%d-%d)", b.LogID, b.EntriesNum, b.MemorySize, b.TimestampFrom, b.TimestampTo),
+				)
+			}
+		}
+		strs = append(strs, fmt.Sprintf("f%d:%s", binlogs[0].GetFieldID(), strings.Join(fieldsStrs, "|")))
+	}
+	return strs
 }

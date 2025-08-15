@@ -18,8 +18,7 @@ import (
 type ServerBuilder struct {
 	etcdClient   *clientv3.Client
 	grpcServer   *grpc.Server
-	rc           *syncutil.Future[types.RootCoordClient]
-	dc           *syncutil.Future[types.DataCoordClient]
+	mixc         *syncutil.Future[types.MixCoordClient]
 	session      *sessionutil.Session
 	kv           kv.MetaKv
 	chunkManager storage.ChunkManager
@@ -49,14 +48,8 @@ func (b *ServerBuilder) WithGRPCServer(svr *grpc.Server) *ServerBuilder {
 }
 
 // WithRootCoordClient sets root coord client to the server builder.
-func (b *ServerBuilder) WithRootCoordClient(rc *syncutil.Future[types.RootCoordClient]) *ServerBuilder {
-	b.rc = rc
-	return b
-}
-
-// WithDataCoordClient sets data coord client to the server builder.
-func (b *ServerBuilder) WithDataCoordClient(dc *syncutil.Future[types.DataCoordClient]) *ServerBuilder {
-	b.dc = dc
+func (b *ServerBuilder) WithMixCoordClient(mixc *syncutil.Future[types.MixCoordClient]) *ServerBuilder {
+	b.mixc = mixc
 	return b
 }
 
@@ -74,14 +67,12 @@ func (b *ServerBuilder) WithMetaKV(kv kv.MetaKv) *ServerBuilder {
 
 // Build builds a streaming node server.
 func (b *ServerBuilder) Build() *Server {
-	resource.Apply(
+	resource.Init(
 		resource.OptETCD(b.etcdClient),
 		resource.OptChunkManager(b.chunkManager),
-		resource.OptRootCoordClient(b.rc),
-		resource.OptDataCoordClient(b.dc),
+		resource.OptMixCoordClient(b.mixc),
 		resource.OptStreamingNodeCatalog(streamingnode.NewCataLog(b.kv)),
 	)
-	resource.Done()
 	s := &Server{
 		session:    b.session,
 		grpcServer: b.grpcServer,

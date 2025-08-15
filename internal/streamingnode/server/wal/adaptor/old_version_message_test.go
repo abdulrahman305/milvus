@@ -21,16 +21,16 @@ import (
 )
 
 func TestNewOldVersionImmutableMessage(t *testing.T) {
-	rc := mocks.NewMockRootCoordClient(t)
+	rc := mocks.NewMockMixCoordClient(t)
 	rc.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 		Status:               merr.Success(),
 		CollectionID:         1,
 		PhysicalChannelNames: []string{"test1", "test2"},
 		VirtualChannelNames:  []string{"test1-v0", "test2-v0"},
 	}, nil)
-	rcf := syncutil.NewFuture[types.RootCoordClient]()
+	rcf := syncutil.NewFuture[types.MixCoordClient]()
 	rcf.Set(rc)
-	resource.InitForTest(t, resource.OptRootCoordClient(rcf))
+	resource.InitForTest(t, resource.OptMixCoordClient(rcf))
 
 	ctx := context.Background()
 	pchannel := "test1"
@@ -53,6 +53,7 @@ func TestNewOldVersionImmutableMessage(t *testing.T) {
 
 	msg, err := newOldVersionImmutableMessage(ctx, pchannel, lastConfirmedMessageID, message.NewImmutableMesasge(messageID, payload, map[string]string{}))
 	assert.NoError(t, err)
+	assert.Equal(t, message.VersionOld, msg.Version())
 	assert.NotNil(t, msg.LastConfirmedMessageID())
 	assert.Equal(t, msg.VChannel(), "test1-v0")
 	assert.Equal(t, msg.TimeTick(), tt)

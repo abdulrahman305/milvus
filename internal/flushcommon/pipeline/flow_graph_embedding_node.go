@@ -19,9 +19,12 @@ package pipeline
 import (
 	"fmt"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/internal/flushcommon/writebuffer"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/function"
@@ -35,7 +38,7 @@ import (
 type embeddingNode struct {
 	BaseNode
 
-	schema      *schemapb.CollectionSchema
+	metaCache   metacache.MetaCache
 	pkField     *schemapb.FieldSchema
 	channelName string
 
@@ -43,7 +46,7 @@ type embeddingNode struct {
 	functionRunners map[int64]function.FunctionRunner
 }
 
-func newEmbeddingNode(channelName string, schema *schemapb.CollectionSchema) (*embeddingNode, error) {
+func newEmbeddingNode(channelName string, metaCache metacache.MetaCache) (*embeddingNode, error) {
 	baseNode := BaseNode{}
 	baseNode.SetMaxQueueLength(paramtable.Get().DataNodeCfg.FlowGraphMaxQueueLength.GetAsInt32())
 	baseNode.SetMaxParallelism(paramtable.Get().DataNodeCfg.FlowGraphMaxParallelism.GetAsInt32())
@@ -51,9 +54,11 @@ func newEmbeddingNode(channelName string, schema *schemapb.CollectionSchema) (*e
 	node := &embeddingNode{
 		BaseNode:        baseNode,
 		channelName:     channelName,
-		schema:          schema,
+		metaCache:       metaCache,
 		functionRunners: make(map[int64]function.FunctionRunner),
 	}
+
+	schema := metaCache.GetSchema(0)
 
 	for _, field := range schema.GetFields() {
 		if field.GetIsPrimaryKey() {
@@ -79,24 +84,33 @@ func (eNode *embeddingNode) Name() string {
 	return fmt.Sprintf("embeddingNode-%s", eNode.channelName)
 }
 
-func (eNode *embeddingNode) bm25Embedding(runner function.FunctionRunner, inputFieldId, outputFieldId int64, data *storage.InsertData, meta map[int64]*storage.BM25Stats) error {
+func (eNode *embeddingNode) bm25Embedding(runner function.FunctionRunner, data *storage.InsertData, meta map[int64]*storage.BM25Stats) error {
+	inputFieldIds := lo.Map(runner.GetInputFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })
+	outputFieldId := runner.GetOutputFields()[0].GetFieldID()
+
 	if _, ok := meta[outputFieldId]; !ok {
 		meta[outputFieldId] = storage.NewBM25Stats()
 	}
 
-	embeddingData, ok := data.Data[inputFieldId].GetDataRows().([]string)
-	if !ok {
-		return fmt.Errorf("BM25 embedding failed: input field data not varchar/text")
+	datas := []any{}
+
+	for _, inputFieldId := range inputFieldIds {
+		data, ok := data.Data[inputFieldId]
+		if !ok {
+			return errors.New("BM25 embedding failed: input field data not varchar/text")
+		}
+
+		datas = append(datas, data.GetDataRows())
 	}
 
-	output, err := runner.BatchRun(embeddingData)
+	output, err := runner.BatchRun(datas...)
 	if err != nil {
 		return err
 	}
 
 	sparseArray, ok := output[0].(*schemapb.SparseFloatArray)
 	if !ok {
-		return fmt.Errorf("BM25 embedding failed: BM25 runner output not sparse map")
+		return errors.New("BM25 embedding failed: BM25 runner output not sparse map")
 	}
 
 	meta[outputFieldId].AppendBytes(sparseArray.GetContents()...)
@@ -111,7 +125,7 @@ func (eNode *embeddingNode) embedding(datas []*storage.InsertData) (map[int64]*s
 			functionSchema := functionRunner.GetSchema()
 			switch functionSchema.GetType() {
 			case schemapb.FunctionType_BM25:
-				err := eNode.bm25Embedding(functionRunner, functionSchema.GetInputFieldIds()[0], functionSchema.GetOutputFieldIds()[0], data, meta)
+				err := eNode.bm25Embedding(functionRunner, data, meta)
 				if err != nil {
 					return nil, err
 				}
@@ -141,20 +155,28 @@ func (eNode *embeddingNode) Operate(in []Msg) []Msg {
 		return []Msg{fgMsg}
 	}
 
-	insertData, err := writebuffer.PrepareInsert(eNode.schema, eNode.pkField, fgMsg.InsertMessages)
-	if err != nil {
-		log.Error("failed to prepare insert data", zap.Error(err))
-		panic(err)
+	insertData := make([]*writebuffer.InsertData, 0)
+	if len(fgMsg.InsertMessages) > 0 {
+		var err error
+		if insertData, err = writebuffer.PrepareInsert(eNode.metaCache.GetSchema(fgMsg.TimeTick()), eNode.pkField, fgMsg.InsertMessages); err != nil {
+			log.Error("failed to prepare insert data", zap.Error(err))
+			panic(err)
+		}
 	}
 
-	err = eNode.Embedding(insertData)
-	if err != nil {
+	if err := eNode.Embedding(insertData); err != nil {
 		log.Warn("failed to embedding insert data", zap.Error(err))
 		panic(err)
 	}
 
 	fgMsg.InsertData = insertData
 	return []Msg{fgMsg}
+}
+
+func (eNode *embeddingNode) Free() {
+	for _, runner := range eNode.functionRunners {
+		runner.Close()
+	}
 }
 
 func BuildSparseFieldData(array *schemapb.SparseFloatArray) storage.FieldData {

@@ -24,22 +24,31 @@ import (
 	"os"
 	"testing"
 
+	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/apache/arrow/go/v17/parquet"
 	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/exp/slices"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/nullutil"
 	"github.com/milvus-io/milvus/internal/util/testutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+)
+
+const (
+	testOutputPath = "/tmp/milvus_test/test_parquet_reader"
 )
 
 type ReaderSuite struct {
@@ -175,11 +184,20 @@ func (s *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.DataType
 	assert.NoError(s.T(), err)
 
 	ctx := context.Background()
-	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp/milvus_test/test_parquet_reader/"))
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
 	cm, err := f.NewPersistentStorageChunkManager(ctx)
 	assert.NoError(s.T(), err)
 	reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
 	s.NoError(err)
+	s.NotNil(reader)
+	defer reader.Close()
+
+	size, err := reader.Size()
+	s.NoError(err)
+	s.True(size > int64(0))
+	size2, err := reader.Size() // size is cached
+	s.NoError(err)
+	s.Equal(size, size2)
 
 	checkFn := func(actualInsertData *storage.InsertData, offsetBegin, expectRows int) {
 		expectInsertData := insertData
@@ -277,7 +295,7 @@ func (s *ReaderSuite) failRun(dt schemapb.DataType, isDynamic bool) {
 	assert.NoError(s.T(), err)
 
 	ctx := context.Background()
-	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp/milvus_test/test_parquet_reader/"))
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
 	cm, err := f.NewPersistentStorageChunkManager(ctx)
 	assert.NoError(s.T(), err)
 	reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
@@ -330,7 +348,7 @@ func (s *ReaderSuite) runWithDefaultValue(dataType schemapb.DataType, elemType s
 	assert.NoError(s.T(), err)
 
 	ctx := context.Background()
-	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp/milvus_test/test_parquet_reader/"))
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
 	cm, err := f.NewPersistentStorageChunkManager(ctx)
 	assert.NoError(s.T(), err)
 	schema.Fields[2].Nullable = nullable
@@ -355,6 +373,107 @@ func (s *ReaderSuite) runWithDefaultValue(dataType schemapb.DataType, elemType s
 
 	res, err := reader.Read()
 	s.NoError(err)
+	checkFn(res, 0, s.numRows)
+}
+
+func (s *ReaderSuite) runWithSparseVector(indicesType arrow.DataType, valuesType arrow.DataType) {
+	// milvus schema
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "pk",
+				IsPrimaryKey: true,
+				DataType:     schemapb.DataType_Int64,
+				AutoID:       false,
+			},
+			{
+				FieldID:  101,
+				Name:     "sparse",
+				DataType: schemapb.DataType_SparseFloatVector,
+			},
+		},
+	}
+
+	// arrow schema
+	arrowFields := make([]arrow.Field, 0)
+	arrowFields = append(arrowFields, arrow.Field{
+		Name:     "pk",
+		Type:     &arrow.Int64Type{},
+		Nullable: false,
+		Metadata: arrow.Metadata{},
+	})
+
+	sparseFields := []arrow.Field{
+		{Name: sparseVectorIndice, Type: arrow.ListOf(indicesType)},
+		{Name: sparseVectorValues, Type: arrow.ListOf(valuesType)},
+	}
+	arrowFields = append(arrowFields, arrow.Field{
+		Name:     "sparse",
+		Type:     arrow.StructOf(sparseFields...),
+		Nullable: false,
+		Metadata: arrow.Metadata{},
+	})
+	pqSchema := arrow.NewSchema(arrowFields, nil)
+
+	// parquet writer
+	filePath := fmt.Sprintf("/tmp/test_%d_reader.parquet", rand.Int())
+	defer os.Remove(filePath)
+
+	// prepare milvus data
+	insertData, err := testutil.CreateInsertData(schema, s.numRows, 0)
+	assert.NoError(s.T(), err)
+
+	// use a function here because the fw.Close() must be called before we read the parquet file
+	func() {
+		wf, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o666)
+		assert.NoError(s.T(), err)
+		fw, err := pqarrow.NewFileWriter(pqSchema, wf, parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(int64(s.numRows))), pqarrow.DefaultWriterProps())
+		assert.NoError(s.T(), err)
+		defer fw.Close()
+
+		// prepare parquet data
+		arrowColumns := make([]arrow.Array, 0, len(schema.Fields))
+		mem := memory.NewGoAllocator()
+		builder := array.NewInt64Builder(mem)
+		int64Data := insertData.Data[schema.Fields[0].FieldID].(*storage.Int64FieldData).Data
+		validData := insertData.Data[schema.Fields[0].FieldID].(*storage.Int64FieldData).ValidData
+		builder.AppendValues(int64Data, validData)
+		arrowColumns = append(arrowColumns, builder.NewInt64Array())
+
+		contents := insertData.Data[schema.Fields[1].FieldID].(*storage.SparseFloatVectorFieldData).GetContents()
+		arr, err := testutil.BuildSparseVectorData(mem, contents, arrowFields[1].Type)
+		assert.NoError(s.T(), err)
+		arrowColumns = append(arrowColumns, arr)
+
+		// write parquet
+		recordBatch := array.NewRecord(pqSchema, arrowColumns, int64(s.numRows))
+		err = fw.Write(recordBatch)
+		assert.NoError(s.T(), err)
+	}()
+
+	// read parquet
+	ctx := context.Background()
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
+	cm, err := f.NewPersistentStorageChunkManager(ctx)
+	assert.NoError(s.T(), err)
+	reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
+	assert.NoError(s.T(), err)
+
+	checkFn := func(actualInsertData *storage.InsertData, offsetBegin, expectRows int) {
+		expectInsertData := insertData
+		for fieldID, data := range actualInsertData.Data {
+			s.Equal(expectRows, data.RowNum())
+			for i := 0; i < expectRows; i++ {
+				expect := expectInsertData.Data[fieldID].GetRow(i + offsetBegin)
+				actual := data.GetRow(i)
+				s.Equal(expect, actual)
+			}
+		}
+	}
+
+	res, err := reader.Read()
+	assert.NoError(s.T(), err)
 	checkFn(res, 0, s.numRows)
 }
 
@@ -494,12 +613,141 @@ func (s *ReaderSuite) TestVector() {
 	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
 	s.vecDataType = schemapb.DataType_BFloat16Vector
 	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
+	// this test case only test parsing sparse vector from JSON-format string
 	s.vecDataType = schemapb.DataType_SparseFloatVector
 	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
 	s.vecDataType = schemapb.DataType_Int8Vector
 	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
 }
 
-func TestUtil(t *testing.T) {
+func (s *ReaderSuite) TestSparseVector() {
+	s.runWithSparseVector(arrow.PrimitiveTypes.Int32, arrow.PrimitiveTypes.Float32)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Int32, arrow.PrimitiveTypes.Float64)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Uint32, arrow.PrimitiveTypes.Float32)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Uint32, arrow.PrimitiveTypes.Float64)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Int64, arrow.PrimitiveTypes.Float32)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Int64, arrow.PrimitiveTypes.Float64)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Uint64, arrow.PrimitiveTypes.Float32)
+	s.runWithSparseVector(arrow.PrimitiveTypes.Uint64, arrow.PrimitiveTypes.Float64)
+}
+
+func TestParquetReader(t *testing.T) {
 	suite.Run(t, new(ReaderSuite))
+}
+
+func TestParquetReaderError(t *testing.T) {
+	ctx := context.Background()
+	cm := mocks.NewChunkManager(t)
+	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(nil, merr.WrapErrImportFailed("read error"))
+
+	// io error
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "pk",
+				IsPrimaryKey: true,
+				DataType:     schemapb.DataType_Int64,
+				AutoID:       false,
+			},
+			{
+				FieldID:          101,
+				Name:             "vec",
+				DataType:         schemapb.DataType_SparseFloatVector,
+				IsFunctionOutput: false,
+			},
+		},
+	}
+	_, err := NewReader(ctx, cm, schema, "dummy path", 64*1024*1024)
+	assert.Error(t, err)
+
+	// temp tunction to write parquet file
+	writeParquetFunc := func(colSchema *schemapb.CollectionSchema, numRows int) string {
+		filePath := fmt.Sprintf("/tmp/test_%d_reader.parquet", rand.Int())
+		wf, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o666)
+		assert.NoError(t, err)
+
+		pqSchema, err := ConvertToArrowSchema(colSchema, false)
+		assert.NoError(t, err)
+
+		fw, err := pqarrow.NewFileWriter(pqSchema, wf, parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(int64(numRows))), pqarrow.DefaultWriterProps())
+		assert.NoError(t, err)
+		defer fw.Close()
+
+		insertData, err := testutil.CreateInsertData(schema, numRows, 0)
+		assert.NoError(t, err)
+		columns, err := testutil.BuildArrayData(schema, insertData, false)
+		assert.NoError(t, err)
+
+		recordBatch := array.NewRecord(pqSchema, columns, int64(numRows))
+		err = fw.Write(recordBatch)
+		assert.NoError(t, err)
+
+		return filePath
+	}
+
+	checkFunc := func(colSchema *schemapb.CollectionSchema, filePath string, succeed bool) {
+		f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
+		c, err := f.NewPersistentStorageChunkManager(ctx)
+		assert.NoError(t, err)
+
+		_, err = NewReader(ctx, c, schema, filePath, 64*1024*1024)
+		if succeed {
+			assert.NoError(t, err)
+		} else {
+			assert.Error(t, err)
+		}
+	}
+
+	// the parquet file contains "pk" and "vec"
+	numRows := 3
+	filePath := writeParquetFunc(schema, numRows)
+	defer os.Remove(filePath)
+
+	// now set the pk to be AutoID
+	// NewReader will return error "the primary key is auto-generated, no need to provide"
+	schema.Fields[0].AutoID = true
+	checkFunc(schema, filePath, false)
+
+	// now set the vec to be FunctionOutput
+	// NewReader will return error "the field is output by function, no need to provide"
+	schema.Fields[0].AutoID = false
+	schema.Fields[1].IsFunctionOutput = true
+	checkFunc(schema, filePath, false)
+
+	// now add a nullable field in the schema
+	// NewReader will succeed
+	schema.Fields[1].IsFunctionOutput = false
+	schema.Fields = append(schema.Fields, &schemapb.FieldSchema{
+		FieldID:  200,
+		Name:     "new",
+		DataType: schemapb.DataType_Float,
+		Nullable: true,
+	})
+	checkFunc(schema, filePath, true)
+
+	// the new field is not nullable
+	// NewReader will return error "schema not equal"
+	schema.Fields[2].Nullable = false
+	checkFunc(schema, filePath, false)
+
+	// now add a dynamic field in the schema
+	// NewReader will succeed
+	schema.Fields[2].Nullable = true
+	schema.Fields = append(schema.Fields, &schemapb.FieldSchema{
+		FieldID:   300,
+		Name:      "dynamic",
+		DataType:  schemapb.DataType_JSON,
+		IsDynamic: true,
+	})
+	checkFunc(schema, filePath, true)
+
+	// the new file contains 4 fields: pk, vec, new, dynamic
+	filePath = writeParquetFunc(schema, numRows)
+	defer os.Remove(filePath)
+
+	// the schema has 2 fields: pk, vec
+	// NewReader will succeed
+	schema.Fields = schema.Fields[0:2]
+	checkFunc(schema, filePath, true)
 }

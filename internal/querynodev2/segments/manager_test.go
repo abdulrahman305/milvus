@@ -59,6 +59,7 @@ func (s *ManagerSuite) SetupTest() {
 		segment, err := NewSegment(
 			context.Background(),
 			collection,
+			s.mgr,
 			s.types[i],
 			0,
 			&querypb.SegmentLoadInfo{
@@ -68,7 +69,6 @@ func (s *ManagerSuite) SetupTest() {
 				InsertChannel: s.channels[i],
 				Level:         s.levels[i],
 			},
-			nil,
 		)
 		s.Require().NoError(err)
 		s.segments = append(s.segments, segment)

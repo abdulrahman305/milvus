@@ -1,8 +1,8 @@
 use tantivy::tokenizer::*;
 
-use crate::analyzer::tokenizers::*;
-use crate::analyzer::filter::*;
-use crate::analyzer::stop_words;
+use super::filter::stop_words;
+use super::filter::*;
+use super::tokenizers::*;
 
 // default build-in analyzer
 pub(crate) fn standard_analyzer(stop_words: Vec<String>) -> TextAnalyzer {
@@ -16,7 +16,7 @@ pub(crate) fn standard_analyzer(stop_words: Vec<String>) -> TextAnalyzer {
 }
 
 pub fn chinese_analyzer(stop_words: Vec<String>) -> TextAnalyzer {
-    let builder = jieba_builder().filter(CnAlphaNumOnlyFilter);
+    let builder = jieba_builder(None).unwrap().filter(CnAlphaNumOnlyFilter);
     if stop_words.len() > 0 {
         return builder.filter(StopWordFilter::remove(stop_words)).build();
     }

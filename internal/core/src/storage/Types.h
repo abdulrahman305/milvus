@@ -83,6 +83,7 @@ struct IndexMeta {
     std::string field_name;
     DataType field_type;
     int64_t dim;
+    bool index_non_encoding;
 };
 
 struct StorageConfig {
@@ -130,6 +131,9 @@ struct MmapConfig {
     uint64_t fix_file_size;
     bool growing_enable_mmap;
     bool scalar_index_enable_mmap;
+    bool scalar_field_enable_mmap;
+    bool vector_index_enable_mmap;
+    bool vector_field_enable_mmap;
     bool
     GetEnableGrowingMmap() const {
         return growing_enable_mmap;
@@ -146,6 +150,31 @@ struct MmapConfig {
     SetScalarIndexEnableMmap(bool flag) {
         this->scalar_index_enable_mmap = flag;
     }
+    bool
+    GetScalarFieldEnableMmap() const {
+        return scalar_field_enable_mmap;
+    }
+    void
+    SetScalarFieldEnableMmap(bool flag) {
+        this->scalar_field_enable_mmap = flag;
+    }
+    bool
+    GetVectorIndexEnableMmap() const {
+        return vector_index_enable_mmap;
+    }
+    void
+    SetVectorIndexEnableMmap(bool flag) {
+        this->vector_index_enable_mmap = flag;
+    }
+    bool
+    GetVectorFieldEnableMmap() const {
+        return vector_field_enable_mmap;
+    }
+    void
+    SetVectorFieldEnableMmap(bool flag) {
+        this->vector_field_enable_mmap = flag;
+    }
+
     std::string
     GetMmapPath() {
         return mmap_path;
@@ -159,7 +188,13 @@ struct MmapConfig {
            << ", fix_file_size=" << fix_file_size / (1024 * 1024) << "MB"
            << ", growing_enable_mmap=" << std::boolalpha << growing_enable_mmap
            << ", scalar_index_enable_mmap=" << std::boolalpha
-           << scalar_index_enable_mmap << "]";
+           << scalar_index_enable_mmap
+           << ", scalar_field_enable_mmap=" << std::boolalpha
+           << scalar_field_enable_mmap
+           << ", vector_index_enable_mmap=" << std::boolalpha
+           << vector_index_enable_mmap
+           << ", vector_field_enable_mmap=" << std::boolalpha
+           << vector_field_enable_mmap << "]";
         return ss.str();
     }
 };
@@ -220,4 +255,26 @@ struct fmt::formatter<milvus::storage::StorageType> : formatter<string_view> {
         }
         return formatter<string_view>::format("unknown", ctx);
     }
+};
+
+struct BytesBuf {
+ public:
+    explicit BytesBuf(const uint8_t* data, int64_t length)
+        : data_(data), size_(length) {
+        AssertInfo(data != nullptr, "Data pointer for slice cannot be null.");
+    }
+
+    int64_t
+    Size() const {
+        return size_;
+    }
+
+    const uint8_t*
+    Data() const {
+        return data_;
+    }
+
+ private:
+    const uint8_t* data_;  // Only used when not owning the data
+    int64_t size_;
 };

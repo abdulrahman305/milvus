@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/rgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
@@ -136,7 +137,15 @@ func (suite *JobSuite) SetupSuite() {
 	}
 
 	suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
-		Return(nil, nil)
+		Return(&milvuspb.DescribeCollectionResponse{
+			Schema: &schemapb.CollectionSchema{
+				Fields: []*schemapb.FieldSchema{
+					{FieldID: 100},
+					{FieldID: 101},
+					{FieldID: 102},
+				},
+			},
+		}, nil)
 	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).
 		Return(nil, nil).Maybe()
 
@@ -249,6 +258,7 @@ func (suite *JobSuite) TestLoadCollection() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -276,6 +286,7 @@ func (suite *JobSuite) TestLoadCollection() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -301,6 +312,7 @@ func (suite *JobSuite) TestLoadCollection() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -328,6 +340,7 @@ func (suite *JobSuite) TestLoadCollection() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -363,6 +376,7 @@ func (suite *JobSuite) TestLoadCollection() {
 		suite.targetObserver,
 		suite.collectionObserver,
 		suite.nodeMgr,
+		false,
 	)
 	suite.scheduler.Add(job)
 	err := job.Wait()
@@ -384,6 +398,7 @@ func (suite *JobSuite) TestLoadCollection() {
 		suite.targetObserver,
 		suite.collectionObserver,
 		suite.nodeMgr,
+		false,
 	)
 	suite.scheduler.Add(job)
 	err = job.Wait()
@@ -413,6 +428,7 @@ func (suite *JobSuite) TestLoadCollectionWithReplicas() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -444,6 +460,7 @@ func (suite *JobSuite) TestLoadCollectionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -473,6 +490,7 @@ func (suite *JobSuite) TestLoadCollectionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -500,10 +518,12 @@ func (suite *JobSuite) TestLoadCollectionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
-			suite.ErrorIs(err, merr.ErrParameterInvalid)
+			// suite.ErrorIs(err, merr.ErrParameterInvalid)
+			suite.NoError(err)
 		}
 	})
 
@@ -533,6 +553,7 @@ func (suite *JobSuite) TestLoadCollectionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -565,6 +586,7 @@ func (suite *JobSuite) TestLoadPartition() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -595,6 +617,7 @@ func (suite *JobSuite) TestLoadPartition() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -622,6 +645,7 @@ func (suite *JobSuite) TestLoadPartition() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -649,6 +673,7 @@ func (suite *JobSuite) TestLoadPartition() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -675,6 +700,7 @@ func (suite *JobSuite) TestLoadPartition() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -710,6 +736,7 @@ func (suite *JobSuite) TestLoadPartition() {
 		suite.targetObserver,
 		suite.collectionObserver,
 		suite.nodeMgr,
+		false,
 	)
 	suite.scheduler.Add(job)
 	err := job.Wait()
@@ -732,6 +759,7 @@ func (suite *JobSuite) TestLoadPartition() {
 		suite.targetObserver,
 		suite.collectionObserver,
 		suite.nodeMgr,
+		false,
 	)
 	suite.scheduler.Add(job)
 	err = job.Wait()
@@ -764,6 +792,7 @@ func (suite *JobSuite) TestLoadPartitionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -796,6 +825,7 @@ func (suite *JobSuite) TestLoadPartitionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -825,10 +855,11 @@ func (suite *JobSuite) TestLoadPartitionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
-			suite.ErrorIs(err, merr.ErrParameterInvalid)
+			suite.NoError(err)
 		}
 	})
 
@@ -860,6 +891,7 @@ func (suite *JobSuite) TestLoadPartitionWithLoadFields() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -889,6 +921,7 @@ func (suite *JobSuite) TestDynamicLoad() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		return job
 	}
@@ -907,6 +940,7 @@ func (suite *JobSuite) TestDynamicLoad() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		return job
 	}
@@ -1006,6 +1040,7 @@ func (suite *JobSuite) TestLoadPartitionWithReplicas() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -1299,6 +1334,7 @@ func (suite *JobSuite) TestLoadCollectionStoreFailed() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		loadErr := job.Wait()
@@ -1312,7 +1348,7 @@ func (suite *JobSuite) TestLoadPartitionStoreFailed() {
 	store := mocks.NewQueryCoordCatalog(suite.T())
 	suite.meta = meta.NewMeta(RandomIncrementIDAllocator(), store, suite.nodeMgr)
 
-	store.EXPECT().SaveResourceGroup(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	store.EXPECT().SaveResourceGroup(mock.Anything, mock.Anything).Return(nil)
 	suite.meta.HandleNodeUp(ctx, 1000)
 	suite.meta.HandleNodeUp(ctx, 2000)
 	suite.meta.HandleNodeUp(ctx, 3000)
@@ -1341,6 +1377,7 @@ func (suite *JobSuite) TestLoadPartitionStoreFailed() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		loadErr := job.Wait()
@@ -1368,6 +1405,7 @@ func (suite *JobSuite) TestLoadCreateReplicaFailed() {
 			suite.targetObserver,
 			suite.collectionObserver,
 			suite.nodeMgr,
+			false,
 		)
 		suite.scheduler.Add(job)
 		err := job.Wait()
@@ -1457,6 +1495,7 @@ func (suite *JobSuite) loadAll() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -1481,6 +1520,7 @@ func (suite *JobSuite) loadAll() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.scheduler.Add(job)
 			err := job.Wait()
@@ -1595,24 +1635,32 @@ func (suite *JobSuite) updateChannelDist(ctx context.Context, collection int64, 
 	segments := lo.Flatten(lo.Values(suite.segments[collection]))
 
 	replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
+	targetVersion := suite.targetMgr.GetCollectionTargetVersion(ctx, collection, meta.CurrentTargetFirst)
 	for _, replica := range replicas {
 		if loaded {
 			i := 0
 			for _, node := range replica.GetNodes() {
-				suite.dist.ChannelDistManager.Update(node, meta.DmChannelFromVChannel(&datapb.VchannelInfo{
-					CollectionID: collection,
-					ChannelName:  channels[i],
-				}))
-				suite.dist.LeaderViewManager.Update(node, &meta.LeaderView{
-					ID:           node,
-					CollectionID: collection,
-					Channel:      channels[i],
-					Segments: lo.SliceToMap(segments, func(segment int64) (int64, *querypb.SegmentDist) {
-						return segment, &querypb.SegmentDist{
-							NodeID:  node,
-							Version: time.Now().Unix(),
-						}
-					}),
+				suite.dist.ChannelDistManager.Update(node, &meta.DmChannel{
+					VchannelInfo: &datapb.VchannelInfo{
+						CollectionID: collection,
+						ChannelName:  channels[i],
+					},
+					Node: node,
+					View: &meta.LeaderView{
+						ID:           node,
+						CollectionID: collection,
+						Channel:      channels[i],
+						Segments: lo.SliceToMap(segments, func(segment int64) (int64, *querypb.SegmentDist) {
+							return segment, &querypb.SegmentDist{
+								NodeID:  node,
+								Version: time.Now().Unix(),
+							}
+						}),
+						TargetVersion: targetVersion,
+						Status: &querypb.LeaderViewStatus{
+							Serviceable: true,
+						},
+					},
 				})
 				i++
 				if i >= len(channels) {
@@ -1622,10 +1670,159 @@ func (suite *JobSuite) updateChannelDist(ctx context.Context, collection int64, 
 		} else {
 			for _, node := range replica.GetNodes() {
 				suite.dist.ChannelDistManager.Update(node)
-				suite.dist.LeaderViewManager.Update(node)
 			}
 		}
 	}
+}
+
+func (suite *JobSuite) TestLoadCollectionWithUserSpecifiedReplicaMode() {
+	ctx := context.Background()
+
+	// Test load collection with userSpecifiedReplicaMode = true
+	for _, collection := range suite.collections {
+		if suite.loadTypes[collection] != querypb.LoadType_LoadCollection {
+			continue
+		}
+
+		req := &querypb.LoadCollectionRequest{
+			CollectionID:  collection,
+			ReplicaNumber: 1,
+		}
+
+		job := NewLoadCollectionJob(
+			ctx,
+			req,
+			suite.dist,
+			suite.meta,
+			suite.broker,
+			suite.targetMgr,
+			suite.targetObserver,
+			suite.collectionObserver,
+			suite.nodeMgr,
+			true, // userSpecifiedReplicaMode = true
+		)
+
+		suite.scheduler.Add(job)
+		err := job.Wait()
+		suite.NoError(err)
+
+		// Verify UserSpecifiedReplicaMode is set correctly
+		loadedCollection := suite.meta.GetCollection(ctx, collection)
+		suite.NotNil(loadedCollection)
+		suite.True(loadedCollection.GetUserSpecifiedReplicaMode())
+
+		suite.targetMgr.UpdateCollectionCurrentTarget(ctx, collection)
+		suite.assertCollectionLoaded(collection)
+	}
+}
+
+func (suite *JobSuite) TestLoadPartitionWithUserSpecifiedReplicaMode() {
+	ctx := context.Background()
+
+	// Test load partition with userSpecifiedReplicaMode = true
+	for _, collection := range suite.collections {
+		if suite.loadTypes[collection] != querypb.LoadType_LoadPartition {
+			continue
+		}
+
+		req := &querypb.LoadPartitionsRequest{
+			CollectionID:  collection,
+			PartitionIDs:  suite.partitions[collection],
+			ReplicaNumber: 1,
+		}
+
+		job := NewLoadPartitionJob(
+			ctx,
+			req,
+			suite.dist,
+			suite.meta,
+			suite.broker,
+			suite.targetMgr,
+			suite.targetObserver,
+			suite.collectionObserver,
+			suite.nodeMgr,
+			true, // userSpecifiedReplicaMode = true
+		)
+
+		suite.scheduler.Add(job)
+		err := job.Wait()
+		suite.NoError(err)
+
+		// Verify UserSpecifiedReplicaMode is set correctly
+		loadedCollection := suite.meta.GetCollection(ctx, collection)
+		suite.NotNil(loadedCollection)
+		suite.True(loadedCollection.GetUserSpecifiedReplicaMode())
+
+		suite.targetMgr.UpdateCollectionCurrentTarget(ctx, collection)
+		suite.assertCollectionLoaded(collection)
+	}
+}
+
+func (suite *JobSuite) TestLoadPartitionUpdateUserSpecifiedReplicaMode() {
+	ctx := context.Background()
+
+	// First load partition with userSpecifiedReplicaMode = false
+	collection := suite.collections[1] // Use partition load type collection
+	if suite.loadTypes[collection] != querypb.LoadType_LoadPartition {
+		return
+	}
+
+	req := &querypb.LoadPartitionsRequest{
+		CollectionID:  collection,
+		PartitionIDs:  suite.partitions[collection][:1], // Load first partition
+		ReplicaNumber: 1,
+	}
+
+	job := NewLoadPartitionJob(
+		ctx,
+		req,
+		suite.dist,
+		suite.meta,
+		suite.broker,
+		suite.targetMgr,
+		suite.targetObserver,
+		suite.collectionObserver,
+		suite.nodeMgr,
+		false, // userSpecifiedReplicaMode = false
+	)
+
+	suite.scheduler.Add(job)
+	err := job.Wait()
+	suite.NoError(err)
+
+	// Verify UserSpecifiedReplicaMode is false
+	loadedCollection := suite.meta.GetCollection(ctx, collection)
+	suite.NotNil(loadedCollection)
+	suite.False(loadedCollection.GetUserSpecifiedReplicaMode())
+
+	// Load another partition with userSpecifiedReplicaMode = true
+	req2 := &querypb.LoadPartitionsRequest{
+		CollectionID:  collection,
+		PartitionIDs:  suite.partitions[collection][1:2], // Load second partition
+		ReplicaNumber: 1,
+	}
+
+	job2 := NewLoadPartitionJob(
+		ctx,
+		req2,
+		suite.dist,
+		suite.meta,
+		suite.broker,
+		suite.targetMgr,
+		suite.targetObserver,
+		suite.collectionObserver,
+		suite.nodeMgr,
+		true, // userSpecifiedReplicaMode = true
+	)
+
+	suite.scheduler.Add(job2)
+	err = job2.Wait()
+	suite.NoError(err)
+
+	// Verify UserSpecifiedReplicaMode is updated to true
+	updatedCollection := suite.meta.GetCollection(ctx, collection)
+	suite.NotNil(updatedCollection)
+	suite.True(updatedCollection.GetUserSpecifiedReplicaMode())
 }
 
 func TestJob(t *testing.T) {

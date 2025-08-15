@@ -29,8 +29,6 @@ import "C"
 import (
 	"context"
 	"fmt"
-	"strings"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -62,7 +60,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/indexparams"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
-	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -231,7 +228,7 @@ func (s *baseSegment) BatchPkExist(lc *storage.BatchLocationsCache) []bool {
 	return s.bloomFilterSet.BatchPkExist(lc)
 }
 
-// ResourceUsageEstimate returns the estimated resource usage of the segment.
+// ResourceUsageEstimate returns the final estimated resource usage of the segment.
 func (s *baseSegment) ResourceUsageEstimate() ResourceUsage {
 	if s.segmentType == SegmentTypeGrowing {
 		// Growing segment cannot do resource usage estimate.
@@ -242,11 +239,11 @@ func (s *baseSegment) ResourceUsageEstimate() ResourceUsage {
 		return *cache
 	}
 
-	usage, err := getResourceUsageEstimateOfSegment(s.collection.Schema(), s.LoadInfo(), resourceEstimateFactor{
-		memoryUsageFactor:        1.0,
-		memoryIndexUsageFactor:   1.0,
-		enableTempSegmentIndex:   false,
-		deltaDataExpansionFactor: paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat(),
+	usage, err := getLogicalResourceUsageEstimateOfSegment(s.collection.Schema(), s.LoadInfo(), resourceEstimateFactor{
+		deltaDataExpansionFactor:        paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat(),
+		TieredEvictionEnabled:           paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool(),
+		TieredEvictableMemoryCacheRatio: paramtable.Get().QueryNodeCfg.TieredEvictableMemoryCacheRatio.GetAsFloat(),
+		TieredEvictableDiskCacheRatio:   paramtable.Get().QueryNodeCfg.TieredEvictableDiskCacheRatio.GetAsFloat(),
 	})
 	if err != nil {
 		// Should never failure, if failed, segment should never be loaded.
@@ -283,6 +280,7 @@ var _ Segment = (*LocalSegment)(nil)
 // Segment is a wrapper of the underlying C-structure segment.
 type LocalSegment struct {
 	baseSegment
+	manager SegmentManager
 	ptrLock *state.LoadStateLock
 	ptr     C.CSegmentInterface // TODO: Remove in future, after move load index into segcore package.
 	// always keep same with csegment.RawPtr(), for eaiser to access,
@@ -296,15 +294,15 @@ type LocalSegment struct {
 	lastDeltaTimestamp *atomic.Uint64
 	fields             *typeutil.ConcurrentMap[int64, *FieldInfo]
 	fieldIndexes       *typeutil.ConcurrentMap[int64, *IndexedFieldInfo] // indexID -> IndexedFieldInfo
-	warmupDispatcher   *AsyncWarmupDispatcher
+	fieldJSONStats     []int64
 }
 
 func NewSegment(ctx context.Context,
 	collection *Collection,
+	manager SegmentManager,
 	segmentType SegmentType,
 	version int64,
 	loadInfo *querypb.SegmentLoadInfo,
-	warmupDispatcher *AsyncWarmupDispatcher,
 ) (Segment, error) {
 	log := log.Ctx(ctx)
 	/*
@@ -342,21 +340,21 @@ func NewSegment(ctx context.Context,
 	if _, err := GetDynamicPool().Submit(func() (any, error) {
 		var err error
 		csegment, err = segcore.CreateCSegment(&segcore.CreateCSegmentRequest{
-			Collection:    collection.ccollection,
-			SegmentID:     loadInfo.GetSegmentID(),
-			SegmentType:   segmentType,
-			IsSorted:      loadInfo.GetIsSorted(),
-			EnableChunked: paramtable.Get().QueryNodeCfg.MultipleChunkedEnable.GetAsBool(),
+			Collection:  collection.ccollection,
+			SegmentID:   loadInfo.GetSegmentID(),
+			SegmentType: segmentType,
+			IsSorted:    loadInfo.GetIsSorted(),
 		})
 		return nil, err
 	}).Await(); err != nil {
 		logger.Warn("create segment failed", zap.Error(err))
 		return nil, err
 	}
-	log.Info("create segment done")
+	logger.Info("create segment done")
 
 	segment := &LocalSegment{
 		baseSegment:        base,
+		manager:            manager,
 		ptrLock:            locker,
 		ptr:                C.CSegmentInterface(csegment.RawPointer()),
 		csegment:           csegment,
@@ -364,10 +362,9 @@ func NewSegment(ctx context.Context,
 		fields:             typeutil.NewConcurrentMap[int64, *FieldInfo](),
 		fieldIndexes:       typeutil.NewConcurrentMap[int64, *IndexedFieldInfo](),
 
-		memSize:          atomic.NewInt64(-1),
-		rowNum:           atomic.NewInt64(-1),
-		insertCount:      atomic.NewInt64(0),
-		warmupDispatcher: warmupDispatcher,
+		memSize:     atomic.NewInt64(-1),
+		rowNum:      atomic.NewInt64(-1),
+		insertCount: atomic.NewInt64(0),
 	}
 
 	if err := segment.initializeSegment(); err != nil {
@@ -527,6 +524,7 @@ func (s *LocalSegment) ResetIndexesLazyLoad(lazyState bool) {
 
 func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequest) (*segcore.SearchResult, error) {
 	log := log.Ctx(ctx).WithLazy(
+		zap.Uint64("mvcc", searchReq.MVCC()),
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("segmentID", s.ID()),
 		zap.String("segmentType", s.segmentType.String()),
@@ -578,7 +576,7 @@ func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan)
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("partitionID", s.Partition()),
 		zap.Int64("segmentID", s.ID()),
-		zap.Int64("msgID", plan.MsgID()),
+		zap.Uint64("mvcc", plan.Timestamp),
 		zap.String("segmentType", s.segmentType.String()),
 	)
 
@@ -644,19 +642,6 @@ func (s *LocalSegment) RetrieveByOffsets(ctx context.Context, plan *segcore.Retr
 	}
 	log.Debug("retrieve by segment offsets done", zap.Int("resultNum", len(retrieveResult.Offset)))
 	return retrieveResult, nil
-}
-
-func (s *LocalSegment) GetFieldDataPath(index *IndexedFieldInfo, offset int64) (dataPath string, offsetInBinlog int64) {
-	offsetInBinlog = offset
-	for _, binlog := range index.FieldBinlog.Binlogs {
-		if offsetInBinlog < binlog.EntriesNum {
-			dataPath = binlog.GetLogPath()
-			break
-		} else {
-			offsetInBinlog -= binlog.EntriesNum
-		}
-	}
-	return dataPath, offsetInBinlog
 }
 
 func (s *LocalSegment) Insert(ctx context.Context, rowIDs []int64, timestamps []typeutil.Timestamp, record *segcorepb.InsertRecord) error {
@@ -759,8 +744,9 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 	)
 
 	req := &segcore.LoadFieldDataRequest{
-		MMapDir:  paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue(),
-		RowCount: rowCount,
+		MMapDir:        paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue(),
+		RowCount:       rowCount,
+		StorageVersion: loadInfo.StorageVersion,
 	}
 	for _, field := range fields {
 		req.Fields = append(req.Fields, segcore.LoadFieldDataInfo{
@@ -821,7 +807,8 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 			Field:      field,
 			EnableMMap: mmapEnabled,
 		}},
-		RowCount: rowCount,
+		RowCount:       rowCount,
+		StorageVersion: s.LoadInfo().GetStorageVersion(),
 	}
 
 	GetLoadPool().Submit(func() (any, error) {
@@ -860,8 +847,10 @@ func (s *LocalSegment) AddFieldDataInfo(ctx context.Context, rowCount int64, fie
 	)
 
 	req := &segcore.AddFieldDataInfoRequest{
-		Fields:   make([]segcore.LoadFieldDataInfo, 0, len(fields)),
-		RowCount: rowCount,
+		Fields:         make([]segcore.LoadFieldDataInfo, 0, len(fields)),
+		RowCount:       rowCount,
+		LoadPriority:   s.loadInfo.Load().GetPriority(),
+		StorageVersion: s.loadInfo.Load().GetStorageVersion(),
 	}
 	for _, field := range fields {
 		req.Fields = append(req.Fields, segcore.LoadFieldDataInfo{
@@ -950,7 +939,7 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 
 func GetCLoadInfoWithFunc(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
-	s *querypb.SegmentLoadInfo,
+	loadInfo *querypb.SegmentLoadInfo,
 	indexInfo *querypb.FieldIndexInfo,
 	f func(c *LoadIndexInfo) error,
 ) error {
@@ -984,9 +973,9 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
 
 	indexInfoProto := &cgopb.LoadIndexInfo{
-		CollectionID:       s.GetCollectionID(),
-		PartitionID:        s.GetPartitionID(),
-		SegmentID:          s.GetSegmentID(),
+		CollectionID:       loadInfo.GetCollectionID(),
+		PartitionID:        loadInfo.GetPartitionID(),
+		SegmentID:          loadInfo.GetSegmentID(),
 		Field:              fieldSchema,
 		EnableMmap:         enableMmap,
 		MmapDirPath:        paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue(),
@@ -1085,33 +1074,11 @@ func (s *LocalSegment) innerLoadIndex(ctx context.Context,
 				return err
 			}
 			updateIndexInfoSpan := tr.RecordSpan()
-			// Skip warnup chunk cache when
-			// . scalar data
-			// . index has row data
-			// . vector was bm25 function output
 
-			if !typeutil.IsVectorType(fieldType) || s.HasRawData(indexInfo.GetFieldID()) {
-				return nil
-			}
-
-			metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.MetricTypeKey, indexInfo.IndexParams)
-			if err != nil {
-				return fmt.Errorf("metric type not exist in index params")
-			}
-
-			if metricType == metric.BM25 {
-				return nil
-			}
-
-			// 4.
-			mmapChunkCache := paramtable.Get().QueryNodeCfg.MmapChunkCache.GetAsBool()
-			s.WarmupChunkCache(ctx, indexInfo.GetFieldID(), mmapChunkCache)
-			warmupChunkCacheSpan := tr.RecordSpan()
 			log.Info("Finish loading index",
 				zap.Duration("newLoadIndexInfoSpan", newLoadIndexInfoSpan),
 				zap.Duration("appendLoadIndexInfoSpan", appendLoadIndexInfoSpan),
 				zap.Duration("updateIndexInfoSpan", updateIndexInfoSpan),
-				zap.Duration("warmupChunkCacheSpan", warmupChunkCacheSpan),
 			)
 			return nil
 		})
@@ -1129,6 +1096,8 @@ func (s *LocalSegment) LoadTextIndex(ctx context.Context, textLogs *datapb.TextI
 		return err
 	}
 
+	// Text match index mmap config is based on the raw data mmap.
+	enableMmap := isDataMmapEnable(f)
 	cgoProto := &indexcgopb.LoadTextIndexInfo{
 		FieldID:      textLogs.GetFieldID(),
 		Version:      textLogs.GetVersion(),
@@ -1137,6 +1106,8 @@ func (s *LocalSegment) LoadTextIndex(ctx context.Context, textLogs *datapb.TextI
 		Schema:       f,
 		CollectionID: s.Collection(),
 		PartitionID:  s.Partition(),
+		LoadPriority: s.LoadInfo().GetPriority(),
+		EnableMmap:   enableMmap,
 	}
 
 	marshaled, err := proto.Marshal(cgoProto)
@@ -1151,6 +1122,57 @@ func (s *LocalSegment) LoadTextIndex(ctx context.Context, textLogs *datapb.TextI
 	}).Await()
 
 	return HandleCStatus(ctx, &status, "LoadTextIndex failed")
+}
+
+func (s *LocalSegment) LoadJSONKeyIndex(ctx context.Context, jsonKeyStats *datapb.JsonKeyStats, schemaHelper *typeutil.SchemaHelper) error {
+	if jsonKeyStats.GetJsonKeyStatsDataFormat() == 0 {
+		log.Ctx(ctx).Info("load json key index failed dataformat invalid", zap.Int64("dataformat", jsonKeyStats.GetJsonKeyStatsDataFormat()), zap.Int64("field id", jsonKeyStats.GetFieldID()), zap.Any("json key logs", jsonKeyStats))
+		return nil
+	}
+	log.Ctx(ctx).Info("load json key index", zap.Int64("field id", jsonKeyStats.GetFieldID()), zap.Any("json key logs", jsonKeyStats))
+	exists := false
+	for _, field := range s.fieldJSONStats {
+		if field == jsonKeyStats.GetFieldID() {
+			exists = true
+			break
+		}
+	}
+	if exists {
+		log.Warn("JsonKeyIndexStats already loaded")
+		return nil
+	}
+	f, err := schemaHelper.GetFieldFromID(jsonKeyStats.GetFieldID())
+	if err != nil {
+		return err
+	}
+
+	// Json key stats index mmap config is based on the raw data mmap.
+	enableMmap := isDataMmapEnable(f)
+	cgoProto := &indexcgopb.LoadJsonKeyIndexInfo{
+		FieldID:      jsonKeyStats.GetFieldID(),
+		Version:      jsonKeyStats.GetVersion(),
+		BuildID:      jsonKeyStats.GetBuildID(),
+		Files:        jsonKeyStats.GetFiles(),
+		Schema:       f,
+		CollectionID: s.Collection(),
+		PartitionID:  s.Partition(),
+		LoadPriority: s.loadInfo.Load().GetPriority(),
+		EnableMmap:   enableMmap,
+	}
+
+	marshaled, err := proto.Marshal(cgoProto)
+	if err != nil {
+		return err
+	}
+
+	var status C.CStatus
+	_, _ = GetLoadPool().Submit(func() (any, error) {
+		traceCtx := ParseCTraceContext(ctx)
+		status = C.LoadJsonKeyIndex(traceCtx.ctx, s.ptr, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)))
+		return nil, nil
+	}).Await()
+	s.fieldJSONStats = append(s.fieldJSONStats, jsonKeyStats.GetFieldID())
+	return HandleCStatus(ctx, &status, "Load JsonKeyStats failed")
 }
 
 func (s *LocalSegment) UpdateIndexInfo(ctx context.Context, indexInfo *querypb.FieldIndexInfo, info *LoadIndexInfo) error {
@@ -1190,62 +1212,6 @@ func (s *LocalSegment) UpdateIndexInfo(ctx context.Context, indexInfo *querypb.F
 	return nil
 }
 
-func (s *LocalSegment) WarmupChunkCache(ctx context.Context, fieldID int64, mmapEnabled bool) {
-	log := log.Ctx(ctx).With(
-		zap.Int64("collectionID", s.Collection()),
-		zap.Int64("partitionID", s.Partition()),
-		zap.Int64("segmentID", s.ID()),
-		zap.Int64("fieldID", fieldID),
-		zap.Bool("mmapEnabled", mmapEnabled),
-	)
-	if !s.ptrLock.PinIf(state.IsNotReleased) {
-		return
-	}
-	defer s.ptrLock.Unpin()
-
-	var status C.CStatus
-
-	warmingUp := strings.ToLower(paramtable.Get().QueryNodeCfg.ChunkCacheWarmingUp.GetValue())
-	switch warmingUp {
-	case "sync":
-		GetWarmupPool().Submit(func() (any, error) {
-			cFieldID := C.int64_t(fieldID)
-			cMmapEnabled := C.bool(mmapEnabled)
-			status = C.WarmupChunkCache(s.ptr, cFieldID, cMmapEnabled)
-			if err := HandleCStatus(ctx, &status, "warming up chunk cache failed"); err != nil {
-				log.Warn("warming up chunk cache synchronously failed", zap.Error(err))
-				return nil, err
-			}
-			log.Info("warming up chunk cache synchronously done")
-			return nil, nil
-		}).Await()
-	case "async":
-		task := func() (any, error) {
-			// failed to wait for state update, return directly
-			if !s.ptrLock.BlockUntilDataLoadedOrReleased() {
-				return nil, nil
-			}
-			if s.PinIfNotReleased() != nil {
-				return nil, nil
-			}
-			defer s.Unpin()
-
-			cFieldID := C.int64_t(fieldID)
-			cMmapEnabled := C.bool(mmapEnabled)
-			status = C.WarmupChunkCache(s.ptr, cFieldID, cMmapEnabled)
-			if err := HandleCStatus(ctx, &status, ""); err != nil {
-				log.Warn("warming up chunk cache asynchronously failed", zap.Error(err))
-				return nil, err
-			}
-			log.Info("warming up chunk cache asynchronously done")
-			return nil, nil
-		}
-		s.warmupDispatcher.AddTask(task)
-	default:
-		// no warming up
-	}
-}
-
 func (s *LocalSegment) UpdateFieldRawDataSize(ctx context.Context, numRows int64, fieldBinlog *datapb.FieldBinlog) error {
 	var status C.CStatus
 	fieldID := fieldBinlog.FieldID
@@ -1283,6 +1249,12 @@ func (s *LocalSegment) CreateTextIndex(ctx context.Context, fieldID int64) error
 	log.Ctx(ctx).Info("create text index for segment done", zap.Int64("segmentID", s.ID()), zap.Int64("fieldID", fieldID))
 
 	return nil
+}
+
+func (s *LocalSegment) FinishLoad() error {
+	usage := s.ResourceUsageEstimate()
+	s.manager.AddLogicalResource(usage)
+	return s.csegment.FinishLoad()
 }
 
 type ReleaseScope int
@@ -1337,10 +1309,15 @@ func (s *LocalSegment) Release(ctx context.Context, opts ...releaseOption) {
 		return
 	}
 
+	usage := s.ResourceUsageEstimate()
+
 	GetDynamicPool().Submit(func() (any, error) {
 		C.DeleteSegment(ptr)
 		return nil, nil
 	}).Await()
+
+	// release reserved resource after the segment resource is really released.
+	s.manager.SubLogicalResource(usage)
 
 	log.Info("delete segment from memory")
 }
@@ -1407,54 +1384,6 @@ func (s *LocalSegment) indexNeedLoadRawData(schema *schemapb.CollectionSchema, i
 	return !typeutil.IsVectorType(fieldSchema.DataType) && s.HasRawData(indexInfo.IndexInfo.FieldID), nil
 }
 
-type (
-	WarmupTask            = func() (any, error)
-	AsyncWarmupDispatcher struct {
-		mu     sync.RWMutex
-		tasks  []WarmupTask
-		notify chan struct{}
-	}
-)
-
-func NewWarmupDispatcher() *AsyncWarmupDispatcher {
-	return &AsyncWarmupDispatcher{
-		notify: make(chan struct{}, 1),
-	}
-}
-
-func (d *AsyncWarmupDispatcher) AddTask(task func() (any, error)) {
-	d.mu.Lock()
-	d.tasks = append(d.tasks, task)
-	d.mu.Unlock()
-	select {
-	case d.notify <- struct{}{}:
-	default:
-	}
-}
-
-func (d *AsyncWarmupDispatcher) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-d.notify:
-			d.mu.RLock()
-			tasks := make([]WarmupTask, len(d.tasks))
-			copy(tasks, d.tasks)
-			d.mu.RUnlock()
-
-			for _, task := range tasks {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					GetWarmupPool().Submit(task)
-				}
-			}
-
-			d.mu.Lock()
-			d.tasks = d.tasks[len(tasks):]
-			d.mu.Unlock()
-		}
-	}
+func (s *LocalSegment) GetFieldJSONIndexStats() []int64 {
+	return s.fieldJSONStats
 }

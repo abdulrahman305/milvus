@@ -34,28 +34,36 @@
 
 namespace milvus::index {
 
+const std::string MMAP_PATH_FOR_TEST = "/tmp/milvus/mmap_test";
+
+const std::string STLSORT_INDEX_FILE_NAME = "stlsort-index";
+
+constexpr size_t ALIGNMENT = 32;  // 32-byte alignment
+
+const uint64_t MMAP_INDEX_PADDING = 1;
+
 template <typename T>
 ScalarIndexSort<T>::ScalarIndexSort(
     const storage::FileManagerContext& file_manager_context)
     : ScalarIndex<T>(ASCENDING_SORT), is_built_(false), data_() {
+    // not valid means we are in unit test
     if (file_manager_context.Valid()) {
+        field_id_ = file_manager_context.fieldDataMeta.field_id;
         file_manager_ =
             std::make_shared<storage::MemFileManagerImpl>(file_manager_context);
-        AssertInfo(file_manager_ != nullptr, "create file manager failed!");
+        disk_file_manager_ = std::make_shared<storage::DiskFileManagerImpl>(
+            file_manager_context);
     }
 }
 
 template <typename T>
 void
 ScalarIndexSort<T>::Build(const Config& config) {
-    if (is_built_)
+    if (is_built_) {
         return;
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build index");
+    }
     auto field_datas =
-        file_manager_->CacheRawDataToMemory(insert_files.value());
+        storage::CacheRawDataAndFillMissing(file_manager_, config);
 
     BuildWithFieldData(field_datas);
 }
@@ -66,8 +74,10 @@ ScalarIndexSort<T>::Build(size_t n, const T* values, const bool* valid_data) {
     if (is_built_)
         return;
     if (n == 0) {
-        PanicInfo(DataIsEmpty, "ScalarIndexSort cannot build null values!");
+        ThrowInfo(DataIsEmpty, "ScalarIndexSort cannot build null values!");
     }
+    index_build_begin_ = std::chrono::system_clock::now();
+
     data_.reserve(n);
     total_num_rows_ = n;
     valid_bitset_ = TargetBitmap(total_num_rows_, false);
@@ -86,19 +96,23 @@ ScalarIndexSort<T>::Build(size_t n, const T* values, const bool* valid_data) {
         idx_to_offsets_[data_[i].idx_] = i;
     }
     is_built_ = true;
+
+    setup_data_pointers();
 }
 
 template <typename T>
 void
 ScalarIndexSort<T>::BuildWithFieldData(
     const std::vector<milvus::FieldDataPtr>& field_datas) {
+    index_build_begin_ = std::chrono::system_clock::now();
+
     int64_t length = 0;
     for (const auto& data : field_datas) {
         total_num_rows_ += data->get_num_rows();
         length += data->get_num_rows() - data->get_null_count();
     }
     if (total_num_rows_ == 0) {
-        PanicInfo(DataIsEmpty, "ScalarIndexSort cannot build null values!");
+        ThrowInfo(DataIsEmpty, "ScalarIndexSort cannot build null values!");
     }
 
     data_.reserve(length);
@@ -115,13 +129,18 @@ ScalarIndexSort<T>::BuildWithFieldData(
             offset++;
         }
     }
-
     std::sort(data_.begin(), data_.end());
     idx_to_offsets_.resize(total_num_rows_);
     for (size_t i = 0; i < length; ++i) {
+        // TODO: there is an existing bug here, data_[i].idx_ is out of range, should be fixed
+        if (data_[i].idx_ < 0 || data_[i].idx_ >= total_num_rows_) {
+            continue;
+        }
         idx_to_offsets_[data_[i].idx_] = i;
     }
     is_built_ = true;
+
+    setup_data_pointers();
 }
 
 template <typename T>
@@ -153,6 +172,15 @@ ScalarIndexSort<T>::Serialize(const Config& config) {
 template <typename T>
 IndexStatsPtr
 ScalarIndexSort<T>::Upload(const Config& config) {
+    auto index_build_duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now() - index_build_begin_)
+            .count();
+    LOG_INFO(
+        "index build done for ScalarIndexSort, field_id: {}, duration: {}ms",
+        field_id_,
+        index_build_duration);
+
     auto binary_set = Serialize(config);
     file_manager_->AddFile(binary_set);
 
@@ -169,8 +197,63 @@ ScalarIndexSort<T>::LoadWithoutAssemble(const BinarySet& index_binary,
     auto index_length = index_binary.GetByName("index_length");
     memcpy(&index_size, index_length->data.get(), (size_t)index_length->size);
 
+    is_mmap_ = GetValueFromConfig<bool>(config, ENABLE_MMAP).value_or(true);
+
     auto index_data = index_binary.GetByName("index_data");
-    data_.resize(index_size);
+
+    if (is_mmap_) {
+        // some test may pass invalid file_manager_context in constructor which results in a nullptr disk_file_manager_
+        mmap_filepath_ = disk_file_manager_ != nullptr
+                             ? disk_file_manager_->GetLocalIndexObjectPrefix() +
+                                   STLSORT_INDEX_FILE_NAME
+                             : MMAP_PATH_FOR_TEST;
+        std::filesystem::create_directories(
+            std::filesystem::path(mmap_filepath_).parent_path());
+
+        auto aligned_size =
+            ((index_data->size + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+        {
+            auto file_writer = storage::FileWriter(mmap_filepath_);
+            file_writer.Write(index_data->data.get(), (size_t)index_data->size);
+
+            if (aligned_size > index_data->size) {
+                std::vector<uint8_t> padding(aligned_size - index_data->size,
+                                             0);
+                file_writer.Write(padding.data(), padding.size());
+            }
+            // write padding in case of all null values
+            std::vector<uint8_t> padding(MMAP_INDEX_PADDING, 0);
+            file_writer.Write(padding.data(), padding.size());
+            file_writer.Finish();
+        }
+
+        auto file = File::Open(mmap_filepath_, O_RDONLY);
+        mmap_data_ = static_cast<char*>(mmap(NULL,
+                                             aligned_size + MMAP_INDEX_PADDING,
+                                             PROT_READ,
+                                             MAP_PRIVATE,
+                                             file.Descriptor(),
+                                             0));
+
+        if (mmap_data_ == MAP_FAILED) {
+            file.Close();
+            remove(mmap_filepath_.c_str());
+            ThrowInfo(ErrorCode::UnexpectedError,
+                      "failed to mmap: {}",
+                      strerror(errno));
+        }
+
+        mmap_size_ = aligned_size + MMAP_INDEX_PADDING;
+        data_size_ = index_data->size;
+
+        file.Close();
+    } else {
+        data_.resize(index_size);
+        memcpy(data_.data(), index_data->data.get(), (size_t)index_data->size);
+    }
+
+    setup_data_pointers();
+
     auto index_num_rows = index_binary.GetByName("index_num_rows");
     if (index_num_rows) {
         memcpy(&total_num_rows_,
@@ -182,13 +265,18 @@ ScalarIndexSort<T>::LoadWithoutAssemble(const BinarySet& index_binary,
 
     idx_to_offsets_.resize(total_num_rows_);
     valid_bitset_ = TargetBitmap(total_num_rows_, false);
-    memcpy(data_.data(), index_data->data.get(), (size_t)index_data->size);
-    for (size_t i = 0; i < data_.size(); ++i) {
-        idx_to_offsets_[data_[i].idx_] = i;
-        valid_bitset_.set(data_[i].idx_);
+
+    for (size_t i = 0; i < Size(); ++i) {
+        const auto& item = operator[](i);
+        idx_to_offsets_[item.idx_] = i;
+        valid_bitset_.set(item.idx_);
     }
 
     is_built_ = true;
+
+    LOG_INFO("load ScalarIndexSort done, field_id: {}, is_mmap:{}",
+             field_id_,
+             is_mmap_);
 }
 
 template <typename T>
@@ -206,17 +294,12 @@ ScalarIndexSort<T>::Load(milvus::tracer::TraceContext ctx,
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load disk ann index");
-    auto index_datas = file_manager_->LoadIndexToMemory(index_files.value());
-    AssembleIndexDatas(index_datas);
+    auto index_datas = file_manager_->LoadIndexToMemory(
+        index_files.value(), config[milvus::LOAD_PRIORITY]);
     BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        auto size = data->DataSize();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        binary_set.Append(key, buf, size);
-    }
-
+    AssembleIndexDatas(index_datas, binary_set);
+    // clear index_datas to free memory early
+    index_datas.clear();
     LoadWithoutAssemble(binary_set, config);
 }
 
@@ -226,10 +309,10 @@ ScalarIndexSort<T>::In(const size_t n, const T* values) {
     AssertInfo(is_built_, "index has not been built");
     TargetBitmap bitset(Count());
     for (size_t i = 0; i < n; ++i) {
-        auto lb = std::lower_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(*(values + i)));
-        auto ub = std::upper_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(*(values + i)));
+        auto lb =
+            std::lower_bound(begin(), end(), IndexStructure<T>(*(values + i)));
+        auto ub =
+            std::upper_bound(begin(), end(), IndexStructure<T>(*(values + i)));
         for (; lb < ub; ++lb) {
             if (lb->a_ != *(values + i)) {
                 std::cout << "error happens in ScalarIndexSort<T>::In, "
@@ -248,10 +331,10 @@ ScalarIndexSort<T>::NotIn(const size_t n, const T* values) {
     AssertInfo(is_built_, "index has not been built");
     TargetBitmap bitset(Count(), true);
     for (size_t i = 0; i < n; ++i) {
-        auto lb = std::lower_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(*(values + i)));
-        auto ub = std::upper_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(*(values + i)));
+        auto lb =
+            std::lower_bound(begin(), end(), IndexStructure<T>(*(values + i)));
+        auto ub =
+            std::upper_bound(begin(), end(), IndexStructure<T>(*(values + i)));
         for (; lb < ub; ++lb) {
             if (lb->a_ != *(values + i)) {
                 std::cout << "error happens in ScalarIndexSort<T>::NotIn, "
@@ -290,30 +373,26 @@ const TargetBitmap
 ScalarIndexSort<T>::Range(const T value, const OpType op) {
     AssertInfo(is_built_, "index has not been built");
     TargetBitmap bitset(Count());
-    auto lb = data_.begin();
-    auto ub = data_.end();
+    auto lb = begin();
+    auto ub = end();
     if (ShouldSkip(value, value, op)) {
         return bitset;
     }
     switch (op) {
         case OpType::LessThan:
-            ub = std::lower_bound(
-                data_.begin(), data_.end(), IndexStructure<T>(value));
+            ub = std::lower_bound(begin(), end(), IndexStructure<T>(value));
             break;
         case OpType::LessEqual:
-            ub = std::upper_bound(
-                data_.begin(), data_.end(), IndexStructure<T>(value));
+            ub = std::upper_bound(begin(), end(), IndexStructure<T>(value));
             break;
         case OpType::GreaterThan:
-            lb = std::upper_bound(
-                data_.begin(), data_.end(), IndexStructure<T>(value));
+            lb = std::upper_bound(begin(), end(), IndexStructure<T>(value));
             break;
         case OpType::GreaterEqual:
-            lb = std::lower_bound(
-                data_.begin(), data_.end(), IndexStructure<T>(value));
+            lb = std::lower_bound(begin(), end(), IndexStructure<T>(value));
             break;
         default:
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format("Invalid OperatorType: {}", op));
     }
     for (; lb < ub; ++lb) {
@@ -338,21 +417,21 @@ ScalarIndexSort<T>::Range(T lower_bound_value,
     if (ShouldSkip(lower_bound_value, upper_bound_value, OpType::Range)) {
         return bitset;
     }
-    auto lb = data_.begin();
-    auto ub = data_.end();
+    auto lb = begin();
+    auto ub = end();
     if (lb_inclusive) {
         lb = std::lower_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(lower_bound_value));
+            begin(), end(), IndexStructure<T>(lower_bound_value));
     } else {
         lb = std::upper_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(lower_bound_value));
+            begin(), end(), IndexStructure<T>(lower_bound_value));
     }
     if (ub_inclusive) {
         ub = std::upper_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(upper_bound_value));
+            begin(), end(), IndexStructure<T>(upper_bound_value));
     } else {
         ub = std::lower_bound(
-            data_.begin(), data_.end(), IndexStructure<T>(upper_bound_value));
+            begin(), end(), IndexStructure<T>(upper_bound_value));
     }
     for (; lb < ub; ++lb) {
         bitset[lb->idx_] = true;
@@ -370,7 +449,7 @@ ScalarIndexSort<T>::Reverse_Lookup(size_t idx) const {
         return std::nullopt;
     }
     auto offset = idx_to_offsets_[idx];
-    return data_[offset].a_;
+    return operator[](offset).a_;
 }
 
 template <typename T>
@@ -378,9 +457,9 @@ bool
 ScalarIndexSort<T>::ShouldSkip(const T lower_value,
                                const T upper_value,
                                const milvus::OpType op) {
-    if (!data_.empty()) {
-        auto lower_bound = data_.begin();
-        auto upper_bound = data_.rbegin();
+    if (!Empty()) {
+        auto lower_bound = begin();
+        auto upper_bound = rbegin();
         bool shouldSkip = false;
         switch (op) {
             case OpType::LessThan: {
@@ -405,7 +484,7 @@ ScalarIndexSort<T>::ShouldSkip(const T lower_value,
                 break;
             }
             default:
-                PanicInfo(OpTypeInvalid,
+                ThrowInfo(OpTypeInvalid,
                           fmt::format("Invalid OperatorType for "
                                       "checking scalar index optimization: {}",
                                       op));
@@ -422,5 +501,4 @@ template class ScalarIndexSort<int32_t>;
 template class ScalarIndexSort<int64_t>;
 template class ScalarIndexSort<float>;
 template class ScalarIndexSort<double>;
-template class ScalarIndexSort<std::string>;
 }  // namespace milvus::index

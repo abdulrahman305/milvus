@@ -426,7 +426,7 @@ class TestNewIndexBase(TestcaseBase):
     ******************************************************************
     """
     @pytest.mark.tags(CaseLabel.L0)
-    @pytest.mark.parametrize("index_type", ct.all_index_types[0:7])
+    @pytest.mark.parametrize("index_type", ct.all_index_types[0:8])
     def test_create_index_default(self, index_type):
         """
         target: test create index interface
@@ -892,7 +892,7 @@ class TestNewIndexBase(TestcaseBase):
                                          "limit": default_limit})
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("index", ct.all_index_types[:6])
+    @pytest.mark.parametrize("index", ct.all_index_types[:7])
     def test_drop_mmap_index(self, index):
         """
         target: disabling and re-enabling mmap for index
@@ -1124,7 +1124,7 @@ class TestIndexInvalid(TestcaseBase):
     def scalar_index(self, request):
         yield request.param
 
-    @pytest.fixture(scope="function", params=["FLOAT_VECTOR", "FLOAT16_VECTOR", "BFLOAT16_VECTOR"])
+    @pytest.fixture(scope="function", params=ct.all_dense_vector_types)
     def vector_data_type(self, request):
         yield request.param
 
@@ -1184,19 +1184,6 @@ class TestIndexInvalid(TestcaseBase):
                                   check_items={"err_code": 1100,
                                                "err_msg": "invalid index type: ANNOY"})
 
-    @pytest.mark.tags(CaseLabel.L1)
-    def test_create_index_json(self):
-        """
-        target: test create index on json fields
-        method: 1.create collection, and create index
-        expected: create index raise an error
-        """
-        collection_w = self.init_collection_general(prefix, True, nb=100, is_index=False)[0]
-        # create index on JSON/Array field is not supported
-        collection_w.create_index(ct.default_json_field_name,
-                                  check_task=CheckTasks.err_res,
-                                  check_items={ct.err_code: 1100,
-                                               ct.err_msg: "create auto index on type:JSON is not supported"})
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_create_scalar_index_on_vector_field(self, scalar_index, vector_data_type):
@@ -1235,7 +1222,7 @@ class TestIndexInvalid(TestcaseBase):
         expected: success
         """
         collection_w = self.init_collection_general(prefix, is_index=False, vector_data_type=vector_data_type)[0]
-        scalar_index_params = {"index_type": "INVERTED", "json_cast_type": DataType.INT32, "json_path": ct.default_json_field_name+"['a']"}
+        scalar_index_params = {"index_type": "INVERTED", "json_cast_type": "double", "json_path": ct.default_json_field_name+"['a']"}
         collection_w.create_index(ct.default_json_field_name, index_params=scalar_index_params)
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -1386,7 +1373,7 @@ class TestIndexInvalid(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("metric_type", ["L2", "COSINE", "   ", "invalid"])
-    @pytest.mark.parametrize("index", ct.all_index_types[9:11])
+    @pytest.mark.parametrize("index", ct.all_index_types[10:12])
     def test_invalid_sparse_metric_type(self, metric_type, index):
         """
         target: unsupported metric_type create index
@@ -1407,7 +1394,7 @@ class TestIndexInvalid(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("ratio", [-0.5, 1, 3])
-    @pytest.mark.parametrize("index ", ct.all_index_types[9:11])
+    @pytest.mark.parametrize("index ", ct.all_index_types[10:12])
     def test_invalid_sparse_ratio(self, ratio, index):
         """
         target: index creation for unsupported ratio parameter
@@ -1428,7 +1415,7 @@ class TestIndexInvalid(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("inverted_index_algo", ["INVALID_ALGO"])
-    @pytest.mark.parametrize("index ", ct.all_index_types[9:11])
+    @pytest.mark.parametrize("index ", ct.all_index_types[10:12])
     def test_invalid_sparse_inverted_index_algo(self, inverted_index_algo, index):
         """
         target: index creation for unsupported ratio parameter
@@ -2171,7 +2158,7 @@ class TestInvertedIndexValid(TestcaseBase):
     def scalar_index(self, request):
         yield request.param
 
-    @pytest.fixture(scope="function", params=["FLOAT_VECTOR", "FLOAT16_VECTOR", "BFLOAT16_VECTOR"])
+    @pytest.fixture(scope="function", params=ct.all_dense_vector_types)
     def vector_data_type(self, request):
         yield request.param
 

@@ -111,7 +111,7 @@ func WithPartitionIDs(partitionIDs []int64) SegmentFilter {
 
 func WithStartPosNotRecorded() SegmentFilter {
 	return SegmentFilterFunc(func(info *SegmentInfo) bool {
-		return !info.startPosRecorded
+		return !info.startPosRecorded && info.startPosition != nil
 	})
 }
 
@@ -134,6 +134,30 @@ func SegmentActions(actions ...SegmentAction) SegmentAction {
 		for _, act := range actions {
 			act(info)
 		}
+	}
+}
+
+func UpdateBinlogs(binlogs []*datapb.FieldBinlog) SegmentAction {
+	return func(info *SegmentInfo) {
+		info.binlogs = binlogs
+	}
+}
+
+func UpdateStatslogs(statslogs []*datapb.FieldBinlog) SegmentAction {
+	return func(info *SegmentInfo) {
+		info.statslogs = statslogs
+	}
+}
+
+func UpdateDeltalogs(deltalogs []*datapb.FieldBinlog) SegmentAction {
+	return func(info *SegmentInfo) {
+		info.deltalogs = deltalogs
+	}
+}
+
+func UpdateBm25logs(bm25logs []*datapb.FieldBinlog) SegmentAction {
+	return func(info *SegmentInfo) {
+		info.bm25logs = bm25logs
 	}
 }
 
@@ -160,6 +184,12 @@ func SetStartPositionIfNil(startPos *msgpb.MsgPosition) SegmentAction {
 		if info.startPosition == nil {
 			info.startPosition = startPos
 		}
+	}
+}
+
+func SetStorageVersion(version int64) SegmentAction {
+	return func(info *SegmentInfo) {
+		info.storageVersion = version
 	}
 }
 

@@ -65,12 +65,16 @@ func (s *MixCompactionTaskSuite) SetupSuite() {
 	paramtable.Get().Init(paramtable.NewBaseTable())
 }
 
-func (s *MixCompactionTaskSuite) SetupTest() {
+func (s *MixCompactionTaskSuite) setupTest() {
 	s.mockBinlogIO = mock_util.NewMockBinlogIO(s.T())
 
 	s.meta = genTestCollectionMeta()
 
 	paramtable.Get().Save(paramtable.Get().CommonCfg.EntityExpirationTTL.Key, "0")
+	params, err := compaction.GenerateJSONParams()
+	if err != nil {
+		panic(err)
+	}
 
 	plan := &datapb.CompactionPlan{
 		PlanID: 999,
@@ -83,17 +87,26 @@ func (s *MixCompactionTaskSuite) SetupTest() {
 		TimeoutInSeconds:       10,
 		Type:                   datapb.CompactionType_MixCompaction,
 		Schema:                 s.meta.GetSchema(),
-		BeginLogID:             19530,
 		PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 19531, End: math.MaxInt64},
+		PreAllocatedLogIDs:     &datapb.IDRange{Begin: 9530, End: 19530},
 		MaxSize:                64 * 1024 * 1024,
+		JsonParams:             params,
 	}
 
-	s.task = NewMixCompactionTask(context.Background(), s.mockBinlogIO, plan)
+	s.task = NewMixCompactionTask(context.Background(), s.mockBinlogIO, plan, compaction.GenParams())
+}
+
+func (s *MixCompactionTaskSuite) SetupTest() {
+	s.setupTest()
 }
 
 func (s *MixCompactionTaskSuite) SetupBM25() {
 	s.mockBinlogIO = mock_util.NewMockBinlogIO(s.T())
 	s.meta = genTestCollectionMetaWithBM25()
+	params, err := compaction.GenerateJSONParams()
+	if err != nil {
+		panic(err)
+	}
 
 	plan := &datapb.CompactionPlan{
 		PlanID: 999,
@@ -106,12 +119,13 @@ func (s *MixCompactionTaskSuite) SetupBM25() {
 		TimeoutInSeconds:       10,
 		Type:                   datapb.CompactionType_MixCompaction,
 		Schema:                 s.meta.GetSchema(),
-		BeginLogID:             19530,
 		PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 19531, End: math.MaxInt64},
+		PreAllocatedLogIDs:     &datapb.IDRange{Begin: 9530, End: 19530},
 		MaxSize:                64 * 1024 * 1024,
+		JsonParams:             params,
 	}
 
-	s.task = NewMixCompactionTask(context.Background(), s.mockBinlogIO, plan)
+	s.task = NewMixCompactionTask(context.Background(), s.mockBinlogIO, plan, compaction.GenParams())
 }
 
 func (s *MixCompactionTaskSuite) SetupSubTest() {
@@ -126,9 +140,7 @@ func getMilvusBirthday() time.Time {
 	return time.Date(2019, time.Month(5), 30, 0, 0, 0, 0, time.UTC)
 }
 
-func (s *MixCompactionTaskSuite) TestCompactDupPK() {
-	// Test merge compactions, two segments with the same pk, one deletion pk=1
-	// The merged segment 19530 should remain 3 pk without pk=100
+func (s *MixCompactionTaskSuite) prepareCompactDupPKSegments() {
 	segments := []int64{7, 8, 9}
 	dblobs, err := getInt64DeltaBlobs(
 		1,
@@ -138,24 +150,14 @@ func (s *MixCompactionTaskSuite) TestCompactDupPK() {
 	s.Require().NoError(err)
 
 	s.mockBinlogIO.EXPECT().Download(mock.Anything, []string{"1"}).
-		Return([][]byte{dblobs.GetValue()}, nil).Times(3)
+		Return([][]byte{dblobs.GetValue()}, nil).Times(len(segments))
 	s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
 	alloc := allocator.NewLocalAllocator(7777777, math.MaxInt64)
 
-	// clear origial segments
+	// Clear original segments
 	s.task.plan.SegmentBinlogs = make([]*datapb.CompactionSegmentBinlogs, 0)
 	for _, segID := range segments {
 		s.initSegBuffer(1, segID)
-		row := getRow(100)
-		v := &storage.Value{
-			PK:        storage.NewInt64PrimaryKey(100),
-			Timestamp: int64(tsoutil.ComposeTSByTime(getMilvusBirthday(), 0)),
-			Value:     row,
-		}
-		err := s.segWriter.Write(v)
-		s.segWriter.FlushAndIsFull()
-		s.Require().NoError(err)
-
 		kvs, fBinlogs, err := serializeWrite(context.TODO(), alloc, s.segWriter)
 		s.Require().NoError(err)
 		s.mockBinlogIO.EXPECT().Download(mock.Anything, mock.MatchedBy(func(keys []string) bool {
@@ -171,6 +173,10 @@ func (s *MixCompactionTaskSuite) TestCompactDupPK() {
 			},
 		})
 	}
+}
+
+func (s *MixCompactionTaskSuite) TestCompactDupPK() {
+	s.prepareCompactDupPKSegments()
 	result, err := s.task.Compact()
 	s.NoError(err)
 	s.NotNil(result)
@@ -181,12 +187,12 @@ func (s *MixCompactionTaskSuite) TestCompactDupPK() {
 	segment := result.GetSegments()[0]
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(3, segment.GetNumOfRows())
-	s.NotEmpty(segment.InsertLogs)
-	s.NotEmpty(segment.Field2StatslogPaths)
+	// s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.InsertLogs))
+	s.EqualValues(1, len(segment.Field2StatslogPaths))
 	s.Empty(segment.Deltalogs)
 }
 
-func (s *MixCompactionTaskSuite) TestCompactTwoToOne() {
+func (s *MixCompactionTaskSuite) prepareCompactTwoToOneSegments() {
 	segments := []int64{5, 6, 7}
 	alloc := allocator.NewLocalAllocator(7777777, math.MaxInt64)
 	s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
@@ -217,7 +223,10 @@ func (s *MixCompactionTaskSuite) TestCompactTwoToOne() {
 	s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
 		SegmentID: seg.SegmentID(),
 	})
+}
 
+func (s *MixCompactionTaskSuite) TestCompactTwoToOne() {
+	s.prepareCompactTwoToOneSegments()
 	result, err := s.task.Compact()
 	s.Require().NoError(err)
 	s.NotNil(result)
@@ -228,12 +237,12 @@ func (s *MixCompactionTaskSuite) TestCompactTwoToOne() {
 	segment := result.GetSegments()[0]
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(3, segment.GetNumOfRows())
-	s.NotEmpty(segment.InsertLogs)
-	s.NotEmpty(segment.Field2StatslogPaths)
+	// s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.InsertLogs))
+	s.EqualValues(1, len(segment.Field2StatslogPaths))
 	s.Empty(segment.Deltalogs)
 }
 
-func (s *MixCompactionTaskSuite) TestCompactTwoToOneWithBM25() {
+func (s *MixCompactionTaskSuite) prepareCompactTwoToOneWithBM25Segments() {
 	s.SetupBM25()
 	segments := []int64{5, 6, 7}
 	alloc := allocator.NewLocalAllocator(7777777, math.MaxInt64)
@@ -265,7 +274,10 @@ func (s *MixCompactionTaskSuite) TestCompactTwoToOneWithBM25() {
 	s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
 		SegmentID: seg.SegmentID(),
 	})
+}
 
+func (s *MixCompactionTaskSuite) TestCompactTwoToOneWithBM25() {
+	s.prepareCompactTwoToOneWithBM25Segments()
 	result, err := s.task.Compact()
 	s.NoError(err)
 	s.NotNil(result)
@@ -276,15 +288,13 @@ func (s *MixCompactionTaskSuite) TestCompactTwoToOneWithBM25() {
 	segment := result.GetSegments()[0]
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(3, segment.GetNumOfRows())
-	s.NotEmpty(segment.InsertLogs)
-	s.NotEmpty(segment.Bm25Logs)
-	s.NotEmpty(segment.Field2StatslogPaths)
+	// s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.InsertLogs))
+	s.EqualValues(1, len(segment.Field2StatslogPaths))
+	s.EqualValues(1, len(segment.Bm25Logs))
 	s.Empty(segment.Deltalogs)
 }
 
-func (s *MixCompactionTaskSuite) TestCompactSortedSegment() {
-	paramtable.Get().Save("dataNode.compaction.useMergeSort", "true")
-	defer paramtable.Get().Reset("dataNode.compaction.useMergeSort")
+func (s *MixCompactionTaskSuite) prepareCompactSortedSegment() {
 	segments := []int64{1001, 1002, 1003}
 	alloc := allocator.NewLocalAllocator(100, math.MaxInt64)
 	s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
@@ -317,8 +327,14 @@ func (s *MixCompactionTaskSuite) TestCompactSortedSegment() {
 				{Binlogs: []*datapb.Binlog{{LogPath: deltaPath}}},
 			},
 		})
-
 	}
+}
+
+func (s *MixCompactionTaskSuite) TestCompactSortedSegment() {
+	s.prepareCompactSortedSegment()
+	paramtable.Get().Save("dataNode.compaction.useMergeSort", "true")
+	defer paramtable.Get().Reset("dataNode.compaction.useMergeSort")
+	s.task.compactionParams = compaction.GenParams()
 
 	result, err := s.task.Compact()
 	s.NoError(err)
@@ -331,15 +347,12 @@ func (s *MixCompactionTaskSuite) TestCompactSortedSegment() {
 	segment := result.GetSegments()[0]
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(291, segment.GetNumOfRows())
-	s.NotEmpty(segment.InsertLogs)
-
-	s.NotEmpty(segment.Field2StatslogPaths)
+	// s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.InsertLogs))
+	s.EqualValues(1, len(segment.Field2StatslogPaths))
 	s.Empty(segment.Deltalogs)
 }
 
-func (s *MixCompactionTaskSuite) TestCompactSortedSegmentLackBinlog() {
-	paramtable.Get().Save("dataNode.compaction.useMergeSort", "true")
-	defer paramtable.Get().Reset("dataNode.compaction.useMergeSort")
+func (s *MixCompactionTaskSuite) prepareCompactSortedSegmentLackBinlog() {
 	segments := []int64{1001, 1002, 1003}
 	alloc := allocator.NewLocalAllocator(100, math.MaxInt64)
 	s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
@@ -395,6 +408,13 @@ func (s *MixCompactionTaskSuite) TestCompactSortedSegmentLackBinlog() {
 		})
 
 	}
+}
+
+func (s *MixCompactionTaskSuite) TestCompactSortedSegmentLackBinlog() {
+	s.prepareCompactSortedSegmentLackBinlog()
+	paramtable.Get().Save("dataNode.compaction.useMergeSort", "true")
+	defer paramtable.Get().Reset("dataNode.compaction.useMergeSort")
+	s.task.compactionParams = compaction.GenParams()
 
 	result, err := s.task.Compact()
 	s.NoError(err)
@@ -407,13 +427,12 @@ func (s *MixCompactionTaskSuite) TestCompactSortedSegmentLackBinlog() {
 	segment := result.GetSegments()[0]
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(291, segment.GetNumOfRows())
-	s.NotEmpty(segment.InsertLogs)
-
-	s.NotEmpty(segment.Field2StatslogPaths)
+	// s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.InsertLogs))
+	s.EqualValues(1, len(segment.Field2StatslogPaths))
 	s.Empty(segment.Deltalogs)
 }
 
-func (s *MixCompactionTaskSuite) TestSplitMergeEntityExpired() {
+func (s *MixCompactionTaskSuite) prepareSplitMergeEntityExpired() {
 	s.initSegBuffer(1, 3)
 	collTTL := 864000 // 10 days
 	s.task.currentTime = getMilvusBirthday().Add(time.Second * (time.Duration(collTTL) + 1))
@@ -444,6 +463,14 @@ func (s *MixCompactionTaskSuite) TestSplitMergeEntityExpired() {
 		})
 	}
 	s.task.plan.SegmentBinlogs[0].FieldBinlogs = fieldBinlogs
+}
+
+func (s *MixCompactionTaskSuite) TestSplitMergeEntityExpired() {
+	s.prepareSplitMergeEntityExpired()
+
+	err := s.task.preCompact()
+	s.Require().NoError(err)
+
 	compactionSegments, err := s.task.mergeSplit(s.task.ctx)
 	s.NoError(err)
 	s.Equal(1, len(compactionSegments))
@@ -542,6 +569,9 @@ func (s *MixCompactionTaskSuite) TestMergeNoExpirationLackBinlog() {
 			s.task.partitionID = PartitionID
 			s.task.maxRows = 1000
 
+			err := s.task.preCompact()
+			s.Require().NoError(err)
+
 			res, err := s.task.mergeSplit(s.task.ctx)
 			s.NoError(err)
 			s.EqualValues(test.expectedRes, len(res))
@@ -620,6 +650,9 @@ func (s *MixCompactionTaskSuite) TestMergeNoExpiration() {
 			s.task.collectionID = CollectionID
 			s.task.partitionID = PartitionID
 			s.task.maxRows = 1000
+
+			err := s.task.preCompact()
+			s.NoError(err)
 
 			res, err := s.task.mergeSplit(s.task.ctx)
 			s.NoError(err)
@@ -794,11 +827,13 @@ func (s *MixCompactionTaskSuite) TestCompactFail() {
 	})
 }
 
-func getRow(magic int64) map[int64]interface{} {
-	ts := tsoutil.ComposeTSByTime(getMilvusBirthday(), 0)
+func getRow(magic int64, ts int64) map[int64]interface{} {
+	if ts == 0 {
+		ts = int64(tsoutil.ComposeTSByTime(getMilvusBirthday(), 0))
+	}
 	return map[int64]interface{}{
 		common.RowIDField:      magic,
-		common.TimeStampField:  int64(ts), // should be int64 here
+		common.TimeStampField:  ts, // should be int64 here
 		BoolField:              true,
 		Int8Field:              int8(magic),
 		Int16Field:             int16(magic),
@@ -839,7 +874,7 @@ func (s *MixCompactionTaskSuite) initMultiRowsSegBuffer(magic, numRows, step int
 		v := storage.Value{
 			PK:        storage.NewInt64PrimaryKey(magic + i*step),
 			Timestamp: int64(tsoutil.ComposeTSByTime(getMilvusBirthday(), 0)),
-			Value:     getRow(magic + i*step),
+			Value:     getRow(magic+i*step, 0),
 		}
 		err = segWriter.Write(&v)
 		s.Require().NoError(err)
@@ -874,7 +909,7 @@ func (s *MixCompactionTaskSuite) initSegBuffer(size int, seed int64) {
 		v := storage.Value{
 			PK:        storage.NewInt64PrimaryKey(seed),
 			Timestamp: int64(tsoutil.ComposeTSByTime(getMilvusBirthday(), 0)),
-			Value:     getRow(seed),
+			Value:     getRow(seed, int64(tsoutil.ComposeTSByTime(getMilvusBirthday(), 0))),
 		}
 		err = segWriter.Write(&v)
 		s.Require().NoError(err)

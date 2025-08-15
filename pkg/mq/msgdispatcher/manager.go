@@ -40,6 +40,8 @@ import (
 type DispatcherManager interface {
 	Add(ctx context.Context, streamConfig *StreamConfig) (<-chan *MsgPack, error)
 	Remove(vchannel string)
+	NumTarget() int
+	NumConsumer() int
 	Run()
 	Close()
 }
@@ -53,9 +55,7 @@ type dispatcherManager struct {
 
 	registeredTargets *typeutil.ConcurrentMap[string, *target]
 
-	numConsumer     atomic.Int64
-	numActiveTarget atomic.Int64
-
+	mu                sync.RWMutex
 	mainDispatcher    *Dispatcher
 	deputyDispatchers map[int64]*Dispatcher // ID -> *Dispatcher
 
@@ -63,25 +63,28 @@ type dispatcherManager struct {
 	factory     msgstream.Factory
 	closeChan   chan struct{}
 	closeOnce   sync.Once
+
+	includeSkipWhenSplit bool
 }
 
-func NewDispatcherManager(pchannel string, role string, nodeID int64, factory msgstream.Factory) DispatcherManager {
+func NewDispatcherManager(pchannel string, role string, nodeID int64, factory msgstream.Factory, includeSkipWhenSplit bool) DispatcherManager {
 	log.Info("create new dispatcherManager", zap.String("role", role),
 		zap.Int64("nodeID", nodeID), zap.String("pchannel", pchannel))
 	c := &dispatcherManager{
-		role:              role,
-		nodeID:            nodeID,
-		pchannel:          pchannel,
-		registeredTargets: typeutil.NewConcurrentMap[string, *target](),
-		deputyDispatchers: make(map[int64]*Dispatcher),
-		factory:           factory,
-		closeChan:         make(chan struct{}),
+		role:                 role,
+		nodeID:               nodeID,
+		pchannel:             pchannel,
+		registeredTargets:    typeutil.NewConcurrentMap[string, *target](),
+		deputyDispatchers:    make(map[int64]*Dispatcher),
+		factory:              factory,
+		closeChan:            make(chan struct{}),
+		includeSkipWhenSplit: includeSkipWhenSplit,
 	}
 	return c
 }
 
 func (c *dispatcherManager) Add(ctx context.Context, streamConfig *StreamConfig) (<-chan *MsgPack, error) {
-	t := newTarget(streamConfig)
+	t := newTarget(streamConfig, c.includeSkipWhenSplit)
 	if _, ok := c.registeredTargets.GetOrInsert(t.vchannel, t); ok {
 		return nil, fmt.Errorf("vchannel %s already exists in the dispatcher", t.vchannel)
 	}
@@ -96,7 +99,24 @@ func (c *dispatcherManager) Remove(vchannel string) {
 			zap.Int64("nodeID", c.nodeID), zap.String("vchannel", vchannel))
 		return
 	}
+	c.removeTargetFromDispatcher(t)
 	t.close()
+}
+
+func (c *dispatcherManager) NumTarget() int {
+	return c.registeredTargets.Len()
+}
+
+func (c *dispatcherManager) NumConsumer() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	numConsumer := 0
+	if c.mainDispatcher != nil {
+		numConsumer++
+	}
+	numConsumer += len(c.deputyDispatchers)
+	return numConsumer
 }
 
 func (c *dispatcherManager) Close() {
@@ -108,8 +128,8 @@ func (c *dispatcherManager) Close() {
 func (c *dispatcherManager) Run() {
 	log := log.With(zap.String("role", c.role), zap.Int64("nodeID", c.nodeID), zap.String("pchannel", c.pchannel))
 	log.Info("dispatcherManager is running...")
-	ticker1 := time.NewTicker(10 * time.Second)
-	ticker2 := time.NewTicker(paramtable.Get().MQCfg.MergeCheckInterval.GetAsDuration(time.Second))
+	ticker1 := time.NewTicker(30 * time.Second)
+	ticker2 := time.NewTicker(paramtable.Get().MQCfg.CheckInterval.GetAsDuration(time.Second))
 	defer ticker1.Stop()
 	defer ticker2.Stop()
 	for {
@@ -123,30 +143,46 @@ func (c *dispatcherManager) Run() {
 			c.tryRemoveUnregisteredTargets()
 			c.tryBuildDispatcher()
 			c.tryMerge()
-			c.updateNumInfo()
 		}
 	}
 }
 
-func (c *dispatcherManager) updateNumInfo() {
-	numConsumer := 0
-	numActiveTarget := 0
+func (c *dispatcherManager) removeTargetFromDispatcher(t *target) {
+	log := log.With(zap.String("role", c.role), zap.Int64("nodeID", c.nodeID), zap.String("pchannel", c.pchannel))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, dispatcher := range c.deputyDispatchers {
+		if dispatcher.HasTarget(t.vchannel) {
+			dispatcher.Handle(pause)
+			dispatcher.RemoveTarget(t.vchannel)
+			if dispatcher.TargetNum() == 0 {
+				dispatcher.Handle(terminate)
+				delete(c.deputyDispatchers, dispatcher.ID())
+				log.Info("remove deputy dispatcher done", zap.Int64("id", dispatcher.ID()))
+			} else {
+				dispatcher.Handle(resume)
+			}
+			t.close()
+		}
+	}
 	if c.mainDispatcher != nil {
-		numConsumer++
-		numActiveTarget += c.mainDispatcher.TargetNum()
+		if c.mainDispatcher.HasTarget(t.vchannel) {
+			c.mainDispatcher.Handle(pause)
+			c.mainDispatcher.RemoveTarget(t.vchannel)
+			if c.mainDispatcher.TargetNum() == 0 && len(c.deputyDispatchers) == 0 {
+				c.mainDispatcher.Handle(terminate)
+				c.mainDispatcher = nil
+			} else {
+				c.mainDispatcher.Handle(resume)
+			}
+			t.close()
+		}
 	}
-	numConsumer += len(c.deputyDispatchers)
-	c.numConsumer.Store(int64(numConsumer))
-
-	for _, d := range c.deputyDispatchers {
-		numActiveTarget += d.TargetNum()
-	}
-	c.numActiveTarget.Store(int64(numActiveTarget))
 }
 
 func (c *dispatcherManager) tryRemoveUnregisteredTargets() {
-	log := log.With(zap.String("role", c.role), zap.Int64("nodeID", c.nodeID), zap.String("pchannel", c.pchannel))
 	unregisteredTargets := make([]*target, 0)
+	c.mu.RLock()
 	for _, dispatcher := range c.deputyDispatchers {
 		for _, t := range dispatcher.GetTargets() {
 			if !c.registeredTargets.Contain(t.vchannel) {
@@ -161,36 +197,10 @@ func (c *dispatcherManager) tryRemoveUnregisteredTargets() {
 			}
 		}
 	}
-	for _, dispatcher := range c.deputyDispatchers {
-		for _, t := range unregisteredTargets {
-			if dispatcher.HasTarget(t.vchannel) {
-				dispatcher.Handle(pause)
-				dispatcher.RemoveTarget(t.vchannel)
-				if dispatcher.TargetNum() == 0 {
-					dispatcher.Handle(terminate)
-					delete(c.deputyDispatchers, dispatcher.ID())
-					log.Info("remove deputy dispatcher done", zap.Int64("id", dispatcher.ID()))
-				} else {
-					dispatcher.Handle(resume)
-				}
-				t.close()
-			}
-		}
-	}
-	if c.mainDispatcher != nil {
-		for _, t := range unregisteredTargets {
-			if c.mainDispatcher.HasTarget(t.vchannel) {
-				c.mainDispatcher.Handle(pause)
-				c.mainDispatcher.RemoveTarget(t.vchannel)
-				if c.mainDispatcher.TargetNum() == 0 && len(c.deputyDispatchers) == 0 {
-					c.mainDispatcher.Handle(terminate)
-					c.mainDispatcher = nil
-				} else {
-					c.mainDispatcher.Handle(resume)
-				}
-				t.close()
-			}
-		}
+	c.mu.RUnlock()
+
+	for _, t := range unregisteredTargets {
+		c.removeTargetFromDispatcher(t)
 	}
 }
 
@@ -202,6 +212,7 @@ func (c *dispatcherManager) tryBuildDispatcher() {
 	// get lack targets to perform subscription
 	lackTargets := make([]*target, 0, len(allTargets))
 
+	c.mu.RLock()
 OUTER:
 	for _, t := range allTargets {
 		if c.mainDispatcher != nil && c.mainDispatcher.HasTarget(t.vchannel) {
@@ -214,6 +225,7 @@ OUTER:
 		}
 		lackTargets = append(lackTargets, t)
 	}
+	c.mu.RUnlock()
 
 	if len(lackTargets) == 0 {
 		return
@@ -235,6 +247,19 @@ OUTER:
 		}
 	}
 
+	// For CDC, CDC needs to includeCurrentMsg when create new dispatcher
+	// and NOT includeCurrentMsg when create lag dispatcher. So if any dispatcher lagged,
+	// we give up batch subscription and create dispatcher for only one target.
+	includeCurrentMsg := false
+	for _, candidate := range candidateTargets {
+		if candidate.isLagged {
+			candidateTargets = []*target{candidate}
+			includeCurrentMsg = true
+			candidate.isLagged = false
+			break
+		}
+	}
+
 	vchannels := lo.Map(candidateTargets, func(t *target, _ int) string {
 		return t.vchannel
 	})
@@ -247,7 +272,7 @@ OUTER:
 
 	// TODO: add newDispatcher timeout param and init context
 	id := c.idAllocator.Inc()
-	d, err := NewDispatcher(context.Background(), c.factory, id, c.pchannel, earliestTarget.pos, earliestTarget.subPos, latestTarget.pos.GetTimestamp())
+	d, err := NewDispatcher(context.Background(), c.factory, id, c.pchannel, earliestTarget.pos, earliestTarget.subPos, includeCurrentMsg, latestTarget.pos.GetTimestamp(), c.includeSkipWhenSplit)
 	if err != nil {
 		panic(err)
 	}
@@ -281,6 +306,21 @@ OUTER:
 		zap.Strings("vchannels", vchannels),
 	)
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	d.Handle(pause)
+	for _, candidate := range candidateTargets {
+		vchannel := candidate.vchannel
+		t, ok := c.registeredTargets.Get(vchannel)
+		// During the build process, the target may undergo repeated deregister and register,
+		// causing the channel object to change. Here, validate whether the channel is the
+		// same as before the build. If inconsistent, remove the target.
+		if !ok || t.ch != candidate.ch {
+			d.RemoveTarget(vchannel)
+		}
+	}
+	d.Handle(resume)
 	if c.mainDispatcher == nil {
 		c.mainDispatcher = d
 		log.Info("add main dispatcher", zap.Int64("id", d.ID()))
@@ -291,6 +331,9 @@ OUTER:
 }
 
 func (c *dispatcherManager) tryMerge() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	start := time.Now()
 	log := log.With(zap.String("role", c.role), zap.Int64("nodeID", c.nodeID), zap.String("pchannel", c.pchannel))
 
@@ -352,6 +395,9 @@ func (c *dispatcherManager) deleteMetric(channel string) {
 }
 
 func (c *dispatcherManager) uploadMetric() {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	nodeIDStr := fmt.Sprintf("%d", c.nodeID)
 	fn := func(gauge *prometheus.GaugeVec) {
 		if c.mainDispatcher == nil {

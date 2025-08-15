@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -32,9 +31,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/datanode/index"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
-	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
@@ -85,7 +83,7 @@ type IndexServiceSuite struct {
 	numRows       int64
 	data          []*storage.Blob
 	deleteData    []*storage.Blob
-	in            *DataNode
+	node          *DataNode
 	storageConfig *indexpb.StorageConfig
 	cm            storage.ChunkManager
 }
@@ -95,6 +93,7 @@ func Test_IndexServiceSuite(t *testing.T) {
 }
 
 func (s *IndexServiceSuite) SetupTest() {
+	streamingutil.SetStreamingServiceEnabled()
 	s.collID = 1
 	s.partID = 2
 	s.segID = 3
@@ -129,29 +128,17 @@ func (s *IndexServiceSuite) SetupTest() {
 		GcpCredentialJSON: paramtable.Get().MinioCfg.GcpCredentialJSON.GetValue(),
 	}
 
-	var (
-		factory = dependency.NewMockFactory(s.T())
-		ctx     = context.TODO()
-	)
+	ctx := context.TODO()
 
-	cm := mocks.NewChunkManager(s.T())
+	s.node = NewDataNode(ctx)
 
-	factory.EXPECT().Init(mock.Anything).Return()
-	factory.EXPECT().NewPersistentStorageChunkManager(mock.Anything).Return(cm, nil)
-
-	s.in = NewDataNode(ctx, factory)
-
-	dc := mocks.NewMockDataCoordClient(s.T())
-	dc.EXPECT().ReportDataNodeTtMsgs(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
-	s.in.dataCoord = dc
-
-	err = s.in.Init()
+	err = s.node.Init()
 	s.NoError(err)
 
-	err = s.in.Start()
+	err = s.node.Start()
 	s.NoError(err)
 
-	s.cm, err = s.in.storageFactory.NewChunkManager(context.Background(), s.storageConfig)
+	s.cm, err = s.node.storageFactory.NewChunkManager(context.Background(), s.storageConfig)
 	s.NoError(err)
 	logID := int64(10000)
 	for i, blob := range s.data {
@@ -175,7 +162,7 @@ func (s *IndexServiceSuite) TearDownSuite() {
 	s.NoError(err)
 	paramtable.Get().MinioCfg.RootPath.SwapTempValue("files")
 
-	err = s.in.Stop()
+	err = s.node.Stop()
 	s.NoError(err)
 }
 
@@ -216,15 +203,15 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				NumRows: s.numRows,
 			}
 
-			status, err := s.in.CreateJob(ctx, req)
+			status, err := s.node.CreateJob(ctx, req)
 			s.NoError(err)
 			err = merr.Error(status)
 			s.NoError(err)
 
 			for {
-				resp, err := s.in.QueryJobs(ctx, &workerpb.QueryJobsRequest{
+				resp, err := s.node.QueryJobs(ctx, &workerpb.QueryJobsRequest{
 					ClusterID: "cluster1",
-					BuildIDs:  []int64{buildID},
+					TaskIDs:   []int64{buildID},
 				})
 				s.NoError(err)
 				err = merr.Error(resp.GetStatus())
@@ -237,9 +224,9 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				time.Sleep(time.Second)
 			}
 
-			status, err = s.in.DropJobs(ctx, &workerpb.DropJobsRequest{
+			status, err = s.node.DropJobs(ctx, &workerpb.DropJobsRequest{
 				ClusterID: "cluster1",
-				BuildIDs:  []int64{buildID},
+				TaskIDs:   []int64{buildID},
 			})
 			s.NoError(err)
 			err = merr.Error(status)
@@ -285,15 +272,15 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				DataIds: []int64{s.logID + 13},
 			}
 
-			status, err := s.in.CreateJob(ctx, req)
+			status, err := s.node.CreateJob(ctx, req)
 			s.NoError(err)
 			err = merr.Error(status)
 			s.NoError(err)
 
 			for {
-				resp, err := s.in.QueryJobs(ctx, &workerpb.QueryJobsRequest{
+				resp, err := s.node.QueryJobs(ctx, &workerpb.QueryJobsRequest{
 					ClusterID: "cluster1",
-					BuildIDs:  []int64{buildID},
+					TaskIDs:   []int64{buildID},
 				})
 				s.NoError(err)
 				err = merr.Error(resp.GetStatus())
@@ -306,9 +293,9 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				time.Sleep(time.Second)
 			}
 
-			status, err = s.in.DropJobs(ctx, &workerpb.DropJobsRequest{
+			status, err = s.node.DropJobs(ctx, &workerpb.DropJobsRequest{
 				ClusterID: "cluster1",
-				BuildIDs:  []int64{buildID},
+				TaskIDs:   []int64{buildID},
 			})
 			s.NoError(err)
 			err = merr.Error(status)
@@ -360,15 +347,15 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				},
 			}
 
-			status, err := s.in.CreateJob(ctx, req)
+			status, err := s.node.CreateJob(ctx, req)
 			s.NoError(err)
 			err = merr.Error(status)
 			s.NoError(err)
 
 			for {
-				resp, err := s.in.QueryJobs(ctx, &workerpb.QueryJobsRequest{
+				resp, err := s.node.QueryJobs(ctx, &workerpb.QueryJobsRequest{
 					ClusterID: "cluster1",
-					BuildIDs:  []int64{buildID},
+					TaskIDs:   []int64{buildID},
 				})
 				s.NoError(err)
 				err = merr.Error(resp.GetStatus())
@@ -381,9 +368,9 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_Compatibility() {
 				time.Sleep(time.Second)
 			}
 
-			status, err = s.in.DropJobs(ctx, &workerpb.DropJobsRequest{
+			status, err = s.node.DropJobs(ctx, &workerpb.DropJobsRequest{
 				ClusterID: "cluster1",
-				BuildIDs:  []int64{buildID},
+				TaskIDs:   []int64{buildID},
 			})
 			s.NoError(err)
 			err = merr.Error(status)
@@ -423,15 +410,15 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_ScalarIndex() {
 			CurrentScalarIndexVersion: 1,
 		}
 
-		status, err := s.in.CreateJob(ctx, req)
+		status, err := s.node.CreateJob(ctx, req)
 		s.NoError(err)
 		err = merr.Error(status)
 		s.NoError(err)
 
 		for {
-			resp, err := s.in.QueryJobs(ctx, &workerpb.QueryJobsRequest{
+			resp, err := s.node.QueryJobs(ctx, &workerpb.QueryJobsRequest{
 				ClusterID: "cluster1",
-				BuildIDs:  []int64{buildID},
+				TaskIDs:   []int64{buildID},
 			})
 			s.NoError(err)
 			err = merr.Error(resp.GetStatus())
@@ -444,9 +431,9 @@ func (s *IndexServiceSuite) Test_CreateIndexJob_ScalarIndex() {
 			time.Sleep(time.Second)
 		}
 
-		status, err = s.in.DropJobs(ctx, &workerpb.DropJobsRequest{
+		status, err = s.node.DropJobs(ctx, &workerpb.DropJobsRequest{
 			ClusterID: "cluster1",
-			BuildIDs:  []int64{buildID},
+			TaskIDs:   []int64{buildID},
 		})
 		s.NoError(err)
 		err = merr.Error(status)
@@ -484,7 +471,7 @@ func (s *IndexServiceSuite) Test_CreateAnalyzeTask() {
 			MaxClusterSize:      5 * 1024 * 1024 * 1024,
 		}
 
-		status, err := s.in.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
+		status, err := s.node.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
 			ClusterID: "cluster1",
 			TaskID:    taskID,
 			JobType:   indexpb.JobType_JobTypeAnalyzeJob,
@@ -497,7 +484,7 @@ func (s *IndexServiceSuite) Test_CreateAnalyzeTask() {
 		s.NoError(err)
 
 		for {
-			resp, err := s.in.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
+			resp, err := s.node.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
 				ClusterID: "cluster1",
 				TaskIDs:   []int64{taskID},
 				JobType:   indexpb.JobType_JobTypeAnalyzeJob,
@@ -514,7 +501,7 @@ func (s *IndexServiceSuite) Test_CreateAnalyzeTask() {
 			time.Sleep(time.Second)
 		}
 
-		status, err = s.in.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
+		status, err = s.node.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
 			ClusterID: "cluster1",
 			TaskIDs:   []int64{taskID},
 			JobType:   indexpb.JobType_JobTypeAnalyzeJob,
@@ -540,25 +527,26 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 	s.Run("normal case", func() {
 		taskID := int64(100)
 		req := &workerpb.CreateStatsRequest{
-			ClusterID:       "cluster2",
-			TaskID:          taskID,
-			CollectionID:    s.collID,
-			PartitionID:     s.partID,
-			InsertChannel:   "ch1",
-			SegmentID:       s.segID,
-			InsertLogs:      fieldBinlogs,
-			DeltaLogs:       nil,
-			StorageConfig:   s.storageConfig,
-			Schema:          generateTestSchema(),
-			TargetSegmentID: s.segID + 1,
-			StartLogID:      s.logID + 100,
-			EndLogID:        s.logID + 200,
-			NumRows:         s.numRows,
-			BinlogMaxSize:   131000,
-			SubJobType:      indexpb.StatsSubJob_Sort,
+			ClusterID:          "cluster2",
+			TaskID:             taskID,
+			CollectionID:       s.collID,
+			PartitionID:        s.partID,
+			InsertChannel:      "ch1",
+			SegmentID:          s.segID,
+			InsertLogs:         fieldBinlogs,
+			DeltaLogs:          nil,
+			StorageConfig:      s.storageConfig,
+			Schema:             generateTestSchema(),
+			TargetSegmentID:    s.segID + 1,
+			StartLogID:         s.logID + 100,
+			EndLogID:           s.logID + 200,
+			NumRows:            s.numRows,
+			BinlogMaxSize:      131000,
+			SubJobType:         indexpb.StatsSubJob_Sort,
+			EnableJsonKeyStats: false,
 		}
 
-		status, err := s.in.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
+		status, err := s.node.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
 			ClusterID: "cluster2",
 			TaskID:    taskID,
 			JobType:   indexpb.JobType_JobTypeStatsJob,
@@ -571,7 +559,7 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 		s.NoError(err)
 
 		for {
-			resp, err := s.in.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
+			resp, err := s.node.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
 				ClusterID: "cluster2",
 				TaskIDs:   []int64{taskID},
 				JobType:   indexpb.JobType_JobTypeStatsJob,
@@ -590,14 +578,12 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 			time.Sleep(time.Second)
 		}
 
-		slotResp, err := s.in.GetJobStats(ctx, &workerpb.GetJobStatsRequest{})
+		slotResp, err := s.node.GetJobStats(ctx, &workerpb.GetJobStatsRequest{})
 		s.NoError(err)
 		err = merr.Error(slotResp.GetStatus())
 		s.NoError(err)
 
-		s.Equal(int64(1), slotResp.GetTaskSlots())
-
-		status, err = s.in.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
+		status, err = s.node.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
 			ClusterID: "cluster2",
 			TaskIDs:   []int64{taskID},
 			JobType:   indexpb.JobType_JobTypeStatsJob,
@@ -641,7 +627,7 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 			SubJobType:      indexpb.StatsSubJob_Sort,
 		}
 
-		status, err := s.in.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
+		status, err := s.node.CreateJobV2(ctx, &workerpb.CreateJobV2Request{
 			ClusterID: "cluster2",
 			TaskID:    taskID,
 			JobType:   indexpb.JobType_JobTypeStatsJob,
@@ -654,7 +640,7 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 		s.NoError(err)
 
 		for {
-			resp, err := s.in.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
+			resp, err := s.node.QueryJobsV2(ctx, &workerpb.QueryJobsV2Request{
 				ClusterID: "cluster2",
 				TaskIDs:   []int64{taskID},
 				JobType:   indexpb.JobType_JobTypeStatsJob,
@@ -672,14 +658,12 @@ func (s *IndexServiceSuite) Test_CreateStatsTask() {
 			time.Sleep(time.Second)
 		}
 
-		slotResp, err := s.in.GetJobStats(ctx, &workerpb.GetJobStatsRequest{})
+		slotResp, err := s.node.GetJobStats(ctx, &workerpb.GetJobStatsRequest{})
 		s.NoError(err)
 		err = merr.Error(slotResp.GetStatus())
 		s.NoError(err)
 
-		s.Equal(int64(1), slotResp.GetTaskSlots())
-
-		status, err = s.in.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
+		status, err = s.node.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
 			ClusterID: "cluster2",
 			TaskIDs:   []int64{taskID},
 			JobType:   indexpb.JobType_JobTypeStatsJob,

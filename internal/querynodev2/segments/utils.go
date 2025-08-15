@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
@@ -126,7 +127,7 @@ func getPKsFromRowBasedInsertMsg(msg *msgstream.InsertMsg, schema *schemapb.Coll
 				}
 			}
 		case schemapb.DataType_SparseFloatVector:
-			return nil, fmt.Errorf("SparseFloatVector not support in row based message")
+			return nil, errors.New("SparseFloatVector not support in row based message")
 		}
 	}
 
@@ -258,27 +259,37 @@ func getFieldSchema(schema *schemapb.CollectionSchema, fieldID int64) (*schemapb
 			return field, nil
 		}
 	}
+	for _, structArrayField := range schema.StructArrayFields {
+		for _, subField := range structArrayField.Fields {
+			if subField.FieldID == fieldID {
+				return subField, nil
+			}
+		}
+	}
 	return nil, fmt.Errorf("field %d not found in schema", fieldID)
 }
 
 func isIndexMmapEnable(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) bool {
 	enableMmap, exist := common.IsMmapIndexEnabled(indexInfo.IndexParams...)
-	if exist {
+	// fast path for returning disabled, need to perform index type check for enabled case
+	if exist && !enableMmap {
 		return enableMmap
 	}
 	indexType := common.GetIndexType(indexInfo.IndexParams)
 	var indexSupportMmap bool
-	var defaultEnableMmap bool
+	// var defaultEnableMmap bool
 	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
 		indexSupportMmap = vecindexmgr.GetVecIndexMgrInstance().IsMMapSupported(indexType)
-		defaultEnableMmap = params.Params.QueryNodeCfg.MmapVectorIndex.GetAsBool()
+		enableMmap = params.Params.QueryNodeCfg.MmapVectorIndex.GetAsBool() || enableMmap
 	} else {
 		indexSupportMmap = indexparamcheck.IsScalarMmapIndex(indexType)
-		defaultEnableMmap = params.Params.QueryNodeCfg.MmapScalarIndex.GetAsBool()
+		enableMmap = params.Params.QueryNodeCfg.MmapScalarIndex.GetAsBool() || enableMmap
 	}
-	return indexSupportMmap && defaultEnableMmap
+	return indexSupportMmap && enableMmap
 }
 
+// Except accepting whether the raw data is loaded in mmap or not, it also affects the stats index such as
+// text match index and json key stats index.
 func isDataMmapEnable(fieldSchema *schemapb.FieldSchema) bool {
 	enableMmap, exist := common.IsMmapDataEnabled(fieldSchema.GetTypeParams()...)
 	if exist {

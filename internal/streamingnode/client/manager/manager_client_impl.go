@@ -61,7 +61,10 @@ func (c *managerClientImpl) CollectAllStatus(ctx context.Context) (map[int64]*ty
 	defer c.lifetime.Done()
 
 	// Get all discovered streamingnode.
-	state := c.rb.Resolver().GetLatestState()
+	state, err := c.rb.Resolver().GetLatestState(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if len(state.State.Addresses) == 0 {
 		return make(map[int64]*types.StreamingNodeStatus), nil
 	}
@@ -73,7 +76,10 @@ func (c *managerClientImpl) CollectAllStatus(ctx context.Context) (map[int64]*ty
 	}
 
 	// Collect status may cost some time, so we need to check the lifetime again.
-	newState := c.rb.Resolver().GetLatestState()
+	newState, err := c.rb.Resolver().GetLatestState(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if newState.Version.GT(state.Version) {
 		newSession := newState.Sessions()
 		for serverID := range result {
@@ -96,7 +102,7 @@ func (c *managerClientImpl) getAllStreamingNodeStatus(ctx context.Context, state
 	}
 
 	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(10)
+	g.SetLimit(16)
 	var mu sync.Mutex
 	result := make(map[int64]*types.StreamingNodeStatus, len(state.State.Addresses))
 	for serverID, session := range state.Sessions() {
@@ -107,24 +113,24 @@ func (c *managerClientImpl) getAllStreamingNodeStatus(ctx context.Context, state
 			resp, err := manager.CollectStatus(ctx, &streamingpb.StreamingNodeManagerCollectStatusRequest{})
 			mu.Lock()
 			defer mu.Unlock()
+
+			if err != nil {
+				log.Warn("collect status failed, skip", zap.Int64("serverID", serverID), zap.Error(err))
+				return err
+			}
 			result[serverID] = &types.StreamingNodeStatus{
 				StreamingNodeInfo: types.StreamingNodeInfo{
 					ServerID: serverID,
 					Address:  address,
 				},
-				Err: err,
-			}
-
-			if err != nil {
-				log.Warn("collect status failed, skip", zap.Int64("serverID", serverID), zap.Error(err))
-				return err
+				Metrics: types.NewStreamingNodeBalanceAttrsFromProto(resp.Metrics),
+				Err:     err,
 			}
 			log.Debug("collect status success", zap.Int64("serverID", serverID), zap.Any("status", resp))
 			return nil
 		})
 	}
 	g.Wait()
-
 	return result, nil
 }
 

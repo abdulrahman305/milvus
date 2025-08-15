@@ -59,6 +59,22 @@ func GetIP(ip string) string {
 	if len(ip) == 0 {
 		return GetLocalIP()
 	}
+
+	// Support setting CIDR in the IP field to match interfaces based on CIDR. For example: 192.168.0.0/16
+	_, ipnet, err := net.ParseCIDR(ip)
+	if err == nil {
+		addrs, err := net.InterfaceAddrs()
+		if err == nil {
+			for _, addr := range addrs {
+				addrip, ok := addr.(*net.IPNet)
+				if ok && ipnet.Contains(addrip.IP) {
+					return addrip.IP.String()
+				}
+			}
+		}
+		panic(errors.New(`Network port does not have an IP address that falls within the given CIDR range`))
+	}
+
 	netIP := net.ParseIP(ip)
 	// not a valid ip addr
 	if netIP == nil {
@@ -282,7 +298,7 @@ func GetVirtualChannel(pchannel string, collectionID int64, idx int) string {
 // ConvertChannelName assembles channel name according to parameters.
 func ConvertChannelName(chanName string, tokenFrom string, tokenTo string) (string, error) {
 	if tokenFrom == "" {
-		return "", fmt.Errorf("the tokenFrom is empty")
+		return "", errors.New("the tokenFrom is empty")
 	}
 	if !strings.Contains(chanName, tokenFrom) {
 		return "", fmt.Errorf("cannot find token '%s' in '%s'", tokenFrom, chanName)
@@ -303,6 +319,11 @@ func GetCollectionIDFromVChannel(vChannelName string) int64 {
 }
 
 func getNumRowsOfScalarField(datas interface{}) uint64 {
+	realTypeDatas := reflect.ValueOf(datas)
+	return uint64(realTypeDatas.Len())
+}
+
+func getNumRowsOfArrayVectorField(datas interface{}) uint64 {
 	realTypeDatas := reflect.ValueOf(datas)
 	return uint64(realTypeDatas.Len())
 }
@@ -422,6 +443,8 @@ func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeu
 		if err != nil {
 			return 0, err
 		}
+	case schemapb.DataType_ArrayOfVector:
+		fieldNumRows = getNumRowsOfArrayVectorField(fieldData.GetVectors().GetVectorArray().GetData())
 	default:
 		return 0, fmt.Errorf("%s is not supported now", fieldSchema.GetDataType())
 	}
@@ -491,6 +514,8 @@ func GetNumRowOfFieldData(fieldData *schemapb.FieldData) (uint64, error) {
 			if err != nil {
 				return 0, err
 			}
+		case *schemapb.VectorField_VectorArray:
+			fieldNumRows = getNumRowsOfArrayVectorField(vectorField.GetVectorArray().Data)
 		default:
 			return 0, fmt.Errorf("%s is not supported now", vectorFieldType)
 		}

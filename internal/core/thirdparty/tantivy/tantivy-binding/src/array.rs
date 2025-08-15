@@ -98,6 +98,7 @@ pub extern "C" fn free_rust_array_i64(array: RustArrayI64) {
     }
 }
 
+#[allow(dead_code)]
 #[repr(C)]
 pub enum Value {
     None(()),
@@ -119,7 +120,7 @@ macro_rules! impl_from_for_enum {
     };
 }
 
-impl_from_for_enum!(Value, None => (), RustArrayI64 => RustArrayI64, RustArray => RustArray, RustArray => Vec<u32>, U32 => u32, Ptr => *mut c_void);
+impl_from_for_enum!(Value, None => (), RustArrayI64 => RustArrayI64, RustArrayI64 => Vec<i64>, RustArray => RustArray, RustArray => Vec<u32>, U32 => u32, Ptr => *mut c_void);
 
 #[repr(C)]
 pub struct RustResult {
@@ -192,18 +193,16 @@ pub extern "C" fn free_rust_error(error: *const c_char) {
 #[macro_export]
 macro_rules! cstr_to_str {
     ($cstr:expr) => {
-        unsafe {
-            match CStr::from_ptr($cstr).to_str() {
-                Ok(f) => f,
-                Err(e) => return RustResult::from_error(e.to_string()),
-            }
+        match unsafe { CStr::from_ptr($cstr).to_str() } {
+            Ok(f) => f,
+            Err(e) => return RustResult::from_error(e.to_string()),
         }
     };
 }
 
 #[no_mangle]
 pub extern "C" fn test_enum_with_array() -> RustResult {
-    let array = vec![1, 2, 3];
+    let array: Vec<u32> = vec![1, 2, 3];
     RustResult::from(Result::Ok(array))
 }
 

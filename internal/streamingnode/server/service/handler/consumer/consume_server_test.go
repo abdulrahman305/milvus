@@ -13,12 +13,14 @@ import (
 
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_wal"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_walmanager"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/walmanager"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/contextutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mocks/proto/mock_streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/mocks/streaming/util/mock_message"
+	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
@@ -32,6 +34,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestCreateConsumeServer(t *testing.T) {
+	resource.InitForTest(t)
 	manager := mock_walmanager.NewMockManager(t)
 	grpcConsumeServer := mock_streamingpb.NewMockStreamingNodeHandlerService_ConsumeServer(t)
 
@@ -188,10 +191,7 @@ func TestConsumerServeSendArm(t *testing.T) {
 	msg := mock_message.NewMockImmutableMessage(t)
 	msg.EXPECT().MessageID().Return(walimplstest.NewTestMessageID(1))
 	msg.EXPECT().EstimateSize().Return(0)
-	msg.EXPECT().Payload().Return([]byte{})
-	properties := mock_message.NewMockRProperties(t)
-	properties.EXPECT().ToRawMap().Return(map[string]string{})
-	msg.EXPECT().Properties().Return(properties)
+	msg.EXPECT().IntoMessageProto().Return(&messagespb.Message{})
 	scanCh <- msg
 
 	// test send txn message.

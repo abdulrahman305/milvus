@@ -24,7 +24,7 @@ type ROWriteAheadBuffer interface {
 }
 
 // NewWriteAheadBuffer creates a new WriteAheadBuffer.
-func NewWirteAheadBuffer(
+func NewWriteAheadBuffer(
 	pchannel string,
 	logger *log.MLogger,
 	capacity int,
@@ -65,6 +65,7 @@ func (w *WriteAheadBuffer) Append(msgs []message.ImmutableMessage, tsMsg message
 	if tsMsg.TimeTick() <= w.lastTimeTickMessage.TimeTick() {
 		panic("the time tick of the message is less or equal than the last time tick message")
 	}
+
 	if len(msgs) > 0 {
 		if msgs[0].TimeTick() <= w.lastTimeTickMessage.TimeTick() {
 			panic("the time tick of the message is less than or equal to the last time tick message")
@@ -72,14 +73,15 @@ func (w *WriteAheadBuffer) Append(msgs []message.ImmutableMessage, tsMsg message
 		if msgs[len(msgs)-1].TimeTick() > tsMsg.TimeTick() {
 			panic("the time tick of the message is greater than the time tick message")
 		}
-		// if the len(msgs) > 0, the tsMsg is a persisted message.
 		w.pendingMessages.Push(msgs)
-		w.pendingMessages.Push([]message.ImmutableMessage{tsMsg})
-	} else {
-		w.pendingMessages.Evict()
 	}
-	w.lastTimeTickMessage = tsMsg
+	if tsMsg.IsPersisted() {
+		// The message is persisted, so we need to push it to the pending queue.
+		w.pendingMessages.Push([]message.ImmutableMessage{tsMsg})
+	}
+	w.pendingMessages.Evict()
 
+	w.lastTimeTickMessage = tsMsg
 	w.metrics.Observe(
 		w.pendingMessages.Len(),
 		w.pendingMessages.Size(),
@@ -160,6 +162,11 @@ func (w *WriteAheadBuffer) createSnapshotFromTimeTick(ctx context.Context, timeT
 
 		// error is eof, which means that the time tick is behind the message buffer.
 		// The lastTimeTickMessage should always be greater or equal to the lastTimeTick in the pending queue.
+		if w.pendingMessages.LastTimeTick() == timeTick {
+			offset := w.pendingMessages.CurrentOffset() + 1
+			w.cond.L.Unlock()
+			return nil, offset, nil
+		}
 
 		if w.lastTimeTickMessage.TimeTick() > timeTick {
 			// check if the last time tick is greater than the given time tick, return it to update the timetick.
@@ -169,11 +176,6 @@ func (w *WriteAheadBuffer) createSnapshotFromTimeTick(ctx context.Context, timeT
 			}
 			w.cond.L.Unlock()
 			return []messageWithOffset{msg}, msg.Offset, nil
-		}
-		if w.lastTimeTickMessage.TimeTick() == timeTick {
-			offset := w.pendingMessages.CurrentOffset() + 1
-			w.cond.L.Unlock()
-			return nil, offset, nil
 		}
 
 		if err := w.cond.Wait(ctx); err != nil {

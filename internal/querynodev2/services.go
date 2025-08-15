@@ -251,6 +251,13 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		}
 	}()
 
+	queryView := delegator.NewChannelQueryView(
+		channel.GetUnflushedSegmentIds(),
+		req.GetSealedSegmentRowCount(),
+		req.GetPartitionIDs(),
+		req.GetTargetVersion(),
+	)
+
 	delegator, err := delegator.NewShardDelegator(
 		ctx,
 		req.GetCollectionID(),
@@ -260,10 +267,10 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		node.clusterManager,
 		node.manager,
 		node.loader,
-		node.factory,
 		channel.GetSeekPosition().GetTimestamp(),
 		node.queryHook,
 		node.chunkManager,
+		queryView,
 	)
 	if err != nil {
 		log.Warn("failed to create shard delegator", zap.Error(err))
@@ -295,6 +302,16 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	})
 	delegator.AddExcludedSegments(growingInfo)
 
+	flushedInfo := lo.SliceToMap(channel.GetFlushedSegmentIds(), func(id int64) (int64, uint64) {
+		return id, typeutil.MaxTimestamp
+	})
+	delegator.AddExcludedSegments(flushedInfo)
+
+	droppedInfo := lo.SliceToMap(channel.GetDroppedSegmentIds(), func(id int64) (int64, uint64) {
+		return id, typeutil.MaxTimestamp
+	})
+	delegator.AddExcludedSegments(droppedInfo)
+
 	defer func() {
 		if err != nil {
 			// remove legacy growing
@@ -314,11 +331,46 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
-	position := &msgpb.MsgPosition{
-		ChannelName: channel.SeekPosition.ChannelName,
-		MsgID:       channel.SeekPosition.MsgID,
-		Timestamp:   channel.SeekPosition.Timestamp,
+
+	var position *msgpb.MsgPosition
+	deleteCheckpoint := channel.GetDeleteCheckpoint()
+	channelCheckpoint := channel.GetSeekPosition()
+	if deleteCheckpoint == nil {
+		// for compatibility with old version coord, which doesn't have delete checkpoint in VchannelInfo
+		log.Info("no delete checkpoint found, use seek position to seek",
+			zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+		)
+		position = &msgpb.MsgPosition{
+			ChannelName: channelCheckpoint.GetChannelName(),
+			MsgID:       channelCheckpoint.GetMsgID(),
+			Timestamp:   channelCheckpoint.GetTimestamp(),
+		}
+	} else {
+		if channelCheckpoint.GetTimestamp() > deleteCheckpoint.GetTimestamp() {
+			msg := "channel seek position is greater than delete checkpoint, use delete checkpoint to seek"
+			log.Info(msg,
+				zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+				zap.Time("deleteCheckpoint", tsoutil.PhysicalTime(deleteCheckpoint.GetTimestamp())),
+			)
+			position = &msgpb.MsgPosition{
+				ChannelName: deleteCheckpoint.GetChannelName(),
+				MsgID:       deleteCheckpoint.GetMsgID(),
+				Timestamp:   deleteCheckpoint.GetTimestamp(),
+			}
+		} else {
+			msg := "channel seek position is smaller than delete checkpoint, use seek position to seek"
+			log.Info(msg,
+				zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+				zap.Time("deleteCheckpoint", tsoutil.PhysicalTime(deleteCheckpoint.GetTimestamp())),
+			)
+			position = &msgpb.MsgPosition{
+				ChannelName: channelCheckpoint.GetChannelName(),
+				MsgID:       channelCheckpoint.GetMsgID(),
+				Timestamp:   channelCheckpoint.GetTimestamp(),
+			}
+		}
 	}
+
 	err = pipeline.ConsumeMsgStream(ctx, position)
 	if err != nil {
 		err = merr.WrapErrServiceUnavailable(err.Error(), "InitPipelineFailed")
@@ -357,10 +409,11 @@ func (node *QueryNode) UnsubDmChannel(ctx context.Context, req *querypb.UnsubDmC
 	defer node.unsubscribingChannels.Remove(req.GetChannelName())
 	delegator, ok := node.delegators.GetAndRemove(req.GetChannelName())
 	if ok {
+		node.pipelineManager.Remove(req.GetChannelName())
+
 		// close the delegator first to block all coming query/search requests
 		delegator.Close()
 
-		node.pipelineManager.Remove(req.GetChannelName())
 		node.manager.Segment.RemoveBy(ctx, segments.WithChannel(req.GetChannelName()), segments.WithType(segments.SegmentTypeGrowing))
 		node.manager.Collection.Unref(req.GetCollectionID(), 1)
 	}
@@ -480,6 +533,9 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	if req.GetLoadScope() == querypb.LoadScope_Index {
 		return node.loadIndex(ctx, req), nil
 	}
+	if req.GetLoadScope() == querypb.LoadScope_Stats {
+		return node.loadStats(ctx, req), nil
+	}
 
 	// Actual load segment
 	log.Info("start to load segments...")
@@ -499,6 +555,31 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
 
 	return merr.Success(), nil
+}
+
+// UpdateSchema updates the schema of the collection on the querynode.
+func (node *QueryNode) UpdateSchema(ctx context.Context, req *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+	defer node.updateDistributionModifyTS()
+
+	// check node healthy
+	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
+		return merr.Status(err), nil
+	}
+	defer node.lifetime.Done()
+
+	log := log.Ctx(ctx).With(
+		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Uint64("schemaVersion", req.GetVersion()),
+	)
+
+	log.Info("querynode received update schema request")
+
+	err := node.manager.Collection.UpdateSchema(req.GetCollectionID(), req.GetSchema(), req.GetVersion())
+	if err != nil {
+		log.Warn("failed to update schema", zap.Error(err))
+	}
+
+	return merr.Status(err), nil
 }
 
 // ReleaseCollection clears all data related to this collection on the querynode
@@ -632,18 +713,19 @@ func (node *QueryNode) GetSegmentInfo(ctx context.Context, in *querypb.GetSegmen
 		}
 
 		info := &querypb.SegmentInfo{
-			SegmentID:    segment.ID(),
-			SegmentState: segment.Type(),
-			DmChannel:    segment.Shard().VirtualName(),
-			PartitionID:  segment.Partition(),
-			CollectionID: segment.Collection(),
-			NodeID:       node.GetNodeID(),
-			NodeIds:      []int64{node.GetNodeID()},
-			MemSize:      segment.MemSize(),
-			NumRows:      segment.InsertCount(),
-			IndexName:    indexName,
-			IndexID:      indexID,
-			IndexInfos:   indexInfos,
+			SegmentID:      segment.ID(),
+			SegmentState:   segment.Type(),
+			DmChannel:      segment.Shard().VirtualName(),
+			PartitionID:    segment.Partition(),
+			CollectionID:   segment.Collection(),
+			NodeID:         node.GetNodeID(),
+			NodeIds:        []int64{node.GetNodeID()},
+			MemSize:        segment.MemSize(),
+			NumRows:        segment.InsertCount(),
+			IndexName:      indexName,
+			IndexID:        indexID,
+			IndexInfos:     indexInfos,
+			StorageVersion: segment.LoadInfo().GetStorageVersion(),
 		}
 		segmentInfos = append(segmentInfos, info)
 	}
@@ -854,7 +936,6 @@ func (node *QueryNode) QuerySegments(ctx context.Context, req *querypb.QueryRequ
 	defer func() {
 		node.manager.Collection.Unref(req.GetReq().GetCollectionID(), 1)
 	}()
-
 	// Send task to scheduler and wait until it finished.
 	task := tasks.NewQueryTask(queryCtx, collection, node.manager, req)
 	if err := node.scheduler.Add(task); err != nil {
@@ -1183,6 +1264,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 			IndexInfo: lo.SliceToMap(s.Indexes(), func(info *segments.IndexedFieldInfo) (int64, *querypb.FieldIndexInfo) {
 				return info.IndexInfo.IndexID, info.IndexInfo
 			}),
+			FieldJsonIndexStats: s.GetFieldJSONIndexStats(),
 		})
 	}
 
@@ -1223,14 +1305,18 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 			numOfGrowingRows += segment.InsertCount()
 		}
 
+		queryView := delegator.GetChannelQueryView()
 		leaderViews = append(leaderViews, &querypb.LeaderView{
 			Collection:             delegator.Collection(),
 			Channel:                key,
 			SegmentDist:            sealedSegments,
 			GrowingSegments:        growingSegments,
-			TargetVersion:          delegator.GetTargetVersion(),
 			NumOfGrowingRows:       numOfGrowingRows,
 			PartitionStatsVersions: delegator.GetPartitionStatsVersions(ctx),
+			TargetVersion:          queryView.GetVersion(),
+			Status: &querypb.LeaderViewStatus{
+				Serviceable: queryView.Serviceable(),
+			},
 		})
 		return true
 	})
@@ -1243,6 +1329,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 		LeaderViews:     leaderViews,
 		LastModifyTs:    lastModifyTs,
 		MemCapacityInMB: float64(hardware.GetMemoryCount() / 1024 / 1024),
+		CpuNum:          int64(hardware.GetCPUNum()),
 	}, nil
 }
 
@@ -1303,7 +1390,11 @@ func (node *QueryNode) SyncDistribution(ctx context.Context, req *querypb.SyncDi
 				})
 			})
 		case querypb.SyncType_UpdateVersion:
-			log.Info("sync action", zap.Int64("TargetVersion", action.GetTargetVersion()), zap.Int64s("partitions", req.GetLoadMeta().GetPartitionIDs()))
+			log.Info("sync action",
+				zap.Int64("TargetVersion", action.GetTargetVersion()),
+				zap.Time("checkPoint", tsoutil.PhysicalTime(action.GetCheckpoint().GetTimestamp())),
+				zap.Time("deleteCP", tsoutil.PhysicalTime(action.GetDeleteCP().GetTimestamp())),
+				zap.Int64s("partitions", req.GetLoadMeta().GetPartitionIDs()))
 			droppedInfos := lo.SliceToMap(action.GetDroppedInTarget(), func(id int64) (int64, uint64) {
 				if action.GetCheckpoint() == nil {
 					return id, typeutil.MaxTimestamp
@@ -1318,16 +1409,7 @@ func (node *QueryNode) SyncDistribution(ctx context.Context, req *querypb.SyncDi
 				return id, action.GetCheckpoint().Timestamp
 			})
 			shardDelegator.AddExcludedSegments(flushedInfo)
-			deleteCP := action.GetDeleteCP()
-			if deleteCP == nil {
-				// for compatible with 2.4, we use checkpoint as deleteCP when deleteCP is nil
-				deleteCP = action.GetCheckpoint()
-				log.Info("use checkpoint as deleteCP",
-					zap.String("channelName", req.GetChannel()),
-					zap.Time("deleteSeekPos", tsoutil.PhysicalTime(action.GetCheckpoint().GetTimestamp())))
-			}
-			shardDelegator.SyncTargetVersion(action.GetTargetVersion(), req.GetLoadMeta().GetPartitionIDs(), action.GetGrowingInTarget(),
-				action.GetSealedInTarget(), action.GetDroppedInTarget(), action.GetCheckpoint(), deleteCP)
+			shardDelegator.SyncTargetVersion(action, req.GetLoadMeta().GetPartitionIDs())
 		case querypb.SyncType_UpdatePartitionStats:
 			log.Info("sync update partition stats versions")
 			shardDelegator.SyncPartitionStats(ctx, action.PartitionStatsVersions)
@@ -1487,6 +1569,31 @@ func (node *QueryNode) DeleteBatch(ctx context.Context, req *querypb.DeleteBatch
 	return &querypb.DeleteBatchResponse{
 		Status:    merr.Success(),
 		FailedIds: errSet.Collect(),
+	}, nil
+}
+
+func (node *QueryNode) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerRequest) (*milvuspb.RunAnalyzerResponse, error) {
+	// get delegator
+	sd, ok := node.delegators.Get(req.GetChannel())
+	if !ok {
+		err := merr.WrapErrChannelNotFound(req.GetChannel())
+		log.Warn("RunAnalyzer failed, failed to get shard delegator", zap.Error(err))
+		return &milvuspb.RunAnalyzerResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	// run analyzer
+	results, err := sd.RunAnalyzer(ctx, req)
+	if err != nil {
+		log.Warn("failed to search on delegator", zap.Error(err))
+		return &milvuspb.RunAnalyzerResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	return &milvuspb.RunAnalyzerResponse{
+		Status:  merr.Status(nil),
+		Results: results,
 	}, nil
 }
 

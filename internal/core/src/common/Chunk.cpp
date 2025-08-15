@@ -11,9 +11,6 @@
 
 #include <sys/mman.h>
 #include <cstdint>
-#include "common/Array.h"
-#include "common/Span.h"
-#include "common/Types.h"
 #include "common/Chunk.h"
 
 namespace milvus {
@@ -32,7 +29,7 @@ StringChunk::StringViews(
             start_offset,
             len);
         AssertInfo(
-            len > 0 && len <= row_nums_,
+            len >= 0 && len <= row_nums_,
             "Retrieve string views with out-of-bound offset:{}, len:{}, wrong",
             start_offset,
             len);

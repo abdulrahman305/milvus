@@ -28,7 +28,6 @@ type writeNode struct {
 	wbManager   writebuffer.BufferManager
 	updater     util.StatsUpdater
 	metacache   metacache.MetaCache
-	collSchema  *schemapb.CollectionSchema
 	pkField     *schemapb.FieldSchema
 }
 
@@ -83,10 +82,13 @@ func (wNode *writeNode) Operate(in []Msg) []Msg {
 	start, end := fgMsg.StartPositions[0], fgMsg.EndPositions[0]
 
 	if fgMsg.InsertData == nil {
-		insertData, err := writebuffer.PrepareInsert(wNode.collSchema, wNode.pkField, fgMsg.InsertMessages)
-		if err != nil {
-			log.Error("failed to prepare data", zap.Error(err))
-			panic(err)
+		insertData := make([]*writebuffer.InsertData, 0)
+		if len(fgMsg.InsertMessages) > 0 {
+			var err error
+			if insertData, err = writebuffer.PrepareInsert(wNode.metacache.GetSchema(fgMsg.TimeTick()), wNode.pkField, fgMsg.InsertMessages); err != nil {
+				log.Error("failed to prepare data", zap.Error(err))
+				panic(err)
+			}
 		}
 		fgMsg.InsertData = insertData
 	}
@@ -144,7 +146,8 @@ func newWriteNode(
 	baseNode.SetMaxQueueLength(paramtable.Get().DataNodeCfg.FlowGraphMaxQueueLength.GetAsInt32())
 	baseNode.SetMaxParallelism(paramtable.Get().DataNodeCfg.FlowGraphMaxParallelism.GetAsInt32())
 
-	collSchema := config.metacache.Schema()
+	// pkfield is a immutable property of the collection, so we can get it from any schema
+	collSchema := config.metacache.GetSchema(0)
 	pkField, err := typeutil.GetPrimaryFieldSchema(collSchema)
 	if err != nil {
 		return nil, err
@@ -156,7 +159,6 @@ func newWriteNode(
 		wbManager:   writeBufferManager,
 		updater:     updater,
 		metacache:   config.metacache,
-		collSchema:  collSchema,
 		pkField:     pkField,
 	}, nil
 }

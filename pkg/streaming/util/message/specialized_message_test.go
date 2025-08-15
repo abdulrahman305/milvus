@@ -36,17 +36,27 @@ func TestAsSpecializedMessage(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), body.CollectionID)
 
+	_, err = message.AsMutableInsertMessageV1(insertMsg)
+	assert.NoError(t, err)
+
 	h := insertMsg.Header()
 	h.Partitions[0].SegmentAssignment = &message.SegmentAssignment{
 		SegmentId: 1,
 	}
 	insertMsg.OverwriteHeader(h)
+	assert.True(t, insertMsg.IsPersisted())
 
 	createColMsg, err := message.AsMutableCreateCollectionMessageV1(m)
-	assert.NoError(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, createColMsg)
 
-	m2 := m.IntoImmutableMessage(mock_message.NewMockMessageID(t))
+	id := mock_message.NewMockMessageID(t)
+	id.EXPECT().String().Return("1")
+	m2 := m.IntoImmutableMessage(id)
+
+	assert.Panics(t, func() {
+		_ = message.MustAsImmutableDeleteMessageV1(m2)
+	})
 
 	insertMsg2, err := message.AsImmutableInsertMessageV1(m2)
 	assert.NoError(t, err)
@@ -57,7 +67,18 @@ func TestAsSpecializedMessage(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), body.CollectionID)
 
-	createColMsg2, err := message.AsMutableCreateCollectionMessageV1(m)
+	// double as is ok.
+	_, err = message.AsImmutableInsertMessageV1(insertMsg2)
 	assert.NoError(t, err)
+
+	insertMsg2 = message.MustAsImmutableInsertMessageV1(m2)
+	assert.NotNil(t, insertMsg2)
+
+	createColMsg2, err := message.AsMutableCreateCollectionMessageV1(m)
+	assert.Error(t, err)
 	assert.Nil(t, createColMsg2)
+
+	assert.Panics(t, func() {
+		message.MustAsMutableCreateCollectionMessageV1(m)
+	})
 }

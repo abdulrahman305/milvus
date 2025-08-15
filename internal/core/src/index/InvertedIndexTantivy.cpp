@@ -19,18 +19,16 @@
 #include "index/Utils.h"
 #include "storage/Util.h"
 
+#include <algorithm>
 #include <boost/filesystem.hpp>
 #include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <cstddef>
+#include <type_traits>
 #include <vector>
 #include "InvertedIndexTantivy.h"
 
-const std::string INDEX_NULL_OFFSET_FILE_NAME = "index_null_offset";
-
 namespace milvus::index {
-constexpr const char* TMP_INVERTED_INDEX_PREFIX = "/tmp/milvus/inverted-index/";
-
 inline TantivyDataType
 get_tantivy_data_type(const proto::schema::FieldSchema& schema) {
     switch (schema.data_type()) {
@@ -46,25 +44,34 @@ void
 InvertedIndexTantivy<T>::InitForBuildIndex() {
     auto field =
         std::to_string(disk_file_manager_->GetFieldDataMeta().field_id);
-    auto prefix = disk_file_manager_->GetIndexIdentifier();
-    path_ = std::string(TMP_INVERTED_INDEX_PREFIX) + prefix;
+    path_ = disk_file_manager_->GetLocalTempIndexObjectPrefix();
     boost::filesystem::create_directories(path_);
     d_type_ = get_tantivy_data_type(schema_);
     if (tantivy_index_exist(path_.c_str())) {
-        PanicInfo(IndexBuildError,
+        ThrowInfo(IndexBuildError,
                   "build inverted index temp dir:{} not empty",
                   path_);
     }
-    wrapper_ = std::make_shared<TantivyIndexWrapper>(
-        field.c_str(), d_type_, path_.c_str(), inverted_index_single_segment_);
+    wrapper_ =
+        std::make_shared<TantivyIndexWrapper>(field.c_str(),
+                                              d_type_,
+                                              path_.c_str(),
+                                              tantivy_index_version_,
+                                              inverted_index_single_segment_,
+                                              user_specified_doc_id_);
 }
 
 template <typename T>
 InvertedIndexTantivy<T>::InvertedIndexTantivy(
-    const storage::FileManagerContext& ctx, bool inverted_index_single_segment)
+    uint32_t tantivy_index_version,
+    const storage::FileManagerContext& ctx,
+    bool inverted_index_single_segment,
+    bool user_specified_doc_id)
     : ScalarIndex<T>(INVERTED_INDEX_TYPE),
       schema_(ctx.fieldDataMeta.field_schema),
-      inverted_index_single_segment_(inverted_index_single_segment) {
+      tantivy_index_version_(tantivy_index_version),
+      inverted_index_single_segment_(inverted_index_single_segment),
+      user_specified_doc_id_(user_specified_doc_id) {
     mem_file_manager_ = std::make_shared<MemFileManager>(ctx);
     disk_file_manager_ = std::make_shared<DiskFileManager>(ctx);
     // push init wrapper to load process
@@ -78,6 +85,9 @@ template <typename T>
 InvertedIndexTantivy<T>::~InvertedIndexTantivy() {
     if (wrapper_) {
         wrapper_->free();
+    }
+    if (path_.empty()) {
+        return;
     }
     auto local_chunk_manager =
         storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
@@ -157,11 +167,8 @@ InvertedIndexTantivy<T>::Upload(const Config& config) {
 template <typename T>
 void
 InvertedIndexTantivy<T>::Build(const Config& config) {
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(), "insert_files were empty");
     auto field_datas =
-        mem_file_manager_->CacheRawDataToMemory(insert_files.value());
+        storage::CacheRawDataAndFillMissing(mem_file_manager_, config);
     BuildWithFieldData(field_datas);
 }
 
@@ -170,93 +177,97 @@ void
 InvertedIndexTantivy<T>::Load(milvus::tracer::TraceContext ctx,
                               const Config& config) {
     auto index_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "index_files");
+        GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load disk ann index data");
-
-    auto prefix = disk_file_manager_->GetLocalIndexObjectPrefix();
     auto inverted_index_files = index_files.value();
 
-    // need erase the index type file that has been readed
-    auto index_type_file =
-        disk_file_manager_->GetRemoteIndexPrefix() + std::string("/index_type");
-    inverted_index_files.erase(
-        std::remove_if(
-            inverted_index_files.begin(),
-            inverted_index_files.end(),
-            [&](const std::string& file) { return file == index_type_file; }),
-        inverted_index_files.end());
+    LoadIndexMetas(inverted_index_files, config);
+    RetainTantivyIndexFiles(inverted_index_files);
+    disk_file_manager_->CacheIndexToDisk(inverted_index_files,
+                                         config[milvus::LOAD_PRIORITY]);
+    auto prefix = disk_file_manager_->GetLocalIndexObjectPrefix();
+    path_ = prefix;
+    auto load_in_mmap =
+        GetValueFromConfig<bool>(config, ENABLE_MMAP).value_or(true);
+    wrapper_ = std::make_shared<TantivyIndexWrapper>(
+        prefix.c_str(), load_in_mmap, milvus::index::SetBitsetSealed);
 
-    std::vector<std::string> null_offset_files;
-    std::shared_ptr<FieldDataBase> null_offset_data;
-
-    auto find_file = [&](const std::string& file) -> auto {
-        return std::find_if(inverted_index_files.begin(),
-                            inverted_index_files.end(),
-                            [&](const std::string& f) {
-                                return f.substr(f.find_last_of('/') + 1) ==
-                                       file;
-                            });
-    };
-
-    if (auto it = find_file(INDEX_FILE_SLICE_META);
-        it != inverted_index_files.end()) {
-        // SLICE_META only exist if null_offset_files are sliced
-        null_offset_files.push_back(*it);
-
-        // find all null_offset_files
-        for (auto& file : inverted_index_files) {
-            auto filename = file.substr(file.find_last_of('/') + 1);
-            if (filename.length() >= INDEX_NULL_OFFSET_FILE_NAME.length() &&
-                filename.substr(0, INDEX_NULL_OFFSET_FILE_NAME.length()) ==
-                    INDEX_NULL_OFFSET_FILE_NAME) {
-                null_offset_files.push_back(file);
-            }
-        }
-
-        auto index_datas =
-            mem_file_manager_->LoadIndexToMemory(null_offset_files);
-        AssembleIndexDatas(index_datas);
-        null_offset_data = index_datas.at(INDEX_NULL_OFFSET_FILE_NAME);
-    } else if (auto it = find_file(INDEX_NULL_OFFSET_FILE_NAME);
-               it != inverted_index_files.end()) {
-        // null offset file is not sliced
-        null_offset_files.push_back(*it);
-        auto index_datas = mem_file_manager_->LoadIndexToMemory({*it});
-        null_offset_data = index_datas.at(INDEX_NULL_OFFSET_FILE_NAME);
+    if (!load_in_mmap) {
+        // the index is loaded in ram, so we can remove files in advance
+        disk_file_manager_->RemoveIndexFiles();
     }
+}
 
-    if (null_offset_data) {
-        auto data = null_offset_data->Data();
-        auto size = null_offset_data->DataSize();
-        folly::SharedMutex::WriteHolder lock(mutex_);
+template <typename T>
+void
+InvertedIndexTantivy<T>::LoadIndexMetas(
+    const std::vector<std::string>& index_files, const Config& config) {
+    auto fill_null_offsets = [&](const uint8_t* data, int64_t size) {
         null_offset_.resize((size_t)size / sizeof(size_t));
         memcpy(null_offset_.data(), data, (size_t)size);
-    }
+    };
+    auto null_offset_file_itr = std::find_if(
+        index_files.begin(), index_files.end(), [&](const std::string& file) {
+            return boost::filesystem::path(file).filename().string() ==
+                   INDEX_NULL_OFFSET_FILE_NAME;
+        });
 
-    // remove from inverted_index_files
-    inverted_index_files.erase(
-        std::remove_if(inverted_index_files.begin(),
-                       inverted_index_files.end(),
-                       [&](const std::string& file) {
-                           return std::find(null_offset_files.begin(),
-                                            null_offset_files.end(),
-                                            file) != null_offset_files.end();
-                       }),
-        inverted_index_files.end());
-    disk_file_manager_->CacheIndexToDisk(inverted_index_files);
-    path_ = prefix;
-    wrapper_ = std::make_shared<TantivyIndexWrapper>(prefix.c_str());
+    if (null_offset_file_itr != index_files.end()) {
+        // null offset file is not sliced
+        auto index_datas = mem_file_manager_->LoadIndexToMemory(
+            {*null_offset_file_itr}, config[milvus::LOAD_PRIORITY]);
+        auto null_offset_data =
+            std::move(index_datas.at(INDEX_NULL_OFFSET_FILE_NAME));
+        fill_null_offsets(null_offset_data->PayloadData(),
+                          null_offset_data->PayloadSize());
+        return;
+    }
+    std::vector<std::string> null_offset_files;
+    for (auto& file : index_files) {
+        auto file_name = boost::filesystem::path(file).filename().string();
+        if (file_name.find(INDEX_NULL_OFFSET_FILE_NAME) != std::string::npos) {
+            null_offset_files.push_back(file);
+        }
+    }
+    if (null_offset_files.size() > 0) {
+        // null offset file is sliced
+        auto index_datas = mem_file_manager_->LoadIndexToMemory(
+            null_offset_files, config[milvus::LOAD_PRIORITY]);
+
+        auto null_offsets_data = CompactIndexDatas(index_datas);
+        auto null_offsets_data_codecs =
+            std::move(null_offsets_data.at(INDEX_NULL_OFFSET_FILE_NAME));
+        for (auto&& null_offsets_codec : null_offsets_data_codecs.codecs_) {
+            fill_null_offsets(null_offsets_codec->PayloadData(),
+                              null_offsets_codec->PayloadSize());
+        }
+    }
+}
+
+template <typename T>
+void
+InvertedIndexTantivy<T>::RetainTantivyIndexFiles(
+    std::vector<std::string>& index_files) {
+    index_files.erase(
+        std::remove_if(
+            index_files.begin(),
+            index_files.end(),
+            [&](const std::string& file) {
+                auto file_name =
+                    boost::filesystem::path(file).filename().string();
+                return file_name == "index_type" ||
+                       file_name.find(INDEX_NULL_OFFSET_FILE_NAME) !=
+                           std::string::npos;
+            }),
+        index_files.end());
 }
 
 template <typename T>
 const TargetBitmap
 InvertedIndexTantivy<T>::In(size_t n, const T* values) {
     TargetBitmap bitset(Count());
-    for (size_t i = 0; i < n; ++i) {
-        auto array = wrapper_->term_query(values[i]);
-        apply_hits(bitset, array, true);
-    }
+    wrapper_->terms_query(values, n, &bitset);
     return bitset;
 }
 
@@ -265,12 +276,22 @@ const TargetBitmap
 InvertedIndexTantivy<T>::IsNull() {
     int64_t count = Count();
     TargetBitmap bitset(count);
-    folly::SharedMutex::ReadHolder lock(mutex_);
-    auto end =
-        std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
-    for (auto iter = null_offset_.begin(); iter != end; ++iter) {
-        bitset.set(*iter);
+
+    auto fill_bitset = [this, count, &bitset]() {
+        auto end =
+            std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
+        for (auto iter = null_offset_.begin(); iter != end; ++iter) {
+            bitset.set(*iter);
+        }
+    };
+
+    if (is_growing_) {
+        folly::SharedMutex::ReadHolder lock(mutex_);
+        fill_bitset();
+    } else {
+        fill_bitset();
     }
+
     return bitset;
 }
 
@@ -279,12 +300,22 @@ const TargetBitmap
 InvertedIndexTantivy<T>::IsNotNull() {
     int64_t count = Count();
     TargetBitmap bitset(count, true);
-    folly::SharedMutex::ReadHolder lock(mutex_);
-    auto end =
-        std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
-    for (auto iter = null_offset_.begin(); iter != end; ++iter) {
-        bitset.reset(*iter);
+
+    auto fill_bitset = [this, count, &bitset]() {
+        auto end =
+            std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
+        for (auto iter = null_offset_.begin(); iter != end; ++iter) {
+            bitset.reset(*iter);
+        }
+    };
+
+    if (is_growing_) {
+        folly::SharedMutex::ReadHolder lock(mutex_);
+        fill_bitset();
+    } else {
+        fill_bitset();
     }
+
     return bitset;
 }
 
@@ -293,10 +324,9 @@ const TargetBitmap
 InvertedIndexTantivy<T>::InApplyFilter(
     size_t n, const T* values, const std::function<bool(size_t)>& filter) {
     TargetBitmap bitset(Count());
-    for (size_t i = 0; i < n; ++i) {
-        auto array = wrapper_->term_query(values[i]);
-        apply_hits_with_filter(bitset, array, filter);
-    }
+    wrapper_->terms_query(values, n, &bitset);
+    // todo(SpadeA): could push-down the filter to tantivy query
+    apply_hits_with_filter(bitset, filter);
     return bitset;
 }
 
@@ -304,28 +334,36 @@ template <typename T>
 void
 InvertedIndexTantivy<T>::InApplyCallback(
     size_t n, const T* values, const std::function<void(size_t)>& callback) {
-    for (size_t i = 0; i < n; ++i) {
-        auto array = wrapper_->term_query(values[i]);
-        apply_hits_with_callback(array, callback);
-    }
+    TargetBitmap bitset(Count());
+    wrapper_->terms_query(values, n, &bitset);
+    // todo(SpadeA): could push-down the callback to tantivy query
+    apply_hits_with_callback(bitset, callback);
 }
 
 template <typename T>
 const TargetBitmap
 InvertedIndexTantivy<T>::NotIn(size_t n, const T* values) {
     int64_t count = Count();
-    TargetBitmap bitset(count, true);
-    for (size_t i = 0; i < n; ++i) {
-        auto array = wrapper_->term_query(values[i]);
-        apply_hits(bitset, array, false);
+    TargetBitmap bitset(count);
+    wrapper_->terms_query(values, n, &bitset);
+    // The expression is "not" in, so we flip the bit.
+    bitset.flip();
+
+    auto fill_bitset = [this, count, &bitset]() {
+        auto end =
+            std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
+        for (auto iter = null_offset_.begin(); iter != end; ++iter) {
+            bitset.reset(*iter);
+        }
+    };
+
+    if (is_growing_) {
+        folly::SharedMutex::ReadHolder lock(mutex_);
+        fill_bitset();
+    } else {
+        fill_bitset();
     }
 
-    folly::SharedMutex::ReadHolder lock(mutex_);
-    auto end =
-        std::lower_bound(null_offset_.begin(), null_offset_.end(), count);
-    for (auto iter = null_offset_.begin(); iter != end; ++iter) {
-        bitset.reset(*iter);
-    }
     return bitset;
 }
 
@@ -333,25 +371,22 @@ template <typename T>
 const TargetBitmap
 InvertedIndexTantivy<T>::Range(T value, OpType op) {
     TargetBitmap bitset(Count());
+
     switch (op) {
         case OpType::LessThan: {
-            auto array = wrapper_->upper_bound_range_query(value, false);
-            apply_hits(bitset, array, true);
+            wrapper_->upper_bound_range_query(value, false, &bitset);
         } break;
         case OpType::LessEqual: {
-            auto array = wrapper_->upper_bound_range_query(value, true);
-            apply_hits(bitset, array, true);
+            wrapper_->upper_bound_range_query(value, true, &bitset);
         } break;
         case OpType::GreaterThan: {
-            auto array = wrapper_->lower_bound_range_query(value, false);
-            apply_hits(bitset, array, true);
+            wrapper_->lower_bound_range_query(value, false, &bitset);
         } break;
         case OpType::GreaterEqual: {
-            auto array = wrapper_->lower_bound_range_query(value, true);
-            apply_hits(bitset, array, true);
+            wrapper_->lower_bound_range_query(value, true, &bitset);
         } break;
         default:
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format("Invalid OperatorType: {}", op));
     }
 
@@ -365,9 +400,11 @@ InvertedIndexTantivy<T>::Range(T lower_bound_value,
                                T upper_bound_value,
                                bool ub_inclusive) {
     TargetBitmap bitset(Count());
-    auto array = wrapper_->range_query(
-        lower_bound_value, upper_bound_value, lb_inclusive, ub_inclusive);
-    apply_hits(bitset, array, true);
+    wrapper_->range_query(lower_bound_value,
+                          upper_bound_value,
+                          lb_inclusive,
+                          ub_inclusive,
+                          &bitset);
     return bitset;
 }
 
@@ -376,8 +413,7 @@ const TargetBitmap
 InvertedIndexTantivy<T>::PrefixMatch(const std::string_view prefix) {
     TargetBitmap bitset(Count());
     std::string s(prefix);
-    auto array = wrapper_->prefix_query(s);
-    apply_hits(bitset, array, true);
+    wrapper_->prefix_query(s, &bitset);
     return bitset;
 }
 
@@ -392,7 +428,7 @@ const TargetBitmap
 InvertedIndexTantivy<std::string>::Query(const DatasetPtr& dataset) {
     auto op = dataset->Get<OpType>(OPERATOR_TYPE);
     if (op == OpType::PrefixMatch) {
-        auto prefix = dataset->Get<std::string>(PREFIX_VALUE);
+        auto prefix = dataset->Get<std::string>(MATCH_VALUE);
         return PrefixMatch(prefix);
     }
     return ScalarIndex<std::string>::Query(dataset);
@@ -402,8 +438,7 @@ template <typename T>
 const TargetBitmap
 InvertedIndexTantivy<T>::RegexQuery(const std::string& regex_pattern) {
     TargetBitmap bitset(Count());
-    auto array = wrapper_->regex_query(regex_pattern);
-    apply_hits(bitset, array, true);
+    wrapper_->regex_query(regex_pattern, &bitset);
     return bitset;
 }
 
@@ -436,19 +471,29 @@ InvertedIndexTantivy<T>::BuildWithRawDataForUT(size_t n,
     if constexpr (std::is_same_v<std::string, T>) {
         schema_.set_data_type(proto::schema::DataType::VarChar);
     }
-    boost::uuids::random_generator generator;
-    auto uuid = generator();
-    auto prefix = boost::uuids::to_string(uuid);
-    path_ = fmt::format("/tmp/{}", prefix);
-    boost::filesystem::create_directories(path_);
-    d_type_ = get_tantivy_data_type(schema_);
-    std::string field = "test_inverted_index";
-    inverted_index_single_segment_ =
-        GetValueFromConfig<int32_t>(config,
-                                    milvus::index::SCALAR_INDEX_ENGINE_VERSION)
-            .value_or(1) == 0;
-    wrapper_ = std::make_shared<TantivyIndexWrapper>(
-        field.c_str(), d_type_, path_.c_str(), inverted_index_single_segment_);
+    if (!wrapper_) {
+        boost::uuids::random_generator generator;
+        auto uuid = generator();
+        auto prefix = boost::uuids::to_string(uuid);
+        path_ = fmt::format("/tmp/{}", prefix);
+        boost::filesystem::create_directories(path_);
+        d_type_ = get_tantivy_data_type(schema_);
+        std::string field = "test_inverted_index";
+        inverted_index_single_segment_ =
+            GetValueFromConfig<int32_t>(
+                config, milvus::index::SCALAR_INDEX_ENGINE_VERSION)
+                .value_or(1) == 0;
+        tantivy_index_version_ =
+            GetValueFromConfig<int32_t>(config,
+                                        milvus::index::TANTIVY_INDEX_VERSION)
+                .value_or(milvus::index::TANTIVY_INDEX_LATEST_VERSION);
+        wrapper_ = std::make_shared<TantivyIndexWrapper>(
+            field.c_str(),
+            d_type_,
+            path_.c_str(),
+            tantivy_index_version_,
+            inverted_index_single_segment_);
+    }
     if (!inverted_index_single_segment_) {
         if (config.find("is_array") != config.end()) {
             // only used in ut.
@@ -473,7 +518,7 @@ InvertedIndexTantivy<T>::BuildWithRawDataForUT(size_t n,
                 static_cast<const T*>(values), n);
         }
     }
-    wrapper_->create_reader();
+    wrapper_->create_reader(milvus::index::SetBitsetSealed);
     finish();
     wrapper_->reload();
 }
@@ -487,7 +532,6 @@ InvertedIndexTantivy<T>::BuildWithFieldData(
         for (const auto& data : field_datas) {
             total += data->get_null_count();
         }
-        folly::SharedMutex::WriteHolder lock(mutex_);
         null_offset_.reserve(total);
     }
     switch (schema_.data_type()) {
@@ -509,7 +553,6 @@ InvertedIndexTantivy<T>::BuildWithFieldData(
                         auto n = data->get_num_rows();
                         for (int i = 0; i < n; i++) {
                             if (!data->is_valid(i)) {
-                                folly::SharedMutex::WriteHolder lock(mutex_);
                                 null_offset_.push_back(offset);
                             }
                             wrapper_->add_array_data<T>(
@@ -532,7 +575,6 @@ InvertedIndexTantivy<T>::BuildWithFieldData(
                     if (schema_.nullable()) {
                         for (int i = 0; i < n; i++) {
                             if (!data->is_valid(i)) {
-                                folly::SharedMutex::WriteHolder lock(mutex_);
                                 null_offset_.push_back(i);
                             }
                             wrapper_
@@ -560,7 +602,7 @@ InvertedIndexTantivy<T>::BuildWithFieldData(
         }
 
         default:
-            PanicInfo(ErrorCode::NotImplemented,
+            ThrowInfo(ErrorCode::NotImplemented,
                       fmt::format("Inverted index not supported on {}",
                                   schema_.data_type()));
     }
@@ -570,24 +612,31 @@ template <typename T>
 void
 InvertedIndexTantivy<T>::build_index_for_array(
     const std::vector<std::shared_ptr<FieldDataBase>>& field_datas) {
+    using ElementType = std::conditional_t<std::is_same<T, int8_t>::value ||
+                                               std::is_same<T, int16_t>::value,
+                                           int32_t,
+                                           T>;
     int64_t offset = 0;
     for (const auto& data : field_datas) {
         auto n = data->get_num_rows();
         auto array_column = static_cast<const Array*>(data->Data());
         for (int64_t i = 0; i < n; i++) {
             if (schema_.nullable() && !data->is_valid(i)) {
-                folly::SharedMutex::WriteHolder lock(mutex_);
                 null_offset_.push_back(offset);
             }
             auto length = data->is_valid(i) ? array_column[i].length() : 0;
             if (!inverted_index_single_segment_) {
                 wrapper_->template add_array_data(
-                    reinterpret_cast<const T*>(array_column[i].data()),
+                    reinterpret_cast<const ElementType*>(
+                        array_column[i].data()),
                     length,
                     offset++);
             } else {
                 wrapper_->template add_array_data_by_single_segment_writer(
-                    reinterpret_cast<const T*>(array_column[i].data()), length);
+                    reinterpret_cast<const ElementType*>(
+                        array_column[i].data()),
+                    length);
+                offset++;
             }
         }
     }
@@ -603,7 +652,6 @@ InvertedIndexTantivy<std::string>::build_index_for_array(
         auto array_column = static_cast<const Array*>(data->Data());
         for (int64_t i = 0; i < n; i++) {
             if (schema_.nullable() && !data->is_valid(i)) {
-                folly::SharedMutex::WriteHolder lock(mutex_);
                 null_offset_.push_back(offset);
             } else {
                 Assert(IsStringDataType(array_column[i].get_element_type()));

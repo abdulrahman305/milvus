@@ -1,9 +1,11 @@
 package syncmgr
 
 import (
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
 
@@ -37,6 +39,11 @@ func (t *SyncTask) WithChunkManager(cm storage.ChunkManager) *SyncTask {
 	return t
 }
 
+func (t *SyncTask) WithStorageConfig(storageConfig *indexpb.StorageConfig) *SyncTask {
+	t.storageConfig = storageConfig
+	return t
+}
+
 func (t *SyncTask) WithAllocator(allocator allocator.Interface) *SyncTask {
 	t.allocator = allocator
 	return t
@@ -52,6 +59,11 @@ func (t *SyncTask) WithMetaCache(metacache metacache.MetaCache) *SyncTask {
 	return t
 }
 
+func (t *SyncTask) WithSchema(schema *schemapb.CollectionSchema) *SyncTask {
+	t.schema = schema
+	return t
+}
+
 func (t *SyncTask) WithMetaWriter(metaWriter MetaWriter) *SyncTask {
 	t.metaWriter = metaWriter
 	return t
@@ -64,15 +76,5 @@ func (t *SyncTask) WithWriteRetryOptions(opts ...retry.Option) *SyncTask {
 
 func (t *SyncTask) WithFailureCallback(callback func(error)) *SyncTask {
 	t.failureCallback = callback
-	return t
-}
-
-func (t *SyncTask) WithSyncBufferSize(size int64) *SyncTask {
-	t.syncBufferSize = size
-	return t
-}
-
-func (t *SyncTask) WithMultiPartUploadSize(size int64) *SyncTask {
-	t.multiPartUploadSize = size
 	return t
 }

@@ -12,14 +12,18 @@
 #include <gtest/gtest.h>
 #include <regex>
 
+#include "cachinglayer/Manager.h"
 #include "pb/plan.pb.h"
 #include "index/InvertedIndexTantivy.h"
 #include "common/Schema.h"
-#include "segcore/SegmentSealedImpl.h"
+
+#include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/GenExprProto.h"
 #include "query/PlanProto.h"
 #include "query/ExecPlanNodeVisitor.h"
+
+#include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -61,7 +65,6 @@ class ArrayInvertedIndexTest : public ::testing::Test {
     void
     SetUp() override {
         schema_ = GenTestSchema<T>();
-        seg_ = CreateSealedSegment(schema_);
         N_ = 3000;
         uint64_t seed = 19190504;
         auto raw_data = DataGen(schema_, N_, seed);
@@ -100,7 +103,7 @@ class ArrayInvertedIndexTest : public ::testing::Test {
             }
             vec_of_array_.push_back(array);
         }
-        SealedLoadFieldData(raw_data, *seg_);
+        seg_ = CreateSealedWithFieldDataLoaded(schema_, raw_data);
         LoadInvertedIndex();
     }
 
@@ -116,7 +119,8 @@ class ArrayInvertedIndexTest : public ::testing::Test {
         index->BuildWithRawDataForUT(N_, vec_of_array_.data(), cfg);
         LoadIndexInfo info{
             .field_id = schema_->get_field_id(FieldName("array")).get(),
-            .index = std::move(index),
+            .index_params = GenIndexParams(index.get()),
+            .cache_index = CreateTestCacheIndex("test", std::move(index)),
         };
         seg_->LoadIndex(info);
     }
@@ -150,12 +154,12 @@ TYPED_TEST_P(ArrayInvertedIndexTest, ArrayContainsAny) {
     auto expr = test::GenExpr();
     expr->set_allocated_json_contains_expr(contains_expr.release());
 
-    auto parser = ProtoParser(*this->schema_);
+    auto parser = ProtoParser(this->schema_);
     auto typed_expr = parser.ParseExprs(*expr);
     auto parsed =
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, typed_expr);
 
-    auto segpromote = dynamic_cast<SegmentSealedImpl*>(this->seg_.get());
+    auto segpromote = dynamic_cast<ChunkedSegmentSealedImpl*>(this->seg_.get());
     BitsetType final;
     final = ExecuteQueryExpr(parsed, segpromote, this->N_, MAX_TIMESTAMP);
 
@@ -164,6 +168,10 @@ TYPED_TEST_P(ArrayInvertedIndexTest, ArrayContainsAny) {
     auto ref = [this, &elems](size_t offset) -> bool {
         std::unordered_set<TypeParam> row(this->vec_of_array_[offset].begin(),
                                           this->vec_of_array_[offset].end());
+        if (elems.empty()) {
+            return false;
+        }
+
         for (const auto& elem : elems) {
             if (row.find(elem) != row.end()) {
                 return true;
@@ -198,12 +206,12 @@ TYPED_TEST_P(ArrayInvertedIndexTest, ArrayContainsAll) {
     auto expr = test::GenExpr();
     expr->set_allocated_json_contains_expr(contains_expr.release());
 
-    auto parser = ProtoParser(*this->schema_);
+    auto parser = ProtoParser(this->schema_);
     auto typed_expr = parser.ParseExprs(*expr);
     auto parsed =
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, typed_expr);
 
-    auto segpromote = dynamic_cast<SegmentSealedImpl*>(this->seg_.get());
+    auto segpromote = dynamic_cast<ChunkedSegmentSealedImpl*>(this->seg_.get());
     BitsetType final;
     final = ExecuteQueryExpr(parsed, segpromote, this->N_, MAX_TIMESTAMP);
 
@@ -212,6 +220,10 @@ TYPED_TEST_P(ArrayInvertedIndexTest, ArrayContainsAll) {
     auto ref = [this, &elems](size_t offset) -> bool {
         std::unordered_set<TypeParam> row(this->vec_of_array_[offset].begin(),
                                           this->vec_of_array_[offset].end());
+        if (elems.empty()) {
+            return true;
+        }
+
         for (const auto& elem : elems) {
             if (row.find(elem) == row.end()) {
                 return false;
@@ -254,12 +266,12 @@ TYPED_TEST_P(ArrayInvertedIndexTest, ArrayEqual) {
     auto expr = test::GenExpr();
     expr->set_allocated_unary_range_expr(unary_range_expr.release());
 
-    auto parser = ProtoParser(*this->schema_);
+    auto parser = ProtoParser(this->schema_);
     auto typed_expr = parser.ParseExprs(*expr);
     auto parsed =
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, typed_expr);
 
-    auto segpromote = dynamic_cast<SegmentSealedImpl*>(this->seg_.get());
+    auto segpromote = dynamic_cast<ChunkedSegmentSealedImpl*>(this->seg_.get());
     BitsetType final;
     final = ExecuteQueryExpr(parsed, segpromote, this->N_, MAX_TIMESTAMP);
 

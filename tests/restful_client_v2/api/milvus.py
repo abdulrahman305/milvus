@@ -550,6 +550,20 @@ class CollectionClient(Requests):
         response = self.post(url, headers=self.update_headers(), data=payload)
         return response.json()
 
+    def add_field(self, collection_name, field_params, db_name="default"):
+        """Add field"""
+        url = f"{self.endpoint}/v2/vectordb/collections/fields/add"
+        payload = {
+            "collectionName": collection_name,
+            "schema": field_params
+        }
+        if self.db_name is not None:
+            payload["dbName"] = self.db_name
+        if db_name != "default":
+            payload["dbName"] = db_name
+        response = self.post(url, headers=self.update_headers(), data=payload)
+        return response.json()    
+
     def flush(self, collection_name, db_name="default"):
         """Flush collection"""
         url = f"{self.endpoint}/v2/vectordb/collections/flush"
@@ -1155,8 +1169,8 @@ class StorageClient():
             prefix = f"{self.root_path}/{dir}/{collection_id}/"
             objects = self.client.list_objects(self.bucket_name, prefix=prefix)
             for obj in objects:
-                binlog_list.append(f"{self.bucket_name}/{obj.object_name}")
-        print(binlog_list)
+                binlog_list.append(f"{obj.object_name}")
+        logger.info(binlog_list)
         return binlog_list
 
 

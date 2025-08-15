@@ -48,7 +48,7 @@ ExtractSubJson(const std::string& json, const std::vector<std::string>& keys) {
     rapidjson::Document doc;
     doc.Parse(json.c_str());
     if (doc.HasParseError()) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "json parse failed, error:{}",
                   rapidjson::GetParseError_En(doc.GetParseError()));
     }
@@ -88,6 +88,13 @@ class Json {
             "create json without enough memory size for SIMD, len={}, cap={}",
             len,
             cap);
+    }
+
+    // WARN: this is used for fast non-copy construction,
+    // MUST make sure there at least SIMDJSON_PADDING bytes allocated
+    // after the string_view
+    explicit Json(const std::string_view& data)
+        : Json(data.data(), data.size()) {
     }
 
     // WARN: this is used for fast non-copy construction,
@@ -149,6 +156,25 @@ class Json {
         return doc;
     }
 
+    value_result<document>
+    doc(uint16_t offset, uint16_t length) const {
+        thread_local simdjson::ondemand::parser parser;
+
+        // it's always safe to add the padding,
+        // as we have allocated the memory with this padding
+        auto doc = parser.iterate(
+            data_.data() + offset, length, length + simdjson::SIMDJSON_PADDING);
+        AssertInfo(doc.error() == simdjson::SUCCESS,
+                   "failed to parse the json {} offset {}, length {}: {}, "
+                   "total_json:{}",
+                   std::string(data_.data() + offset, length),
+                   offset,
+                   length,
+                   simdjson::error_message(doc.error()),
+                   data_);
+        return doc;
+    }
+
     value_result<simdjson::dom::element>
     dom_doc() const {
         if (data_.size() == 0) {
@@ -166,9 +192,29 @@ class Json {
         return doc;
     }
 
+    value_result<simdjson::dom::element>
+    dom_doc(uint16_t offset, uint16_t length) const {
+        thread_local simdjson::dom::parser parser;
+
+        // it's always safe to add the padding,
+        // as we have allocated the memory with this padding
+        auto doc = parser.parse(data_.data() + offset, length);
+        AssertInfo(doc.error() == simdjson::SUCCESS,
+                   "failed to parse the json {}: {}",
+                   std::string(data_.data() + offset, length),
+                   simdjson::error_message(doc.error()));
+        return doc;
+    }
+
     bool
     exist(std::string_view pointer) const {
-        return doc().at_pointer(pointer).error() == simdjson::SUCCESS;
+        auto doc = this->doc();
+        if (pointer.empty()) {
+            return doc.error() == simdjson::SUCCESS && !doc.is_null();
+        } else {
+            auto res = doc.at_pointer(pointer);
+            return res.error() == simdjson::SUCCESS && !res.is_null();
+        }
     }
 
     // construct JSON pointer with provided path
@@ -184,6 +230,18 @@ class Json {
             });
         auto pointer = "/" + boost::algorithm::join(nested_path, "/");
         return pointer;
+    }
+
+    auto
+    type(const std::string& pointer) const {
+        return pointer.empty() ? doc().type()
+                               : doc().at_pointer(pointer).type();
+    }
+
+    auto
+    get_number_type(const std::string& pointer) const {
+        return pointer.empty() ? doc().get_number_type()
+                               : doc().at_pointer(pointer).get_number_type();
     }
 
     template <typename T>
@@ -203,6 +261,22 @@ class Json {
         }
 
         return doc().at_pointer(pointer).get<T>();
+    }
+
+    template <typename T>
+    value_result<T>
+    at(uint16_t offset, uint16_t length) const {
+        return doc(offset, length).get<T>();
+    }
+
+    std::string_view
+    at_string(uint16_t offset, uint16_t length) const {
+        return std::string_view(data_.data() + offset, length);
+    }
+
+    value_result<simdjson::dom::array>
+    array_at(uint16_t offset, uint16_t length) const {
+        return dom_doc(offset, length).get_array();
     }
 
     // get dom array by JSON pointer,

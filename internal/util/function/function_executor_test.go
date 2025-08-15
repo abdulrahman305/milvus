@@ -36,6 +36,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestFunctionExecutor(t *testing.T) {
@@ -46,7 +47,23 @@ type FunctionExecutorSuite struct {
 	suite.Suite
 }
 
+func (s *FunctionExecutorSuite) SetupTest() {
+	paramtable.Init()
+	paramtable.Get().CredentialCfg.Credential.GetFunc = func() map[string]string {
+		return map[string]string{
+			"mock.apikey": "mock",
+		}
+	}
+}
+
 func (s *FunctionExecutorSuite) creataSchema(url string) *schemapb.CollectionSchema {
+	paramtable.Get().FunctionCfg.TextEmbeddingProviders.GetFunc = func() map[string]string {
+		key := openAIProvider + "." + embeddingURLParamKey
+		return map[string]string{
+			key: url,
+		}
+	}
+
 	return &schemapb.CollectionSchema{
 		Name: "test",
 		Fields: []*schemapb.FieldSchema{
@@ -78,8 +95,7 @@ func (s *FunctionExecutorSuite) creataSchema(url string) *schemapb.CollectionSch
 				Params: []*commonpb.KeyValuePair{
 					{Key: Provider, Value: openAIProvider},
 					{Key: modelNameParamKey, Value: "text-embedding-ada-002"},
-					{Key: apiKeyParamKey, Value: "mock"},
-					{Key: embeddingURLParamKey, Value: url},
+					{Key: credentialParamKey, Value: "mock"},
 					{Key: dimParamKey, Value: "4"},
 				},
 			},
@@ -93,8 +109,7 @@ func (s *FunctionExecutorSuite) creataSchema(url string) *schemapb.CollectionSch
 				Params: []*commonpb.KeyValuePair{
 					{Key: Provider, Value: openAIProvider},
 					{Key: modelNameParamKey, Value: "text-embedding-ada-002"},
-					{Key: apiKeyParamKey, Value: "mock"},
-					{Key: embeddingURLParamKey, Value: url},
+					{Key: credentialParamKey, Value: "mock"},
 					{Key: dimParamKey, Value: "8"},
 				},
 			},

@@ -46,12 +46,12 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		go produceTimeTick(t, ctx, producer)
 
-		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory)
+		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory, false)
 		assert.NotNil(t, c)
 		go c.Run()
 		defer c.Close()
-		assert.Equal(t, int64(0), c.(*dispatcherManager).numConsumer.Load())
-		assert.Equal(t, 0, c.(*dispatcherManager).registeredTargets.Len())
+		assert.Equal(t, 0, c.NumConsumer())
+		assert.Equal(t, 0, c.NumTarget())
 
 		var offset int
 		for i := 0; i < 30; i++ {
@@ -64,8 +64,8 @@ func TestManager(t *testing.T) {
 				assert.NoError(t, err)
 			}
 			assert.Eventually(t, func() bool {
-				t.Logf("offset=%d, numConsumer=%d, numTarget=%d", offset, c.(*dispatcherManager).numConsumer.Load(), c.(*dispatcherManager).registeredTargets.Len())
-				return c.(*dispatcherManager).registeredTargets.Len() == offset
+				t.Logf("offset=%d, numConsumer=%d, numTarget=%d", offset, c.NumConsumer(), c.NumTarget())
+				return c.NumTarget() == offset
 			}, 3*time.Second, 10*time.Millisecond)
 			for j := 0; j < rand.Intn(r); j++ {
 				vchannel := fmt.Sprintf("%s_vchannelv%d", pchannel, offset)
@@ -74,8 +74,8 @@ func TestManager(t *testing.T) {
 				offset--
 			}
 			assert.Eventually(t, func() bool {
-				t.Logf("offset=%d, numConsumer=%d, numTarget=%d", offset, c.(*dispatcherManager).numConsumer.Load(), c.(*dispatcherManager).registeredTargets.Len())
-				return c.(*dispatcherManager).registeredTargets.Len() == offset
+				t.Logf("offset=%d, numConsumer=%d, numTarget=%d", offset, c.NumConsumer(), c.NumTarget())
+				return c.NumTarget() == offset
 			}, 3*time.Second, 10*time.Millisecond)
 		}
 	})
@@ -93,7 +93,7 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		go produceTimeTick(t, ctx, producer)
 
-		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory)
+		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory, false)
 		assert.NotNil(t, c)
 
 		go c.Run()
@@ -108,7 +108,7 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		o2, err := c.Add(ctx, NewStreamConfig(fmt.Sprintf("%s_vchannel-2", pchannel), nil, common.SubscriptionPositionUnknown))
 		assert.NoError(t, err)
-		assert.Equal(t, 3, c.(*dispatcherManager).registeredTargets.Len())
+		assert.Equal(t, 3, c.NumTarget())
 
 		consumeFn := func(output <-chan *MsgPack, done <-chan struct{}, wg *sync.WaitGroup) {
 			defer wg.Done()
@@ -130,14 +130,14 @@ func TestManager(t *testing.T) {
 		go consumeFn(o2, d2, wg)
 
 		assert.Eventually(t, func() bool {
-			return c.(*dispatcherManager).numConsumer.Load() == 1 // expected merge
+			return c.NumConsumer() == 1 // expected merge
 		}, 20*time.Second, 10*time.Millisecond)
 
 		// stop consume vchannel_2 to trigger split
 		d2 <- struct{}{}
 		assert.Eventually(t, func() bool {
-			t.Logf("c.NumConsumer=%d", c.(*dispatcherManager).numConsumer.Load())
-			return c.(*dispatcherManager).numConsumer.Load() == 2 // expected split
+			t.Logf("c.NumConsumer=%d", c.NumConsumer())
+			return c.NumConsumer() == 2 // expected split
 		}, 20*time.Second, 10*time.Millisecond)
 
 		// stop all
@@ -157,7 +157,7 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		go produceTimeTick(t, ctx, producer)
 
-		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory)
+		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory, false)
 		assert.NotNil(t, c)
 
 		go c.Run()
@@ -169,23 +169,26 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		_, err = c.Add(ctx, NewStreamConfig(fmt.Sprintf("%s_vchannel-2", pchannel), nil, common.SubscriptionPositionUnknown))
 		assert.NoError(t, err)
-		assert.Equal(t, 3, c.(*dispatcherManager).registeredTargets.Len())
+		assert.Equal(t, 3, c.NumTarget())
 		assert.Eventually(t, func() bool {
-			return c.(*dispatcherManager).numConsumer.Load() >= 1
-		}, 3*time.Second, 10*time.Millisecond)
+			return c.NumConsumer() >= 1
+		}, 10*time.Second, 10*time.Millisecond)
+		if c.(*dispatcherManager).mainDispatcher == nil {
+			t.FailNow()
+		}
 		c.(*dispatcherManager).mainDispatcher.curTs.Store(1000)
 		for _, d := range c.(*dispatcherManager).deputyDispatchers {
 			d.curTs.Store(1000)
 		}
 
-		checkIntervalK := paramtable.Get().MQCfg.MergeCheckInterval.Key
+		checkIntervalK := paramtable.Get().MQCfg.CheckInterval.Key
 		paramtable.Get().Save(checkIntervalK, "0.01")
 		defer paramtable.Get().Reset(checkIntervalK)
 
 		assert.Eventually(t, func() bool {
-			return c.(*dispatcherManager).numConsumer.Load() == 1 // expected merged
+			return c.(*dispatcherManager).NumConsumer() == 1 // expected merged
 		}, 3*time.Second, 10*time.Millisecond)
-		assert.Equal(t, 3, c.(*dispatcherManager).registeredTargets.Len())
+		assert.Equal(t, 3, c.NumTarget())
 	})
 
 	t.Run("test_repeated_vchannel", func(t *testing.T) {
@@ -199,7 +202,7 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, err)
 		go produceTimeTick(t, ctx, producer)
 
-		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory)
+		c := NewDispatcherManager(pchannel, typeutil.ProxyRole, 1, factory, false)
 
 		go c.Run()
 		defer c.Close()
@@ -220,7 +223,7 @@ func TestManager(t *testing.T) {
 		assert.Error(t, err)
 
 		assert.Eventually(t, func() bool {
-			return c.(*dispatcherManager).numConsumer.Load() >= 1
+			return c.NumConsumer() >= 1
 		}, 3*time.Second, 10*time.Millisecond)
 	})
 }

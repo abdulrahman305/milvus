@@ -40,8 +40,10 @@ import (
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -51,6 +53,7 @@ const (
 	DefaultIDKey                        = "id"
 	SupportedLabelPrefix                = "MILVUS_SERVER_LABEL_"
 	LabelStreamingNodeEmbeddedQueryNode = "QUERYNODE_STREAMING-EMBEDDED"
+	MilvusNodeIDForTesting              = "MILVUS_NODE_ID_FOR_TESTING"
 )
 
 // SessionEventType session event type
@@ -101,10 +104,10 @@ type SessionRaw struct {
 	Version                  string             `json:"Version"`
 	IndexEngineVersion       IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
 	ScalarIndexEngineVersion IndexEngineVersion `json:"ScalarIndexEngineVersion,omitempty"`
+	IndexNonEncoding         bool               `json:"IndexNonEncoding,omitempty"`
 	LeaseID                  *clientv3.LeaseID  `json:"LeaseID,omitempty"`
 
 	HostName     string            `json:"HostName,omitempty"`
-	EnableDisk   bool              `json:"EnableDisk,omitempty"`
 	ServerLabels map[string]string `json:"ServerLabels,omitempty"`
 }
 
@@ -193,9 +196,9 @@ func WithScalarIndexEngineVersion(minimal, current int32) SessionOption {
 	}
 }
 
-func WithEnableDisk(enableDisk bool) SessionOption {
-	return func(s *Session) {
-		s.EnableDisk = enableDisk
+func WithIndexNonEncoding() SessionOption {
+	return func(session *Session) {
+		session.IndexNonEncoding = true
 	}
 }
 
@@ -375,6 +378,10 @@ func (s *Session) checkIDExist() {
 }
 
 func (s *Session) getServerIDWithKey(key string) (int64, error) {
+	if os.Getenv(MilvusNodeIDForTesting) != "" {
+		log.Info("use node id for testing", zap.String("nodeID", os.Getenv(MilvusNodeIDForTesting)))
+		return strconv.ParseInt(os.Getenv(MilvusNodeIDForTesting), 10, 64)
+	}
 	log := log.Ctx(s.ctx)
 	for {
 		getResp, err := s.etcdCli.Get(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, key))
@@ -631,7 +638,7 @@ func fnWithTimeout(fn func() error, d time.Duration) error {
 		case <-resultChan:
 			log.Ctx(context.TODO()).Debug("retry func success")
 		case <-time.After(d):
-			return fmt.Errorf("func timed out")
+			return errors.New("func timed out")
 		}
 		return err1
 	}
@@ -1068,7 +1075,26 @@ func (s *Session) ProcessActiveStandBy(activateFunc func() error) error {
 	//   1. doRegistered: if registered the active_key by this session or by other session
 	//   2. revision: revision of the active_key
 	//   3. err: etcd error, should retry
+
+	oldRoles := []string{
+		typeutil.RootCoordRole,
+		typeutil.DataCoordRole,
+		typeutil.QueryCoordRole,
+	}
+
 	registerActiveFn := func() (bool, int64, error) {
+		for _, role := range oldRoles {
+			sessions, _, err := s.GetSessions(role)
+			if err != nil {
+				log.Debug("failed to get old sessions", zap.String("role", role), zap.Error(err))
+				continue
+			}
+			if len(sessions) > 0 {
+				log.Info("old session exists", zap.String("role", role))
+				return false, -1, merr.ErrOldSessionExists
+			}
+		}
+
 		log.Info(fmt.Sprintf("try to register as ACTIVE %v service...", s.ServerName))
 		sessionJSON, err := json.Marshal(s)
 		if err != nil {

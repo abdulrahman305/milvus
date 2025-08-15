@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"time"
+
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
@@ -8,12 +10,13 @@ import (
 )
 
 // newPChannelMeta creates a new PChannelMeta.
-func newPChannelMeta(name string) *PChannelMeta {
+func newPChannelMeta(name string, accessMode types.AccessMode) *PChannelMeta {
 	return &PChannelMeta{
 		inner: &streamingpb.PChannelMeta{
 			Channel: &streamingpb.PChannelInfo{
-				Name: name,
-				Term: 1,
+				Name:       name,
+				Term:       1,
+				AccessMode: streamingpb.PChannelAccessMode(accessMode),
 			},
 			Node:      nil,
 			State:     streamingpb.PChannelMetaState_PCHANNEL_META_STATE_UNINITIALIZED,
@@ -38,6 +41,11 @@ type PChannelMeta struct {
 // Name returns the name of the channel.
 func (c *PChannelMeta) Name() string {
 	return c.inner.GetChannel().GetName()
+}
+
+// ChannelID returns the channel id.
+func (c *PChannelMeta) ChannelID() types.ChannelID {
+	return types.ChannelID{Name: c.inner.Channel.Name}
 }
 
 // ChannelInfo returns the channel info.
@@ -70,8 +78,9 @@ func (c *PChannelMeta) AssignHistories() []types.PChannelInfoAssigned {
 	for _, h := range c.inner.Histories {
 		history = append(history, types.PChannelInfoAssigned{
 			Channel: types.PChannelInfo{
-				Name: c.inner.GetChannel().GetName(),
-				Term: h.Term,
+				Name:       c.inner.GetChannel().GetName(),
+				Term:       h.Term,
+				AccessMode: types.AccessMode(h.AccessMode),
 			},
 			Node: types.NewStreamingNodeInfoFromProto(h.Node),
 		})
@@ -82,6 +91,11 @@ func (c *PChannelMeta) AssignHistories() []types.PChannelInfoAssigned {
 // IsAssigned returns if the channel is assigned to a server.
 func (c *PChannelMeta) IsAssigned() bool {
 	return c.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED
+}
+
+// LastAssignTimestamp returns the last assigned timestamp.
+func (c *PChannelMeta) LastAssignTimestamp() time.Time {
+	return time.Unix(int64(c.inner.LastAssignTimestampSeconds), 0)
 }
 
 // State returns the state of the channel.
@@ -106,20 +120,22 @@ type mutablePChannel struct {
 }
 
 // TryAssignToServerID assigns the channel to a server.
-func (m *mutablePChannel) TryAssignToServerID(streamingNode types.StreamingNodeInfo) bool {
-	if m.CurrentServerID() == streamingNode.ServerID && m.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED {
+func (m *mutablePChannel) TryAssignToServerID(accessMode types.AccessMode, streamingNode types.StreamingNodeInfo) bool {
+	if m.ChannelInfo().AccessMode == accessMode && m.CurrentServerID() == streamingNode.ServerID && m.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED {
 		// if the channel is already assigned to the server, return false.
 		return false
 	}
 	if m.inner.State != streamingpb.PChannelMetaState_PCHANNEL_META_STATE_UNINITIALIZED {
 		// if the channel is already initialized, add the history.
 		m.inner.Histories = append(m.inner.Histories, &streamingpb.PChannelAssignmentLog{
-			Term: m.inner.Channel.Term,
-			Node: m.inner.Node,
+			Term:       m.inner.Channel.Term,
+			Node:       m.inner.Node,
+			AccessMode: m.inner.Channel.AccessMode,
 		})
 	}
 
 	// otherwise update the channel into assgining state.
+	m.inner.Channel.AccessMode = streamingpb.PChannelAccessMode(accessMode)
 	m.inner.Channel.Term++
 	m.inner.Node = types.NewProtoFromStreamingNodeInfo(streamingNode)
 	m.inner.State = streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNING
@@ -131,6 +147,7 @@ func (m *mutablePChannel) AssignToServerDone() {
 	if m.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNING {
 		m.inner.Histories = make([]*streamingpb.PChannelAssignmentLog, 0)
 		m.inner.State = streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED
+		m.inner.LastAssignTimestampSeconds = uint64(time.Now().Unix())
 	}
 }
 

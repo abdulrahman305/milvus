@@ -22,8 +22,11 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 var errBufferFull = errors.New("buffer full")
@@ -52,14 +55,19 @@ type DeleteBuffer[T timed] interface {
 
 	// clean up delete buffer
 	Clear()
+
+	// Pin/Unpin methods for protecting specific timestamps from cleanup
+	Pin(ts uint64, segmentID int64)
+	Unpin(ts uint64, segmentID int64)
 }
 
 func NewDoubleCacheDeleteBuffer[T timed](startTs uint64, maxSize int64) DeleteBuffer[T] {
 	return &doubleCacheBuffer[T]{
-		head:       newCacheBlock[T](startTs, maxSize),
-		maxSize:    maxSize,
-		ts:         startTs,
-		l0Segments: make([]segments.Segment, 0),
+		head:             newCacheBlock[T](startTs, maxSize),
+		maxSize:          maxSize,
+		ts:               startTs,
+		l0Segments:       make([]segments.Segment, 0),
+		pinnedTimestamps: make(map[uint64]map[int64]struct{}),
 	}
 }
 
@@ -72,6 +80,10 @@ type doubleCacheBuffer[T timed] struct {
 
 	// maintain l0 segment list
 	l0Segments []segments.Segment
+
+	// track pinned timestamps to prevent cleanup
+	// map[timestamp]map[segmentID]struct{} - tracks which segments pin which timestamps
+	pinnedTimestamps map[uint64]map[int64]struct{}
 }
 
 func (c *doubleCacheBuffer[T]) RegisterL0(segmentList ...segments.Segment) {
@@ -82,6 +94,10 @@ func (c *doubleCacheBuffer[T]) RegisterL0(segmentList ...segments.Segment) {
 	for _, seg := range segmentList {
 		if seg != nil {
 			c.l0Segments = append(c.l0Segments, seg)
+			log.Info("register l0 from delete buffer",
+				zap.Int64("segmentID", seg.ID()),
+				zap.Time("startPosition", tsoutil.PhysicalTime(seg.StartPosition().GetTimestamp())),
+			)
 		}
 	}
 }
@@ -100,6 +116,11 @@ func (c *doubleCacheBuffer[T]) UnRegister(ts uint64) {
 	for _, s := range c.l0Segments {
 		if s.StartPosition().GetTimestamp() < ts {
 			s.Release(context.TODO())
+			log.Info("unregister l0 from delete buffer",
+				zap.Int64("segmentID", s.ID()),
+				zap.Time("startPosition", tsoutil.PhysicalTime(s.StartPosition().GetTimestamp())),
+				zap.Time("cleanTs", tsoutil.PhysicalTime(ts)),
+			)
 			continue
 		}
 		newSegments = append(newSegments, s)
@@ -241,4 +262,42 @@ func (c *cacheBlock[T]) ListAfter(ts uint64) []T {
 
 func (c *cacheBlock[T]) Size() (entryNum, memorySize int64) {
 	return c.entryNum, c.size
+}
+
+// Pin protects a specific timestamp from being cleaned up by a specific segment
+func (c *doubleCacheBuffer[T]) Pin(ts uint64, segmentID int64) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	if c.pinnedTimestamps[ts] == nil {
+		c.pinnedTimestamps[ts] = make(map[int64]struct{})
+	}
+	c.pinnedTimestamps[ts][segmentID] = struct{}{}
+
+	log.Info("pin timestamp for segment",
+		zap.Uint64("timestamp", ts),
+		zap.Int64("segmentID", segmentID),
+		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
+	)
+}
+
+// Unpin removes protection for a specific timestamp by a specific segment
+func (c *doubleCacheBuffer[T]) Unpin(ts uint64, segmentID int64) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	if segmentMap, exists := c.pinnedTimestamps[ts]; exists {
+		delete(segmentMap, segmentID)
+		if len(segmentMap) == 0 {
+			delete(c.pinnedTimestamps, ts)
+		}
+	}
+
+	log.Info("unpin timestamp for segment",
+		zap.Uint64("timestamp", ts),
+		zap.Int64("segmentID", segmentID),
+		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
+	)
+	// Note: doubleCacheBuffer doesn't implement cleanup logic in TryDiscard,
+	// so no cleanup is triggered here
 }

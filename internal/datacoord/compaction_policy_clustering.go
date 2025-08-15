@@ -121,7 +121,7 @@ func (policy *clusteringCompactionPolicy) triggerOneCollection(ctx context.Conte
 
 	partSegments := GetSegmentsChanPart(policy.meta, collectionID, SegmentFilterFunc(func(segment *SegmentInfo) bool {
 		return isSegmentHealthy(segment) &&
-			isFlush(segment) &&
+			isFlushed(segment) &&
 			!segment.isCompacting && // not compacting now
 			!segment.GetIsImporting() && // not importing now
 			segment.GetLevel() != datapb.SegmentLevel_L0 && // ignore level zero segments
@@ -189,7 +189,7 @@ func (policy *clusteringCompactionPolicy) collectionIsClusteringCompacting(colle
 	tasks := triggers[latestTriggerID]
 	if len(tasks) > 0 {
 		cTasks := tasks
-		summary := summaryCompactionState(cTasks)
+		summary := summaryCompactionState(latestTriggerID, cTasks)
 		return summary.state == commonpb.CompactionState_Executing, cTasks[0].TriggerID
 	}
 	return false, 0

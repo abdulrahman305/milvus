@@ -125,6 +125,7 @@ type Segment struct {
 	Version            int64                             // Version is the timestamp of loading segment
 	LastDeltaTimestamp uint64                            // The timestamp of the last delta record
 	IndexInfo          map[int64]*querypb.FieldIndexInfo // index info of loaded segment, indexID -> FieldIndexInfo
+	JSONIndexField     []int64                           // json index info of loaded segment
 }
 
 func SegmentFromInfo(info *datapb.SegmentInfo) *Segment {
@@ -155,6 +156,12 @@ func (segment *Segment) Clone() *Segment {
 		Node:        segment.Node,
 		Version:     segment.Version,
 	}
+}
+
+type SegmentDistManagerInterface interface {
+	Update(nodeID typeutil.UniqueID, segments ...*Segment)
+	GetByFilter(filters ...SegmentDistFilter) []*Segment
+	GetSegmentDist(collectionID int64) []*metricsinfo.Segment
 }
 
 type SegmentDistManager struct {

@@ -24,30 +24,44 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 	"github.com/milvus-io/milvus/internal/util/function/models/vertexai"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type vertexAIJsonKey struct {
-	jsonKey []byte
-	once    sync.Once
-	initErr error
+	mu       sync.Mutex
+	filePath string
+	jsonKey  []byte
 }
 
 var vtxKey vertexAIJsonKey
 
 func getVertexAIJsonKey() ([]byte, error) {
-	vtxKey.once.Do(func() {
-		jsonKeyPath := os.Getenv(vertexServiceAccountJSONEnv)
-		jsonKey, err := os.ReadFile(jsonKeyPath)
-		if err != nil {
-			vtxKey.initErr = fmt.Errorf("Vertexai: read service account json file failed, %v", err)
-			return
-		}
-		vtxKey.jsonKey = jsonKey
-	})
-	return vtxKey.jsonKey, vtxKey.initErr
+	vtxKey.mu.Lock()
+	defer vtxKey.mu.Unlock()
+
+	jsonKeyPath := os.Getenv(vertexServiceAccountJSONEnv)
+	if jsonKeyPath == "" {
+		return nil, errors.New("VetexAI credentials file path is empty")
+	}
+	if vtxKey.filePath == jsonKeyPath {
+		return vtxKey.jsonKey, nil
+	}
+
+	jsonKey, err := os.ReadFile(jsonKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("Vertexai: read credentials file failed, %v", err)
+	}
+
+	vtxKey.jsonKey = jsonKey
+	vtxKey.filePath = jsonKeyPath
+
+	return vtxKey.jsonKey, nil
 }
 
 const (
@@ -68,16 +82,47 @@ type VertexAIEmbeddingProvider struct {
 	timeoutSec int64
 }
 
-func createVertexAIEmbeddingClient(url string) (*vertexai.VertexAIEmbedding, error) {
-	jsonKey, err := getVertexAIJsonKey()
-	if err != nil {
-		return nil, err
-	}
-	c := vertexai.NewVertexAIEmbedding(url, jsonKey, "https://www.googleapis.com/auth/cloud-platform", "")
+func createVertexAIEmbeddingClient(url string, credentialsJSON []byte) (*vertexai.VertexAIEmbedding, error) {
+	c := vertexai.NewVertexAIEmbedding(url, credentialsJSON, "https://www.googleapis.com/auth/cloud-platform", "")
 	return c, nil
 }
 
-func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, c *vertexai.VertexAIEmbedding) (*VertexAIEmbeddingProvider, error) {
+func parseGcpCredentialInfo(credentials *credentials.Credentials, params []*commonpb.KeyValuePair, confParams map[string]string) ([]byte, error) {
+	// function param > yaml > env
+	var credentialsJSON []byte
+	var err error
+
+	for _, param := range params {
+		switch strings.ToLower(param.Key) {
+		case credentialParamKey:
+			credentialName := param.Value
+			if credentialsJSON, err = credentials.GetGcpCredential(credentialName); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// from milvus.yaml
+	if credentialsJSON == nil {
+		credentialName := confParams[credentialParamKey]
+		if credentialName != "" {
+			if credentialsJSON, err = credentials.GetGcpCredential(credentialName); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// from env
+	if credentialsJSON == nil {
+		credentialsJSON, err = getVertexAIJsonKey()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return credentialsJSON, nil
+}
+
+func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, c *vertexai.VertexAIEmbedding, params map[string]string, credentials *credentials.Credentials) (*VertexAIEmbeddingProvider, error) {
 	fieldDim, err := typeutil.GetDim(fieldSchema)
 	if err != nil {
 		return nil, err
@@ -112,10 +157,17 @@ func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSch
 		location = "us-central1"
 	}
 
-	url := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:predict", location, projectID, location, modelName)
+	url := params["url"]
+	if url == "" {
+		url = fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:predict", location, projectID, location, modelName)
+	}
 	var client *vertexai.VertexAIEmbedding
 	if c == nil {
-		client, err = createVertexAIEmbeddingClient(url)
+		jsonKey, err := parseGcpCredentialInfo(credentials, functionSchema.Params, params)
+		if err != nil {
+			return nil, err
+		}
+		client, err = createVertexAIEmbeddingClient(url, jsonKey)
 		if err != nil {
 			return nil, err
 		}

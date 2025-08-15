@@ -27,7 +27,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type Scheduler interface {
@@ -52,53 +51,67 @@ func NewScheduler(manager TaskManager) Scheduler {
 
 func (s *scheduler) Start() {
 	log.Info("start import scheduler")
+
 	var (
 		exeTicker = time.NewTicker(1 * time.Second)
 		logTicker = time.NewTicker(10 * time.Minute)
 	)
 	defer exeTicker.Stop()
 	defer logTicker.Stop()
+
 	for {
 		select {
 		case <-s.closeChan:
 			log.Info("import scheduler exited")
 			return
 		case <-exeTicker.C:
-			tasks := s.manager.GetBy(WithStates(datapb.ImportTaskStateV2_Pending))
-			sort.Slice(tasks, func(i, j int) bool {
-				return tasks[i].GetTaskID() < tasks[j].GetTaskID()
-			})
-			futures := make(map[int64][]*conc.Future[any])
-			for _, task := range tasks {
-				fs := task.Execute()
-				futures[task.GetTaskID()] = fs
-				tryFreeFutures(futures)
-			}
-			for taskID, fs := range futures {
-				err := conc.AwaitAll(fs...)
-				if err != nil {
-					continue
-				}
-				s.manager.Update(taskID, UpdateState(datapb.ImportTaskStateV2_Completed))
-				log.Info("preimport/import done", zap.Int64("taskID", taskID))
-			}
+			s.scheduleTasks()
 		case <-logTicker.C:
 			LogStats(s.manager)
 		}
 	}
 }
 
+func (s *scheduler) scheduleTasks() {
+	tasks := s.manager.GetBy(WithStates(datapb.ImportTaskStateV2_Pending))
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].GetTaskID() < tasks[j].GetTaskID()
+	})
+
+	if len(tasks) == 0 {
+		return
+	}
+
+	taskIDs := lo.Map(tasks, func(t Task, _ int) int64 {
+		return t.GetTaskID()
+	})
+	log.Info("processing tasks...", zap.Int64s("taskIDs", taskIDs))
+
+	futures := make(map[int64][]*conc.Future[any])
+	for _, task := range tasks {
+		fs := task.Execute()
+		futures[task.GetTaskID()] = fs
+	}
+
+	for taskID, fs := range futures {
+		err := conc.AwaitAll(fs...)
+		if err != nil {
+			continue
+		}
+		s.manager.Update(taskID, UpdateState(datapb.ImportTaskStateV2_Completed))
+		log.Info("preimport/import done", zap.Int64("taskID", taskID))
+	}
+
+	log.Info("all tasks completed", zap.Int64s("taskIDs", taskIDs))
+}
+
+// Slots returns the used slots for import
 func (s *scheduler) Slots() int64 {
 	tasks := s.manager.GetBy(WithStates(datapb.ImportTaskStateV2_Pending, datapb.ImportTaskStateV2_InProgress))
 	used := lo.SumBy(tasks, func(t Task) int64 {
 		return t.GetSlots()
 	})
-	total := paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt64()
-	free := total - used
-	if free >= 0 {
-		return free
-	}
-	return 0
+	return used
 }
 
 func (s *scheduler) Close() {

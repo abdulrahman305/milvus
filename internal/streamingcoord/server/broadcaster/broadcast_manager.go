@@ -48,7 +48,6 @@ func newBroadcastTaskManager(protos []*streamingpb.BroadcastTask) (*broadcastTas
 		cond:         syncutil.NewContextCond(&sync.Mutex{}),
 		tasks:        tasks,
 		resourceKeys: rks,
-		version:      1,
 		metrics:      metrics,
 	}
 	m.SetLogger(logger)
@@ -61,7 +60,6 @@ type broadcastTaskManager struct {
 	cond         *syncutil.ContextCond
 	tasks        map[uint64]*broadcastTask      // map the broadcastID to the broadcastTaskState
 	resourceKeys map[message.ResourceKey]uint64 // map the resource key to the broadcastID
-	version      int                            // version is used to make sure that there's no update lost for watcher.
 	metrics      *broadcasterMetrics
 }
 
@@ -80,21 +78,6 @@ func (bm *broadcastTaskManager) AddTask(ctx context.Context, msg message.Broadca
 
 // assignID assigns the broadcast id to the message.
 func (bm *broadcastTaskManager) assignID(ctx context.Context, msg message.BroadcastMutableMessage) (message.BroadcastMutableMessage, error) {
-	// TODO: current implementation the header cannot be seen at flusher itself.
-	// only import message use it, so temporarily set the broadcast id here.
-	// need to refactor the message to make the broadcast header visible to flusher.
-	if msg.MessageType() == message.MessageTypeImport {
-		importMsg, err := message.AsMutableImportMessageV1(msg)
-		if err != nil {
-			return nil, err
-		}
-		body, err := importMsg.Body()
-		if err != nil {
-			return nil, err
-		}
-		return msg.WithBroadcastID(uint64(body.JobID)), nil
-	}
-
 	id, err := resource.Resource().IDAllocator().Allocate(ctx)
 	if err != nil {
 		return nil, errors.Wrapf(err, "allocate new id failed")

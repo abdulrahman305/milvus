@@ -564,16 +564,18 @@ TEST(Expr, TestArrayRange) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
-        auto new_bool_array_col = raw_data.get_col<ScalarArray>(bool_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
+        auto new_bool_array_col =
+            raw_data.get_col<ScalarFieldProto>(bool_array_fid);
         auto new_string_array_col =
-            raw_data.get_col<ScalarArray>(string_array_fid);
+            raw_data.get_col<ScalarFieldProto>(string_array_fid);
         auto new_float_array_col =
-            raw_data.get_col<ScalarArray>(float_array_fid);
+            raw_data.get_col<ScalarFieldProto>(float_array_fid);
 
         array_cols["long"].insert(array_cols["long"].end(),
                                   new_long_array_col.begin(),
@@ -603,7 +605,7 @@ TEST(Expr, TestArrayRange) {
         raw_plan.replace(loc, 4, clause);
         auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
         BitsetType final;
         final = ExecuteQueryExpr(
             plan->plan_node_->plannodes_->sources()[0]->sources()[0],
@@ -717,11 +719,12 @@ TEST(Expr, TestArrayEqual) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::vector<ScalarArray> long_array_col;
+    std::vector<ScalarFieldProto> long_array_col;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter, 0, 1, 3);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
         long_array_col.insert(long_array_col.end(),
                               new_long_array_col.begin(),
                               new_long_array_col.end());
@@ -740,7 +743,7 @@ TEST(Expr, TestArrayEqual) {
         raw_plan.replace(loc, 4, clause);
         auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
         BitsetType final;
         final = ExecuteQueryExpr(
             plan->plan_node_->plannodes_->sources()[0]->sources()[0],
@@ -820,13 +823,14 @@ TEST(Expr, TestArrayNullExpr) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::vector<ScalarArray> long_array_col;
+    std::vector<ScalarFieldProto> long_array_col;
     int num_iters = 1;
     FixedVector<bool> valid_data;
 
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter, 0, 1, 3);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
         long_array_col.insert(long_array_col.end(),
                               new_long_array_col.begin(),
                               new_long_array_col.end());
@@ -848,7 +852,7 @@ TEST(Expr, TestArrayNullExpr) {
         raw_plan.replace(loc, 4, clause);
         auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
         BitsetType final;
         final = ExecuteQueryExpr(
             plan->plan_node_->plannodes_->sources()[0]->sources()[0],
@@ -960,7 +964,7 @@ TEST(Expr, PraseArrayContainsExpr) {
                          DataType::INT64,
                          false);
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
     }
 }
 
@@ -989,19 +993,22 @@ TEST(Expr, TestArrayContains) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
-        auto new_int_array_col = raw_data.get_col<ScalarArray>(int_array_fid);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
-        auto new_bool_array_col = raw_data.get_col<ScalarArray>(bool_array_fid);
+        auto new_int_array_col =
+            raw_data.get_col<ScalarFieldProto>(int_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
+        auto new_bool_array_col =
+            raw_data.get_col<ScalarFieldProto>(bool_array_fid);
         auto new_float_array_col =
-            raw_data.get_col<ScalarArray>(float_array_fid);
+            raw_data.get_col<ScalarFieldProto>(float_array_fid);
         auto new_double_array_col =
-            raw_data.get_col<ScalarArray>(double_array_fid);
+            raw_data.get_col<ScalarFieldProto>(double_array_fid);
         auto new_string_array_col =
-            raw_data.get_col<ScalarArray>(string_array_fid);
+            raw_data.get_col<ScalarFieldProto>(string_array_fid);
 
         array_cols["int"].insert(array_cols["int"].end(),
                                  new_int_array_col.begin(),
@@ -1052,7 +1059,7 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(bool_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(bool_array_fid, DataType::ARRAY, DataType::BOOL),
             proto::plan::JSONContainsExpr_JSONOp_Contains,
             true,
             values);
@@ -1123,7 +1130,8 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(double_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(
+                double_array_fid, DataType::ARRAY, DataType::DOUBLE),
             proto::plan::JSONContainsExpr_JSONOp_Contains,
             true,
             values);
@@ -1184,7 +1192,7 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(float_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(float_array_fid, DataType::ARRAY, DataType::FLOAT),
             proto::plan::JSONContainsExpr_JSONOp_Contains,
             true,
             values);
@@ -1255,7 +1263,7 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(int_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(int_array_fid, DataType::ARRAY, DataType::INT8),
             proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
             true,
             values);
@@ -1317,7 +1325,7 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(long_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(long_array_fid, DataType::ARRAY, DataType::INT64),
             proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
             true,
             values);
@@ -1386,7 +1394,8 @@ TEST(Expr, TestArrayContains) {
         }
         auto start = std::chrono::steady_clock::now();
         auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
-            expr::ColumnInfo(string_array_fid, DataType::ARRAY),
+            expr::ColumnInfo(
+                string_array_fid, DataType::ARRAY, DataType::VARCHAR),
             proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
             true,
             values);
@@ -1430,6 +1439,73 @@ TEST(Expr, TestArrayContains) {
     }
 }
 
+TEST(Expr, TestArrayContainsEmptyValues) {
+    auto schema = std::make_shared<Schema>();
+    auto int_array_fid =
+        schema->AddDebugField("int_array", DataType::ARRAY, DataType::INT8);
+    auto long_array_fid =
+        schema->AddDebugField("long_array", DataType::ARRAY, DataType::INT64);
+    auto bool_array_fid =
+        schema->AddDebugField("bool_array", DataType::ARRAY, DataType::BOOL);
+    auto float_array_fid =
+        schema->AddDebugField("float_array", DataType::ARRAY, DataType::FLOAT);
+    auto double_array_fid = schema->AddDebugField(
+        "double_array", DataType::ARRAY, DataType::DOUBLE);
+    auto string_array_fid = schema->AddDebugField(
+        "string_array", DataType::ARRAY, DataType::VARCHAR);
+    schema->set_primary_field_id(schema->AddDebugField("id", DataType::INT64));
+    std::vector<FieldId> fields = {
+        int_array_fid,
+        long_array_fid,
+        bool_array_fid,
+        float_array_fid,
+        double_array_fid,
+        string_array_fid,
+    };
+
+    auto dummy_seg = CreateGrowingSegment(schema, empty_index_meta);
+
+    int N = 1000;
+    std::vector<int> age_col;
+    int num_iters = 100;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        dummy_seg->PreInsert(N);
+        dummy_seg->Insert(iter * N,
+                          N,
+                          raw_data.row_ids_.data(),
+                          raw_data.timestamps_.data(),
+                          raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(dummy_seg.get());
+    std::vector<proto::plan::GenericValue> empty_values;
+
+    for (auto field_id : fields) {
+        auto start = std::chrono::steady_clock::now();
+        auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
+            expr::ColumnInfo(field_id, DataType::ARRAY),
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            true,
+            empty_values);
+
+        BitsetType final;
+        auto plan =
+            std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+        for (int i = 0; i < N * num_iters; ++i) {
+            ASSERT_EQ(final[i], false);
+        }
+    }
+}
+
 TEST(Expr, TestArrayBinaryArith) {
     auto schema = std::make_shared<Schema>();
     auto i64_fid = schema->AddDebugField("id", DataType::INT64);
@@ -1445,16 +1521,18 @@ TEST(Expr, TestArrayBinaryArith) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
-        auto new_int_array_col = raw_data.get_col<ScalarArray>(int_array_fid);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
+        auto new_int_array_col =
+            raw_data.get_col<ScalarFieldProto>(int_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
         auto new_float_array_col =
-            raw_data.get_col<ScalarArray>(float_array_fid);
+            raw_data.get_col<ScalarFieldProto>(float_array_fid);
         auto new_double_array_col =
-            raw_data.get_col<ScalarArray>(double_array_fid);
+            raw_data.get_col<ScalarFieldProto>(double_array_fid);
 
         array_cols["int"].insert(array_cols["int"].end(),
                                  new_int_array_col.begin(),
@@ -2355,7 +2433,7 @@ TEST(Expr, TestArrayBinaryArith) {
         raw_plan.replace(loc, 4, clause);
         auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
         BitsetType final;
         final = ExecuteQueryExpr(
             plan->plan_node_->plannodes_->sources()[0]->sources()[0],
@@ -2410,12 +2488,12 @@ TEST(Expr, TestArrayStringMatch) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
         auto new_string_array_col =
-            raw_data.get_col<ScalarArray>(string_array_fid);
+            raw_data.get_col<ScalarFieldProto>(string_array_fid);
         array_cols["string"].insert(array_cols["string"].end(),
                                     new_string_array_col.begin(),
                                     new_string_array_col.end());
@@ -2514,16 +2592,18 @@ TEST(Expr, TestArrayInTerm) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
-        auto new_bool_array_col = raw_data.get_col<ScalarArray>(bool_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
+        auto new_bool_array_col =
+            raw_data.get_col<ScalarFieldProto>(bool_array_fid);
         auto new_float_array_col =
-            raw_data.get_col<ScalarArray>(float_array_fid);
+            raw_data.get_col<ScalarFieldProto>(float_array_fid);
         auto new_string_array_col =
-            raw_data.get_col<ScalarArray>(string_array_fid);
+            raw_data.get_col<ScalarFieldProto>(string_array_fid);
         array_cols["long"].insert(array_cols["long"].end(),
                                   new_long_array_col.begin(),
                                   new_long_array_col.end());
@@ -2685,7 +2765,7 @@ TEST(Expr, TestArrayInTerm) {
         raw_plan.replace(loc, 4, clause);
         auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
         auto plan =
-            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+            CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
         BitsetType final;
         final = ExecuteQueryExpr(
             plan->plan_node_->plannodes_->sources()[0]->sources()[0],
@@ -2731,11 +2811,12 @@ TEST(Expr, TestTermInArray) {
 
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
-    std::map<std::string, std::vector<ScalarArray>> array_cols;
+    std::map<std::string, std::vector<ScalarFieldProto>> array_cols;
     int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
-        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
+        auto new_long_array_col =
+            raw_data.get_col<ScalarFieldProto>(long_array_fid);
         array_cols["long"].insert(array_cols["long"].end(),
                                   new_long_array_col.begin(),
                                   new_long_array_col.end());

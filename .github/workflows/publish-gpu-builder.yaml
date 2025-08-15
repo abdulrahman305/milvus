@@ -15,6 +15,13 @@ on:
       - 'build/docker/builder/gpu/**'
       - '.github/workflows/publish-gpu-builder.yaml'
       - '!**.md'
+  workflow_dispatch:
+    inputs:
+      RunnerHost:
+        description: "Use this label for self-host runner"
+        required: true
+        type: string
+        default: "ubuntu-latest"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -22,28 +29,18 @@ concurrency:
 
 jobs:
   publish-gpu-builder:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 500
     env:
       OS: ubuntu22.04
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        if: ${{ ! startsWith(runner.name, 'self') }} # skip this step if it is self-hosted runner
-        with:
-          root-reserve-mb: 20480
-          # overprovision-lvm: 'true'
-          swap-size-mb: 1024
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
       - name: Checkout
         uses: actions/checkout@v2
       - name: Get version from system time after release step
         id: extracter
         run: |
-          echo "::set-output name=version::$(date +%Y%m%d)"
-          echo "::set-output name=sha_short::$(git rev-parse --short=7 HEAD)"
+          echo "version=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+          echo "sha_short=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5

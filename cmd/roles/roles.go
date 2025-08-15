@@ -35,7 +35,6 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/cmd/components"
-	"github.com/milvus-io/milvus/internal/coordinator/coordclient"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/http/healthz"
@@ -43,11 +42,11 @@ import (
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	internalmetrics "github.com/milvus-io/milvus/internal/util/metrics"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
 	"github.com/milvus-io/milvus/pkg/v2/config"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	rocksmqimpl "github.com/milvus-io/milvus/pkg/v2/mq/mqimpl/rocksmq/server"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper/nmq"
 	"github.com/milvus-io/milvus/pkg/v2/tracer"
 	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
@@ -71,8 +70,11 @@ func init() {
 	metrics.RegisterStorageMetrics(Registry.GoRegistry)
 }
 
-func stopRocksmq() {
-	rocksmqimpl.CloseRocksMQ()
+// stopRocksmqIfUsed closes the RocksMQ if it is used.
+func stopRocksmqIfUsed() {
+	if name := util.MustSelectWALName(); name == util.WALTypeRocksmq {
+		rocksmqimpl.CloseRocksMQ()
+	}
 }
 
 type component interface {
@@ -143,17 +145,17 @@ func runComponent[T component](ctx context.Context,
 
 // MilvusRoles decides which components are brought up with Milvus.
 type MilvusRoles struct {
-	EnableRootCoord     bool `env:"ENABLE_ROOT_COORD"`
 	EnableProxy         bool `env:"ENABLE_PROXY"`
-	EnableQueryCoord    bool `env:"ENABLE_QUERY_COORD"`
+	EnableMixCoord      bool `env:"ENABLE_ROOT_COORD"`
 	EnableQueryNode     bool `env:"ENABLE_QUERY_NODE"`
-	EnableDataCoord     bool `env:"ENABLE_DATA_COORD"`
 	EnableDataNode      bool `env:"ENABLE_DATA_NODE"`
 	EnableStreamingNode bool `env:"ENABLE_STREAMING_NODE"`
-
-	Local    bool
-	Alias    string
-	Embedded bool
+	EnableRootCoord     bool `env:"ENABLE_ROOT_COORD"`
+	EnableQueryCoord    bool `env:"ENABLE_QUERY_COORD"`
+	EnableDataCoord     bool `env:"ENABLE_DATA_COORD"`
+	Local               bool
+	Alias               string
+	Embedded            bool
 
 	ServerType string
 
@@ -177,19 +179,14 @@ func (mr *MilvusRoles) printLDPreLoad() {
 	}
 }
 
-func (mr *MilvusRoles) runRootCoord(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
-	wg.Add(1)
-	return runComponent(ctx, localMsg, wg, components.NewRootCoord, metrics.RegisterRootCoord)
-}
-
 func (mr *MilvusRoles) runProxy(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
 	wg.Add(1)
 	return runComponent(ctx, localMsg, wg, components.NewProxy, metrics.RegisterProxy)
 }
 
-func (mr *MilvusRoles) runQueryCoord(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
+func (mr *MilvusRoles) runMixCoord(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
 	wg.Add(1)
-	return runComponent(ctx, localMsg, wg, components.NewQueryCoord, metrics.RegisterQueryCoord)
+	return runComponent(ctx, localMsg, wg, components.NewMixCoord, metrics.RegisterMixCoord)
 }
 
 func (mr *MilvusRoles) runQueryNode(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
@@ -207,11 +204,6 @@ func (mr *MilvusRoles) runQueryNode(ctx context.Context, localMsg bool, wg *sync
 	cleanLocalDir(TmpTextLogPrefix)
 
 	return runComponent(ctx, localMsg, wg, components.NewQueryNode, metrics.RegisterQueryNode)
-}
-
-func (mr *MilvusRoles) runDataCoord(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
-	wg.Add(1)
-	return runComponent(ctx, localMsg, wg, components.NewDataCoord, metrics.RegisterDataCoord)
 }
 
 func (mr *MilvusRoles) runStreamingNode(ctx context.Context, localMsg bool, wg *sync.WaitGroup) component {
@@ -326,9 +318,6 @@ func (mr *MilvusRoles) Run() {
 	thw.Start()
 	defer thw.Stop()
 
-	internalmetrics.InitHolmes()
-	defer internalmetrics.CloseHolmes()
-
 	// only standalone enable localMsg
 	if mr.Local {
 		if err := os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode); err != nil {
@@ -343,13 +332,6 @@ func (mr *MilvusRoles) Run() {
 		}
 
 		params := paramtable.Get()
-		if paramtable.Get().RocksmqEnable() {
-			defer stopRocksmq()
-		} else if paramtable.Get().NatsmqEnable() {
-			defer nmq.CloseNatsMQ()
-		} else {
-			panic("only support Rocksmq and Natsmq in standalone mode")
-		}
 		if params.EtcdCfg.UseEmbedEtcd.GetAsBool() {
 			// Start etcd server.
 			etcd.InitEtcdServer(
@@ -361,6 +343,7 @@ func (mr *MilvusRoles) Run() {
 			defer etcd.StopEtcdServer()
 		}
 		paramtable.SetRole(typeutil.StandaloneRole)
+		defer stopRocksmqIfUsed()
 	} else {
 		if err := os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.ClusterDeployMode); err != nil {
 			log.Error("Failed to set deploy mode: ", zap.Error(err))
@@ -369,28 +352,29 @@ func (mr *MilvusRoles) Run() {
 		paramtable.SetRole(mr.ServerType)
 	}
 
+	internalmetrics.InitHolmes()
+	defer internalmetrics.CloseHolmes()
+
 	// init tracer before run any component
 	tracer.Init()
 
 	// Initialize streaming service if enabled.
-	streaming.Init()
-	defer streaming.Release()
 
-	coordclient.EnableLocalClientRole(&coordclient.LocalClientRoleConfig{
-		ServerType:       mr.ServerType,
-		EnableQueryCoord: mr.EnableQueryCoord,
-		EnableDataCoord:  mr.EnableDataCoord,
-		EnableRootCoord:  mr.EnableRootCoord,
-	})
+	if mr.ServerType == typeutil.StandaloneRole || !mr.EnableDataNode {
+		// only datanode does not init streaming service
+		streaming.Init()
+		defer streaming.Release()
+	}
 
 	enableComponents := []bool{
-		mr.EnableRootCoord,
 		mr.EnableProxy,
-		mr.EnableQueryCoord,
 		mr.EnableQueryNode,
-		mr.EnableDataCoord,
 		mr.EnableDataNode,
 		mr.EnableStreamingNode,
+		mr.EnableMixCoord,
+		mr.EnableRootCoord,
+		mr.EnableQueryCoord,
+		mr.EnableDataCoord,
 	}
 	enableComponents = lo.Filter(enableComponents, func(v bool, _ int) bool {
 		return v
@@ -419,49 +403,38 @@ func (mr *MilvusRoles) Run() {
 	local := mr.Local
 
 	componentMap := make(map[string]component)
-	var rootCoord, queryCoord, dataCoord component
+	var mixCoord component
 	var proxy, dataNode, queryNode, streamingNode component
-	if mr.EnableRootCoord {
-		rootCoord = mr.runRootCoord(ctx, local, &wg)
-		componentMap[typeutil.RootCoordRole] = rootCoord
-		paramtable.SetLocalComponentEnabled(typeutil.RootCoordRole)
-	}
 
-	if mr.EnableDataCoord {
-		dataCoord = mr.runDataCoord(ctx, local, &wg)
-		componentMap[typeutil.DataCoordRole] = dataCoord
-		paramtable.SetLocalComponentEnabled(typeutil.DataCoordRole)
-	}
-
-	if mr.EnableQueryCoord {
-		queryCoord = mr.runQueryCoord(ctx, local, &wg)
-		componentMap[typeutil.QueryCoordRole] = queryCoord
-		paramtable.SetLocalComponentEnabled(typeutil.QueryCoordRole)
+	if (mr.EnableRootCoord && mr.EnableDataCoord && mr.EnableQueryCoord) || mr.EnableMixCoord {
+		paramtable.SetLocalComponentEnabled(typeutil.MixCoordRole)
+		mixCoord = mr.runMixCoord(ctx, local, &wg)
+		componentMap[typeutil.MixCoordRole] = mixCoord
 	}
 
 	if mr.EnableQueryNode {
+		paramtable.SetLocalComponentEnabled(typeutil.QueryNodeRole)
 		queryNode = mr.runQueryNode(ctx, local, &wg)
 		componentMap[typeutil.QueryNodeRole] = queryNode
-		paramtable.SetLocalComponentEnabled(typeutil.QueryNodeRole)
 	}
 
 	if mr.EnableDataNode {
+		paramtable.SetLocalComponentEnabled(typeutil.DataNodeRole)
 		dataNode = mr.runDataNode(ctx, local, &wg)
 		componentMap[typeutil.DataNodeRole] = dataNode
-		paramtable.SetLocalComponentEnabled(typeutil.DataNodeRole)
 	}
 
 	if mr.EnableProxy {
+		paramtable.SetLocalComponentEnabled(typeutil.ProxyRole)
 		proxy = mr.runProxy(ctx, local, &wg)
 		componentMap[typeutil.ProxyRole] = proxy
-		paramtable.SetLocalComponentEnabled(typeutil.ProxyRole)
 	}
 
 	if mr.EnableStreamingNode {
 		// Before initializing the local streaming node, make sure the local registry is ready.
+		paramtable.SetLocalComponentEnabled(typeutil.StreamingNodeRole)
 		streamingNode = mr.runStreamingNode(ctx, local, &wg)
 		componentMap[typeutil.StreamingNodeRole] = streamingNode
-		paramtable.SetLocalComponentEnabled(typeutil.StreamingNodeRole)
 	}
 
 	wg.Wait()
@@ -523,7 +496,7 @@ func (mr *MilvusRoles) Run() {
 	<-mr.closed
 
 	// stop coordinators first
-	coordinators := []component{rootCoord, dataCoord, queryCoord}
+	coordinators := []component{mixCoord}
 	for idx, coord := range coordinators {
 		log.Warn("stop processing")
 		if coord != nil {
@@ -534,13 +507,22 @@ func (mr *MilvusRoles) Run() {
 	log.Info("All coordinators have stopped")
 
 	// stop nodes
-	nodes := []component{queryNode, dataNode, streamingNode}
-	for idx, node := range nodes {
+	nodes := []component{streamingNode, queryNode, dataNode}
+	stopNodeWG := &sync.WaitGroup{}
+	for _, node := range nodes {
 		if node != nil {
-			log.Info("stop node", zap.Int("idx", idx), zap.Any("node", node))
-			node.Stop()
+			stopNodeWG.Add(1)
+			go func() {
+				defer func() {
+					stopNodeWG.Done()
+					log.Info("stop node done", zap.Any("node", node))
+				}()
+				log.Info("stop node...", zap.Any("node", node))
+				node.Stop()
+			}()
 		}
 	}
+	stopNodeWG.Wait()
 	log.Info("All nodes have stopped")
 
 	if proxy != nil {
@@ -556,20 +538,14 @@ func (mr *MilvusRoles) Run() {
 
 func (mr *MilvusRoles) GetRoles() []string {
 	roles := make([]string, 0)
-	if mr.EnableRootCoord {
-		roles = append(roles, typeutil.RootCoordRole)
+	if mr.EnableMixCoord {
+		roles = append(roles, typeutil.MixCoordRole)
 	}
 	if mr.EnableProxy {
 		roles = append(roles, typeutil.ProxyRole)
 	}
-	if mr.EnableQueryCoord {
-		roles = append(roles, typeutil.QueryCoordRole)
-	}
 	if mr.EnableQueryNode {
 		roles = append(roles, typeutil.QueryNodeRole)
-	}
-	if mr.EnableDataCoord {
-		roles = append(roles, typeutil.DataCoordRole)
 	}
 	if mr.EnableDataNode {
 		roles = append(roles, typeutil.DataNodeRole)

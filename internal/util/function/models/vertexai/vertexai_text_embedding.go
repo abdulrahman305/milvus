@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"golang.org/x/oauth2/google"
 
 	"github.com/milvus-io/milvus/internal/util/function/models/utils"
@@ -89,13 +90,13 @@ func NewVertexAIEmbedding(url string, jsonKey []byte, scopes string, token strin
 
 func (c *VertexAIEmbedding) Check() error {
 	if c.url == "" {
-		return fmt.Errorf("VertexAI embedding url is empty")
+		return errors.New("VertexAI embedding url is empty")
 	}
 	if len(c.jsonKey) == 0 {
-		return fmt.Errorf("jsonKey is empty")
+		return errors.New("jsonKey is empty")
 	}
 	if c.scopes == "" {
-		return fmt.Errorf("Scopes param is empty")
+		return errors.New("Scopes param is empty")
 	}
 	return nil
 }
@@ -147,7 +148,7 @@ func (c *VertexAIEmbedding) Embedding(modelName string, texts []string, dim int6
 		"Content-Type":  "application/json",
 		"Authorization": fmt.Sprintf("Bearer %s", token),
 	}
-	body, err := utils.RetrySend(ctx, data, http.MethodPost, c.url, headers, 3, 1)
+	body, err := utils.RetrySend(ctx, data, http.MethodPost, c.url, headers, 3)
 	if err != nil {
 		return nil, err
 	}

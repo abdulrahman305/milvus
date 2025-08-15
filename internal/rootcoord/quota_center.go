@@ -33,6 +33,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
@@ -45,6 +46,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/ratelimitutil"
@@ -112,6 +114,7 @@ var dqlRateTypes = typeutil.NewSet(
 type LimiterRange struct {
 	RateScope        internalpb.RateScope
 	OpType           opType
+	IncludeRateTypes typeutil.Set[internalpb.RateType]
 	ExcludeRateTypes typeutil.Set[internalpb.RateType]
 }
 
@@ -138,17 +141,18 @@ type QuotaCenter struct {
 	cancel context.CancelFunc
 
 	// clients
-	proxies    proxyutil.ProxyClientManagerInterface
-	queryCoord types.QueryCoordClient
-	dataCoord  types.DataCoordClient
-	meta       IMetaTable
+	proxies  proxyutil.ProxyClientManagerInterface
+	mixCoord types.MixCoord
+	meta     IMetaTable
+
+	lock sync.RWMutex
 
 	// metrics
 	queryNodeMetrics map[UniqueID]*metricsinfo.QueryNodeQuotaMetrics
 	dataNodeMetrics  map[UniqueID]*metricsinfo.DataNodeQuotaMetrics
 	proxyMetrics     map[UniqueID]*metricsinfo.ProxyQuotaMetrics
-	diskMu           sync.Mutex // guards dataCoordMetrics and totalBinlogSize
 	dataCoordMetrics *metricsinfo.DataCoordQuotaMetrics
+	diskMu           sync.Mutex // guards dataCoordMetrics and totalBinlogSize
 	totalBinlogSize  int64
 
 	readableCollections map[int64]map[int64][]int64            // db id -> collection id -> partition id
@@ -172,8 +176,7 @@ type QuotaCenter struct {
 }
 
 // NewQuotaCenter returns a new QuotaCenter.
-func NewQuotaCenter(proxies proxyutil.ProxyClientManagerInterface, queryCoord types.QueryCoordClient,
-	dataCoord types.DataCoordClient, tsoAllocator tso.Allocator, meta IMetaTable,
+func NewQuotaCenter(proxies proxyutil.ProxyClientManagerInterface, mixCoord types.MixCoord, tsoAllocator tso.Allocator, meta IMetaTable,
 ) *QuotaCenter {
 	ctx, cancel := context.WithCancel(context.TODO())
 
@@ -181,8 +184,8 @@ func NewQuotaCenter(proxies proxyutil.ProxyClientManagerInterface, queryCoord ty
 		ctx:                  ctx,
 		cancel:               cancel,
 		proxies:              proxies,
-		queryCoord:           queryCoord,
-		dataCoord:            dataCoord,
+		lock:                 sync.RWMutex{},
+		mixCoord:             mixCoord,
 		tsoAllocator:         tsoAllocator,
 		meta:                 meta,
 		readableCollections:  make(map[int64]map[int64][]int64, 0),
@@ -235,8 +238,14 @@ func updateLimiter(node *rlinternal.RateLimiterNode, limiter *ratelimitutil.Limi
 		return
 	}
 	limiters := node.GetLimiters()
-	getRateTypes(limiterRange.RateScope, limiterRange.OpType).
-		Complement(limiterRange.ExcludeRateTypes).Range(func(rt internalpb.RateType) bool {
+	rateTypes := getRateTypes(limiterRange.RateScope, limiterRange.OpType)
+	if limiterRange.IncludeRateTypes.Len() > 0 {
+		rateTypes = rateTypes.Intersection(limiterRange.IncludeRateTypes)
+	}
+	if limiterRange.ExcludeRateTypes.Len() > 0 {
+		rateTypes = rateTypes.Complement(limiterRange.ExcludeRateTypes)
+	}
+	rateTypes.Range(func(rt internalpb.RateType) bool {
 		originLimiter, ok := limiters.Get(rt)
 		if !ok {
 			log.Warn("update limiter failed, limiter not found",
@@ -288,6 +297,10 @@ func (q *QuotaCenter) Start() {
 
 func (q *QuotaCenter) watchQuotaAndLimit() {
 	pt := paramtable.Get()
+	metrics.QueryNodeMemoryHighWaterLevel.Set(pt.QuotaConfig.QueryNodeMemoryHighWaterLevel.GetAsFloat())
+	metrics.DiskQuota.WithLabelValues(paramtable.GetStringNodeID(), "cluster").Set(pt.QuotaConfig.DiskQuota.GetAsFloat())
+	metrics.DiskQuota.WithLabelValues(paramtable.GetStringNodeID(), "db").Set(pt.QuotaConfig.DiskQuotaPerDB.GetAsFloat())
+	metrics.DiskQuota.WithLabelValues(paramtable.GetStringNodeID(), "collection").Set(pt.QuotaConfig.DiskQuotaPerCollection.GetAsFloat())
 	pt.Watch(pt.QuotaConfig.QueryNodeMemoryHighWaterLevel.Key, config.NewHandler(pt.QuotaConfig.QueryNodeMemoryHighWaterLevel.Key, func(event *config.Event) {
 		metrics.QueryNodeMemoryHighWaterLevel.Set(pt.QuotaConfig.QueryNodeMemoryHighWaterLevel.GetAsFloat())
 	}))
@@ -380,6 +393,9 @@ func SplitCollectionKey(key string) (dbID int64, collectionName string) {
 
 // collectMetrics sends GetMetrics requests to DataCoord and QueryCoord to sync the metrics in DataNodes and QueryNodes.
 func (q *QuotaCenter) collectMetrics() error {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
 	oldDataNodes := typeutil.NewSet(lo.Keys(q.dataNodeMetrics)...)
 	oldQueryNodes := typeutil.NewSet(lo.Keys(q.queryNodeMetrics)...)
 	q.clearMetrics()
@@ -391,7 +407,7 @@ func (q *QuotaCenter) collectMetrics() error {
 
 	// get Query cluster metrics
 	group.Go(func() error {
-		queryCoordTopology, err := getQueryCoordMetrics(ctx, q.queryCoord)
+		queryCoordTopology, err := getQueryCoordMetrics(ctx, q.mixCoord)
 		if err != nil {
 			return err
 		}
@@ -427,7 +443,7 @@ func (q *QuotaCenter) collectMetrics() error {
 			q.collectionIDToDBID.Insert(collectionID, coll.DBID)
 			q.collections.Insert(FormatCollectionKey(coll.DBID, coll.Name), collectionID)
 			if numEntity, ok := numEntitiesLoaded[collectionID]; ok {
-				metrics.RootCoordNumEntities.WithLabelValues(coll.Name, metrics.LoadedLabel).Set(float64(numEntity))
+				metrics.RootCoordNumEntities.WithLabelValues(coll.DBName, coll.Name, metrics.LoadedLabel).Set(float64(numEntity))
 			}
 			return true
 		})
@@ -436,7 +452,7 @@ func (q *QuotaCenter) collectMetrics() error {
 	})
 	// get Data cluster metrics
 	group.Go(func() error {
-		dataCoordTopology, err := getDataCoordMetrics(ctx, q.dataCoord)
+		dataCoordTopology, err := getDataCoordMetrics(ctx, q.mixCoord)
 		if err != nil {
 			return err
 		}
@@ -487,7 +503,7 @@ func (q *QuotaCenter) collectMetrics() error {
 				return true
 			}
 			if datacoordCollectionMetric, ok := collectionMetrics[collectionID]; ok {
-				metrics.RootCoordNumEntities.WithLabelValues(coll.Name, metrics.TotalLabel).Set(float64(datacoordCollectionMetric.NumEntitiesTotal))
+				metrics.RootCoordNumEntities.WithLabelValues(coll.DBName, coll.Name, metrics.TotalLabel).Set(float64(datacoordCollectionMetric.NumEntitiesTotal))
 				fields := lo.KeyBy(coll.Fields, func(v *model.Field) int64 { return v.FieldID })
 				for _, indexInfo := range datacoordCollectionMetric.IndexInfo {
 					if _, ok := fields[indexInfo.FieldID]; !ok {
@@ -495,6 +511,7 @@ func (q *QuotaCenter) collectMetrics() error {
 					}
 					field := fields[indexInfo.FieldID]
 					metrics.RootCoordIndexedNumEntities.WithLabelValues(
+						coll.DBName,
 						coll.Name,
 						indexInfo.IndexName,
 						strconv.FormatBool(typeutil.IsVectorType(field.DataType))).Set(float64(indexInfo.NumEntitiesIndexed))
@@ -553,8 +570,57 @@ func (q *QuotaCenter) collectMetrics() error {
 	}
 	for oldQN := range oldQueryNodes {
 		metrics.RootCoordTtDelay.DeleteLabelValues(typeutil.QueryNodeRole, strconv.FormatInt(oldQN, 10))
+		metrics.RootCoordTtDelay.DeleteLabelValues(typeutil.StreamingNodeRole, strconv.FormatInt(oldQN, 10))
 	}
 	return nil
+}
+
+func getDbPropertyWithAction(db *model.Database, property string, actionFunc func(bool)) {
+	if db == nil || property == "" || actionFunc == nil {
+		return
+	}
+	if v := db.GetProperty(property); v != "" {
+		if dbForceDenyDDLEnabled, err := strconv.ParseBool(v); err == nil {
+			actionFunc(dbForceDenyDDLEnabled)
+		} else {
+			log.Warn("invalid configuration for database force deny DDL",
+				zap.String("config item", property),
+				zap.String("config value", v))
+		}
+	}
+}
+
+func (q *QuotaCenter) calculateDBDDLRates() {
+	dbs, err := q.meta.ListDatabases(q.ctx, typeutil.MaxTimestamp)
+	if err != nil {
+		log.Warn("get databases failed", zap.Error(err))
+		return
+	}
+	for _, db := range dbs {
+		dbDDLKeysWithRatesType := map[string]typeutil.Set[internalpb.RateType]{
+			common.DatabaseForceDenyDDLKey:           ddlRateTypes,
+			common.DatabaseForceDenyCollectionDDLKey: typeutil.NewSet(internalpb.RateType_DDLCollection),
+			common.DatabaseForceDenyPartitionDDLKey:  typeutil.NewSet(internalpb.RateType_DDLPartition),
+			common.DatabaseForceDenyIndexDDLKey:      typeutil.NewSet(internalpb.RateType_DDLIndex),
+			common.DatabaseForceDenyFlushDDLKey:      typeutil.NewSet(internalpb.RateType_DDLFlush),
+			common.DatabaseForceDenyCompactionDDLKey: typeutil.NewSet(internalpb.RateType_DDLCompaction),
+		}
+
+		for ddlKey, rateTypes := range dbDDLKeysWithRatesType {
+			getDbPropertyWithAction(db, ddlKey, func(enabled bool) {
+				if enabled {
+					dbLimiters := q.rateLimiter.GetOrCreateDatabaseLimiters(db.ID,
+						newParamLimiterFunc(internalpb.RateScope_Database, allOps))
+					updateLimiter(dbLimiters, GetEarliestLimiter(), &LimiterRange{
+						RateScope:        internalpb.RateScope_Database,
+						OpType:           ddl,
+						IncludeRateTypes: rateTypes,
+					})
+					dbLimiters.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToDDL, commonpb.ErrorCode_ForceDeny)
+				}
+			})
+		}
+	}
 }
 
 // forceDenyWriting sets dml rates to 0 to reject all dml requests.
@@ -855,9 +921,11 @@ func (q *QuotaCenter) calculateWriteRates() error {
 			internalpb.RateType_DMLUpsert, collectionLimiter)
 		q.guaranteeMinRate(getCollectionRateLimitConfig(collectionProps, common.CollectionDeleteRateMinKey),
 			internalpb.RateType_DMLDelete, collectionLimiter)
-		log.RatedDebug(10, "QuotaCenter cool write rates off done",
-			zap.Int64("collectionID", collection),
-			zap.Float64("factor", factor))
+		if factor < 1.0 {
+			log.RatedDebug(10, "QuotaCenter cool write rates off done",
+				zap.Int64("collectionID", collection),
+				zap.Float64("factor", factor))
+		}
 	}
 
 	if len(ttCollections) > 0 {
@@ -906,6 +974,24 @@ func (q *QuotaCenter) getTimeTickDelayFactor(ts Timestamp) map[int64]float64 {
 			updateCollectionDelay(delay, metric.Effect.CollectionIDs)
 			metrics.RootCoordTtDelay.WithLabelValues(typeutil.QueryNodeRole, strconv.FormatInt(nodeID, 10)).Set(float64(delay.Milliseconds()))
 		}
+		if metric.StreamingQuota != nil {
+			// If the query node is embedded in streaming node,
+			// we also need to use the wal's metrics to calculate the delay.
+			var maxDelay time.Duration
+			for _, wal := range metric.StreamingQuota.WALs {
+				t2, _ := tsoutil.ParseTS(wal.RecoveryTimeTick)
+				delay := t1.Sub(t2)
+				if maxDelay < delay {
+					maxDelay = delay
+				}
+				// Update all collections work on this pchannel.
+				pchannelInfo := channel.StaticPChannelStatsManager.MustGet().GetPChannelStats(wal.Channel)
+				updateCollectionDelay(delay, pchannelInfo.CollectionIDs())
+			}
+			if maxDelay > 0 {
+				metrics.RootCoordTtDelay.WithLabelValues(typeutil.StreamingNodeRole, strconv.FormatInt(nodeID, 10)).Set(float64(maxDelay.Milliseconds()))
+			}
+		}
 	}
 	for nodeID, metric := range q.dataNodeMetrics {
 		if metric.Fgm.NumFlowGraph > 0 && metric.Fgm.MinFlowGraphChannel != "" {
@@ -931,16 +1017,17 @@ func (q *QuotaCenter) getTimeTickDelayFactor(ts Timestamp) map[int64]float64 {
 			continue
 		}
 		factor := float64(maxDelay.Nanoseconds()-curMaxDelay.Nanoseconds()) / float64(maxDelay.Nanoseconds())
-		if factor <= 0.9 {
+		if factor <= 0.95 {
 			log.RatedWarn(10, "QuotaCenter: limit writing due to long timeTick delay",
 				zap.Int64("collectionID", collectionID),
 				zap.Time("curTs", t1),
 				zap.Duration("delay", curMaxDelay),
 				zap.Duration("MaxDelay", maxDelay),
 				zap.Float64("factor", factor))
+			collectionFactor[collectionID] = factor
+			continue
 		}
-
-		collectionFactor[collectionID] = factor
+		collectionFactor[collectionID] = 1.0
 	}
 
 	return collectionFactor
@@ -1176,6 +1263,8 @@ func (q *QuotaCenter) calculateRates() error {
 		return err
 	}
 
+	q.calculateDBDDLRates()
+
 	// log.Debug("QuotaCenter calculates rate done", zap.Any("rates", q.currentRates))
 	return nil
 }
@@ -1221,8 +1310,8 @@ func (q *QuotaCenter) resetAllCurrentRates() error {
 			}
 		}
 	}
-	initLimiters(q.readableCollections)
-	initLimiters(q.writableCollections)
+	partitions := q.meta.ListAllAvailPartitions(q.ctx)
+	initLimiters(partitions)
 	return nil
 }
 
@@ -1535,4 +1624,28 @@ func (q *QuotaCenter) diskAllowance(collection UniqueID) float64 {
 	}
 	allowance = math.Min(allowance, totalDiskQuota-float64(q.totalBinlogSize))
 	return allowance
+}
+
+func (q *QuotaCenter) getQuotaMetrics() *internalpb.GetQuotaMetricsResponse {
+	q.lock.RLock()
+	defer q.lock.RUnlock()
+
+	quotaCenterMetrics := &metricsinfo.QuotaCenterMetrics{
+		QueryNodeMetrics: q.queryNodeMetrics,
+		DataNodeMetrics:  q.dataNodeMetrics,
+		ProxyMetrics:     q.proxyMetrics,
+		DataCoordMetrics: q.dataCoordMetrics,
+	}
+
+	responseString, err := metricsinfo.MarshalComponentInfos(quotaCenterMetrics)
+	if err != nil {
+		log.Warn("failed to marshal quota center metrics", zap.Error(err))
+		return &internalpb.GetQuotaMetricsResponse{
+			Status: merr.Status(err),
+		}
+	}
+	return &internalpb.GetQuotaMetricsResponse{
+		Status:      merr.Status(nil),
+		MetricsInfo: responseString,
+	}
 }

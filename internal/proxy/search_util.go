@@ -15,6 +15,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -79,7 +80,6 @@ func (r *rankParams) String() string {
 type SearchInfo struct {
 	planInfo     *planpb.QueryInfo
 	offset       int64
-	parseError   error
 	isIterator   bool
 	collectionID int64
 }
@@ -120,14 +120,14 @@ func parseSearchIteratorV2Info(searchParamsPair []*commonpb.KeyValuePair, groupB
 	} else {
 		// Validate existing token is a valid UUID
 		if _, err := uuid.Parse(token); err != nil {
-			return nil, fmt.Errorf("invalid token format")
+			return nil, errors.New("invalid token format")
 		}
 	}
 
 	// parse batch size, required non-zero value
 	batchSizeStr, _ := funcutil.GetAttrByKeyFromRepeatedKV(SearchIterBatchSizeKey, searchParamsPair)
 	if batchSizeStr == "" {
-		return nil, fmt.Errorf("batch size is required")
+		return nil, errors.New("batch size is required")
 	}
 	batchSize, err := strconv.ParseInt(batchSizeStr, 0, 64)
 	if err != nil {
@@ -160,21 +160,21 @@ func parseSearchIteratorV2Info(searchParamsPair []*commonpb.KeyValuePair, groupB
 }
 
 // parseSearchInfo returns QueryInfo and offset
-func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb.CollectionSchema, rankParams *rankParams) *SearchInfo {
+func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb.CollectionSchema, rankParams *rankParams) (*SearchInfo, error) {
 	var topK int64
 	isAdvanced := rankParams != nil
 	externalLimit := rankParams.GetLimit() + rankParams.GetOffset()
 	topKStr, err := funcutil.GetAttrByKeyFromRepeatedKV(TopKKey, searchParamsPair)
 	if err != nil {
 		if externalLimit <= 0 {
-			return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s is required", TopKKey)}
+			return nil, fmt.Errorf("%s is required", TopKKey)
 		}
 		topK = externalLimit
 	} else {
 		topKInParam, err := strconv.ParseInt(topKStr, 0, 64)
 		if err != nil {
 			if externalLimit <= 0 {
-				return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%s] is invalid", TopKKey, topKStr)}
+				return nil, fmt.Errorf("%s [%s] is invalid", TopKKey, topKStr)
 			}
 			topK = externalLimit
 		} else {
@@ -194,7 +194,7 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 			// 2. GetAsInt64 has cached inside, no need to worry about cpu cost for parsing here
 			topK = Params.QuotaConfig.TopKLimit.GetAsInt64()
 		} else {
-			return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%d] is invalid, %w", TopKKey, topK, err)}
+			return nil, fmt.Errorf("%s [%d] is invalid, %w", TopKKey, topK, err)
 		}
 	}
 
@@ -205,12 +205,12 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 		if err == nil {
 			offset, err = strconv.ParseInt(offsetStr, 0, 64)
 			if err != nil {
-				return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%s] is invalid", OffsetKey, offsetStr)}
+				return nil, fmt.Errorf("%s [%s] is invalid", OffsetKey, offsetStr)
 			}
 
 			if offset != 0 {
 				if err := validateLimit(offset); err != nil {
-					return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%d] is invalid, %w", OffsetKey, offset, err)}
+					return nil, fmt.Errorf("%s [%d] is invalid, %w", OffsetKey, offset, err)
 				}
 			}
 		}
@@ -218,7 +218,7 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 
 	queryTopK := topK + offset
 	if err := validateLimit(queryTopK); err != nil {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s+%s [%d] is invalid, %w", OffsetKey, TopKKey, queryTopK, err)}
+		return nil, fmt.Errorf("%s+%s [%d] is invalid, %w", OffsetKey, TopKKey, queryTopK, err)
 	}
 
 	// 2. parse metrics type
@@ -240,15 +240,15 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 
 	roundDecimal, err := strconv.ParseInt(roundDecimalStr, 0, 64)
 	if err != nil {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%s] is invalid, should be -1 or an integer in range [0, 6]", RoundDecimalKey, roundDecimalStr)}
+		return nil, fmt.Errorf("%s [%s] is invalid, should be -1 or an integer in range [0, 6]", RoundDecimalKey, roundDecimalStr)
 	}
 
 	if roundDecimal != -1 && (roundDecimal > 6 || roundDecimal < 0) {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("%s [%s] is invalid, should be -1 or an integer in range [0, 6]", RoundDecimalKey, roundDecimalStr)}
+		return nil, fmt.Errorf("%s [%s] is invalid, should be -1 or an integer in range [0, 6]", RoundDecimalKey, roundDecimalStr)
 	}
 
 	// 4. parse search param str
-	searchParamStr, err := funcutil.GetAttrByKeyFromRepeatedKV(SearchParamsKey, searchParamsPair)
+	searchParamStr, err := funcutil.GetAttrByKeyFromRepeatedKV(ParamsKey, searchParamsPair)
 	if err != nil {
 		searchParamStr = ""
 	}
@@ -259,26 +259,26 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 	if isAdvanced {
 		groupByFieldId, groupSize, strictGroupSize = rankParams.GetGroupByFieldId(), rankParams.GetGroupSize(), rankParams.GetStrictGroupSize()
 	} else {
-		groupByInfo := parseGroupByInfo(searchParamsPair, schema)
-		if groupByInfo.err != nil {
-			return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: groupByInfo.err}
+		groupByInfo, err := parseGroupByInfo(searchParamsPair, schema)
+		if err != nil {
+			return nil, err
 		}
 		groupByFieldId, groupSize, strictGroupSize = groupByInfo.GetGroupByFieldId(), groupByInfo.GetGroupSize(), groupByInfo.GetStrictGroupSize()
 	}
 
 	// 6. parse iterator tag, prevent trying to groupBy when doing iteration or doing range-search
 	if isIterator && groupByFieldId > 0 {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: merr.WrapErrParameterInvalid("", "",
-			"Not allowed to do groupBy when doing iteration")}
+		return nil, merr.WrapErrParameterInvalid("", "",
+			"Not allowed to do groupBy when doing iteration")
 	}
 	if strings.Contains(searchParamStr, radiusKey) && groupByFieldId > 0 {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: merr.WrapErrParameterInvalid("", "",
-			"Not allowed to do range-search when doing search-group-by")}
+		return nil, merr.WrapErrParameterInvalid("", "",
+			"Not allowed to do range-search when doing search-group-by")
 	}
 
 	planSearchIteratorV2Info, err := parseSearchIteratorV2Info(searchParamsPair, groupByFieldId, isIterator, offset, &queryTopK)
 	if err != nil {
-		return &SearchInfo{planInfo: nil, offset: 0, isIterator: false, parseError: fmt.Errorf("parse iterator v2 info failed: %w", err)}
+		return nil, fmt.Errorf("parse iterator v2 info failed: %w", err)
 	}
 
 	return &SearchInfo{
@@ -295,9 +295,8 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 		},
 		offset:       offset,
 		isIterator:   isIterator,
-		parseError:   nil,
 		collectionID: collectionId,
-	}
+	}, nil
 }
 
 func getOutputFieldIDs(schema *schemaInfo, outputFields []string) (outputFieldIDs []UniqueID, err error) {
@@ -395,7 +394,6 @@ type groupByInfo struct {
 	groupByFieldId  int64
 	groupSize       int64
 	strictGroupSize bool
-	err             error
 }
 
 func (g *groupByInfo) GetGroupByFieldId() int64 {
@@ -419,14 +417,7 @@ func (g *groupByInfo) GetStrictGroupSize() bool {
 	return false
 }
 
-func (g *groupByInfo) GetError() error {
-	if g != nil {
-		return g.err
-	}
-	return nil
-}
-
-func parseGroupByInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb.CollectionSchema) *groupByInfo {
+func parseGroupByInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb.CollectionSchema) (*groupByInfo, error) {
 	ret := &groupByInfo{}
 
 	// 1. parse group_by_field
@@ -439,17 +430,12 @@ func parseGroupByInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemap
 		fields := schema.GetFields()
 		for _, field := range fields {
 			if field.Name == groupByFieldName {
-				if field.GetNullable() {
-					ret.err = merr.WrapErrParameterInvalidMsg(fmt.Sprintf("groupBy field(%s) not support nullable == true", groupByFieldName))
-					return ret
-				}
 				groupByFieldId = field.FieldID
 				break
 			}
 		}
 		if groupByFieldId == -1 {
-			ret.err = merr.WrapErrFieldNotFound(groupByFieldName, "groupBy field not found in schema")
-			return ret
+			return nil, merr.WrapErrFieldNotFound(groupByFieldName, "groupBy field not found in schema")
 		}
 	}
 	ret.groupByFieldId = groupByFieldId
@@ -462,20 +448,17 @@ func parseGroupByInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemap
 	} else {
 		groupSize, err = strconv.ParseInt(groupSizeStr, 0, 64)
 		if err != nil {
-			ret.err = merr.WrapErrParameterInvalidMsg(
+			return nil, merr.WrapErrParameterInvalidMsg(
 				fmt.Sprintf("failed to parse input group size:%s", groupSizeStr))
-			return ret
 		}
 		if groupSize <= 0 {
-			ret.err = merr.WrapErrParameterInvalidMsg(
+			return nil, merr.WrapErrParameterInvalidMsg(
 				fmt.Sprintf("input group size:%d is negative, failed to do search_groupby", groupSize))
-			return ret
 		}
 	}
 	if groupSize > Params.QuotaConfig.MaxGroupSize.GetAsInt64() {
-		ret.err = merr.WrapErrParameterInvalidMsg(
+		return nil, merr.WrapErrParameterInvalidMsg(
 			fmt.Sprintf("input group size:%d exceeds configured max group size:%d", groupSize, Params.QuotaConfig.MaxGroupSize.GetAsInt64()))
-		return ret
 	}
 	ret.groupSize = groupSize
 
@@ -491,7 +474,7 @@ func parseGroupByInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemap
 		}
 	}
 	ret.strictGroupSize = strictGroupSize
-	return ret
+	return ret, nil
 }
 
 // parseRankParams get limit and offset from rankParams, both are optional.
@@ -540,9 +523,9 @@ func parseRankParams(rankParamsPair []*commonpb.KeyValuePair, schema *schemapb.C
 	}
 
 	// parse group_by parameters from main request body for hybrid search
-	groupByInfo := parseGroupByInfo(rankParamsPair, schema)
-	if groupByInfo.err != nil {
-		return nil, groupByInfo.err
+	groupByInfo, err := parseGroupByInfo(rankParamsPair, schema)
+	if err != nil {
+		return nil, err
 	}
 
 	return &rankParams{
@@ -553,6 +536,14 @@ func parseRankParams(rankParamsPair []*commonpb.KeyValuePair, schema *schemapb.C
 		groupSize:       groupByInfo.GetGroupSize(),
 		strictGroupSize: groupByInfo.GetStrictGroupSize(),
 	}, nil
+}
+
+func getGroupScorerStr(params []*commonpb.KeyValuePair) string {
+	groupScorerStr, err := funcutil.GetAttrByKeyFromRepeatedKV(RankGroupScorer, params)
+	if err != nil {
+		groupScorerStr = MaxScorer
+	}
+	return groupScorerStr
 }
 
 func convertHybridSearchToSearch(req *milvuspb.HybridSearchRequest) *milvuspb.SearchRequest {
@@ -571,6 +562,7 @@ func convertHybridSearchToSearch(req *milvuspb.HybridSearchRequest) *milvuspb.Se
 		UseDefaultConsistency: req.GetUseDefaultConsistency(),
 		SearchByPrimaryKeys:   false,
 		SubReqs:               nil,
+		FunctionScore:         req.FunctionScore,
 	}
 
 	for _, sub := range req.GetRequests() {
@@ -585,4 +577,12 @@ func convertHybridSearchToSearch(req *milvuspb.HybridSearchRequest) *milvuspb.Se
 		ret.SubReqs = append(ret.SubReqs, subReq)
 	}
 	return ret
+}
+
+func getMetricType(toReduceResults []*internalpb.SearchResults) string {
+	metricType := ""
+	if len(toReduceResults) >= 1 {
+		metricType = toReduceResults[0].GetMetricType()
+	}
+	return metricType
 }

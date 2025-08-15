@@ -16,12 +16,14 @@
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <optional>
 #include <sys/errno.h>
 #include <unistd.h>
 #include <yaml-cpp/yaml.h>
 
 #include "index/BitmapIndex.h"
 
+#include "common/Consts.h"
 #include "common/File.h"
 #include "common/Slice.h"
 #include "common/Common.h"
@@ -30,6 +32,8 @@
 #include "index/Utils.h"
 #include "storage/Util.h"
 #include "query/Utils.h"
+
+#include "storage/FileWriter.h"
 
 namespace milvus {
 namespace index {
@@ -69,14 +73,9 @@ BitmapIndex<T>::Build(const Config& config) {
     if (is_built_) {
         return;
     }
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build index");
 
     auto field_datas =
-        file_manager_->CacheRawDataToMemory(insert_files.value());
-
+        storage::CacheRawDataAndFillMissing(file_manager_, config);
     BuildWithFieldData(field_datas);
 }
 
@@ -87,7 +86,7 @@ BitmapIndex<T>::Build(size_t n, const T* data, const bool* valid_data) {
         return;
     }
     if (n == 0) {
-        PanicInfo(DataIsEmpty, "BitmapIndex can not build null values");
+        ThrowInfo(DataIsEmpty, "BitmapIndex can not build null values");
     }
 
     total_num_rows_ = n;
@@ -140,7 +139,7 @@ BitmapIndex<T>::BuildWithFieldData(
         total_num_rows += field_data->get_num_rows();
     }
     if (total_num_rows == 0) {
-        PanicInfo(DataIsEmpty, "scalar bitmap index can not build null values");
+        ThrowInfo(DataIsEmpty, "scalar bitmap index can not build null values");
     }
     total_num_rows_ = total_num_rows;
     valid_bitset_ = TargetBitmap(total_num_rows_, false);
@@ -161,7 +160,7 @@ BitmapIndex<T>::BuildWithFieldData(
             BuildArrayField(field_datas);
             break;
         default:
-            PanicInfo(
+            ThrowInfo(
                 DataTypeInvalid,
                 fmt::format("Invalid data type: {} for build bitmap index",
                             proto::schema::DataType_Name(schema_.data_type())));
@@ -460,52 +459,48 @@ BitmapIndex<T>::MMapIndexData(const std::string& file_name,
     std::filesystem::create_directories(
         std::filesystem::path(file_name).parent_path());
 
-    auto file = File::Open(file_name, O_RDWR | O_CREAT | O_TRUNC);
     auto file_offset = 0;
     std::map<T, std::pair<int32_t, int32_t>> bitmaps;
+    {
+        auto file_writer = storage::FileWriter(file_name);
+        for (size_t i = 0; i < index_length; ++i) {
+            T key = ParseKey(&data_ptr);
 
-    for (size_t i = 0; i < index_length; ++i) {
-        T key = ParseKey(&data_ptr);
+            roaring::Roaring value;
+            value =
+                roaring::Roaring::read(reinterpret_cast<const char*>(data_ptr));
+            for (const auto& v : value) {
+                valid_bitset_.set(v);
+            }
 
-        roaring::Roaring value;
-        value = roaring::Roaring::read(reinterpret_cast<const char*>(data_ptr));
-        for (const auto& v : value) {
-            valid_bitset_.set(v);
+            // convert roaring vaule to frozen mode
+            int32_t frozen_size = value.getFrozenSizeInBytes();
+            auto aligned_size =
+                ((frozen_size + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+            std::vector<uint8_t> buf(aligned_size, 0);
+            value.writeFrozen(reinterpret_cast<char*>(buf.data()));
+
+            file_writer.Write(buf.data(), aligned_size);
+            bitmaps[key] = {file_offset, frozen_size};
+
+            file_offset += aligned_size;
+            data_ptr += value.getSizeInBytes();
         }
-
-        // convert roaring vaule to frozen mode
-        int32_t frozen_size = value.getFrozenSizeInBytes();
-        auto aligned_size =
-            ((frozen_size + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
-        std::vector<uint8_t> buf(aligned_size, 0);
-        value.writeFrozen(reinterpret_cast<char*>(buf.data()));
-
-        auto written = file.Write(buf.data(), aligned_size);
-        if (written != aligned_size) {
-            file.Close();
-            remove(file_name.c_str());
-            PanicInfo(
-                ErrorCode::UnistdError,
-                fmt::format("write data to fd error: {}", strerror(errno)));
-        }
-        bitmaps[key] = {file_offset, frozen_size};
-
-        file_offset += aligned_size;
-        data_ptr += value.getSizeInBytes();
+        file_writer.Finish();
     }
 
-    file.Seek(0, SEEK_SET);
+    auto file = File::Open(file_name, O_RDONLY);
     mmap_data_ = static_cast<char*>(
         mmap(NULL, file_offset, PROT_READ, MAP_PRIVATE, file.Descriptor(), 0));
     if (mmap_data_ == MAP_FAILED) {
         file.Close();
         remove(file_name.c_str());
-        PanicInfo(
+        ThrowInfo(
             ErrorCode::UnexpectedError, "failed to mmap: {}", strerror(errno));
     }
 
     mmap_size_ = file_offset;
-    unlink(file_name.c_str());
+    this->mmap_file_raii_ = std::make_unique<MmapFileRAII>(file_name);
 
     char* ptr = mmap_data_;
     for (const auto& [key, value] : bitmaps) {
@@ -569,22 +564,17 @@ BitmapIndex<T>::LoadWithoutAssemble(const BinarySet& binary_set,
 template <typename T>
 void
 BitmapIndex<T>::Load(milvus::tracer::TraceContext ctx, const Config& config) {
-    LOG_DEBUG("load bitmap index with config {}", config.dump());
+    LOG_INFO("load bitmap index with config {}", config.dump());
     auto index_files =
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load bitmap index");
-    auto index_datas = file_manager_->LoadIndexToMemory(index_files.value());
-    AssembleIndexDatas(index_datas);
+    auto index_datas = file_manager_->LoadIndexToMemory(
+        index_files.value(), config[milvus::LOAD_PRIORITY]);
     BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        auto size = data->DataSize();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        binary_set.Append(key, buf, size);
-    }
-
+    AssembleIndexDatas(index_datas, binary_set);
+    // clear index_datas to free memory early
+    index_datas.clear();
     LoadWithoutAssemble(binary_set, config);
 }
 
@@ -744,7 +734,7 @@ BitmapIndex<T>::RangeForBitset(const T value, const OpType op) {
             break;
         }
         default: {
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format("Invalid OperatorType: {}", op));
         }
     }
@@ -816,7 +806,7 @@ BitmapIndex<T>::RangeForMmap(const T value, const OpType op) {
             break;
         }
         default: {
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format("Invalid OperatorType: {}", op));
         }
     }
@@ -877,7 +867,7 @@ BitmapIndex<T>::RangeForRoaring(const T value, const OpType op) {
             break;
         }
         default: {
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format("Invalid OperatorType: {}", op));
         }
     }
@@ -1103,7 +1093,7 @@ template <typename T>
 std::optional<T>
 BitmapIndex<T>::Reverse_Lookup(size_t idx) const {
     AssertInfo(is_built_, "index has not been built");
-    AssertInfo(idx < total_num_rows_, "out of range of total coun");
+    AssertInfo(idx < total_num_rows_, "out of range of total count");
 
     if (!valid_bitset_[idx]) {
         return std::nullopt;
@@ -1139,7 +1129,7 @@ BitmapIndex<T>::Reverse_Lookup(size_t idx) const {
             }
         }
     }
-    PanicInfo(UnexpectedError,
+    ThrowInfo(UnexpectedError,
               fmt::format(
                   "scalar bitmap index can not lookup target value of index {}",
                   idx));
@@ -1181,7 +1171,7 @@ BitmapIndex<T>::ShouldSkip(const T lower_value,
                 break;
             }
             default:
-                PanicInfo(OpTypeInvalid,
+                ThrowInfo(OpTypeInvalid,
                           fmt::format("Invalid OperatorType for "
                                       "checking scalar index optimization: {}",
                                       op));
@@ -1228,45 +1218,39 @@ BitmapIndex<std::string>::Query(const DatasetPtr& dataset) {
     AssertInfo(is_built_, "index has not been built");
 
     auto op = dataset->Get<OpType>(OPERATOR_TYPE);
-    if (op == OpType::PrefixMatch) {
-        auto prefix = dataset->Get<std::string>(PREFIX_VALUE);
-        TargetBitmap res(total_num_rows_, false);
-        if (is_mmap_) {
-            for (auto it = bitmap_info_map_.begin();
-                 it != bitmap_info_map_.end();
-                 ++it) {
-                const auto& key = it->first;
-                if (milvus::query::Match(key, prefix, op)) {
-                    for (const auto& v : it->second) {
-                        res.set(v);
-                    }
-                }
-            }
-            return res;
-        }
-        if (build_mode_ == BitmapIndexBuildMode::ROARING) {
-            for (auto it = data_.begin(); it != data_.end(); ++it) {
-                const auto& key = it->first;
-                if (milvus::query::Match(key, prefix, op)) {
-                    for (const auto& v : it->second) {
-                        res.set(v);
-                    }
-                }
-            }
-        } else {
-            for (auto it = bitsets_.begin(); it != bitsets_.end(); ++it) {
-                const auto& key = it->first;
-                if (milvus::query::Match(key, prefix, op)) {
-                    res |= it->second;
+    auto val = dataset->Get<std::string>(MATCH_VALUE);
+    TargetBitmap res(total_num_rows_, false);
+    if (is_mmap_) {
+        for (auto it = bitmap_info_map_.begin(); it != bitmap_info_map_.end();
+             ++it) {
+            const auto& key = it->first;
+            if (milvus::query::Match(key, val, op)) {
+                for (const auto& v : it->second) {
+                    res.set(v);
                 }
             }
         }
-
         return res;
-    } else {
-        PanicInfo(OpTypeInvalid,
-                  fmt::format("unsupported op_type:{} for bitmap query", op));
     }
+    if (build_mode_ == BitmapIndexBuildMode::ROARING) {
+        for (auto it = data_.begin(); it != data_.end(); ++it) {
+            const auto& key = it->first;
+            if (milvus::query::Match(key, val, op)) {
+                for (const auto& v : it->second) {
+                    res.set(v);
+                }
+            }
+        }
+    } else {
+        for (auto it = bitsets_.begin(); it != bitsets_.end(); ++it) {
+            const auto& key = it->first;
+            if (milvus::query::Match(key, val, op)) {
+                res |= it->second;
+            }
+        }
+    }
+
+    return res;
 }
 
 template <typename T>

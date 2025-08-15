@@ -33,6 +33,7 @@ const (
 	DefaultFloatArrayField        = "floatArray"
 	DefaultDoubleArrayField       = "doubleArray"
 	DefaultVarcharArrayField      = "varcharArray"
+	DefaultNewField               = "newField"
 
 	DefaultFastPk     = "id"
 	DefaultFastVector = "vector"
@@ -71,6 +72,7 @@ const (
 	MaxTopK                 = 16384
 	MaxVectorFieldNum       = 4
 	MaxShardNum             = 16
+	DefaultBatchSize        = 1000
 )
 
 const (

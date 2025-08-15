@@ -53,14 +53,15 @@ type queryTask struct {
 	ctx            context.Context
 	result         *milvuspb.QueryResults
 	request        *milvuspb.QueryRequest
-	qc             types.QueryCoordClient
+	mixCoord       types.MixCoordClient
 	ids            *schemapb.IDs
 	collectionName string
 	queryParams    *queryParams
 	schema         *schemaInfo
 
-	userOutputFields  []string
-	userDynamicFields []string
+	translatedOutputFields []string
+	userOutputFields       []string
+	userDynamicFields      []string
 
 	resultBuf *typeutil.ConcurrentSet[*internalpb.RetrieveResults]
 
@@ -85,11 +86,12 @@ type queryParams struct {
 }
 
 // translateToOutputFieldIDs translates output fields name to output fields id.
+// If no output fields specified, return only pk field
 func translateToOutputFieldIDs(outputFields []string, schema *schemapb.CollectionSchema) ([]UniqueID, error) {
 	outputFieldIDs := make([]UniqueID, 0, len(outputFields)+1)
 	if len(outputFields) == 0 {
 		for _, field := range schema.Fields {
-			if field.FieldID >= common.StartOfUserFieldID && !typeutil.IsVectorType(field.DataType) {
+			if field.IsPrimaryKey {
 				outputFieldIDs = append(outputFieldIDs, field.FieldID)
 			}
 		}
@@ -109,6 +111,20 @@ func translateToOutputFieldIDs(outputFields []string, schema *schemapb.Collectio
 					break
 				}
 			}
+
+			if !fieldFound {
+			structFieldLoop:
+				for _, structField := range schema.StructArrayFields {
+					for _, field := range structField.Fields {
+						if reqField == field.Name {
+							outputFieldIDs = append(outputFieldIDs, field.FieldID)
+							fieldFound = true
+							break structFieldLoop
+						}
+					}
+				}
+			}
+
 			if !fieldFound {
 				return nil, fmt.Errorf("field %s not exist", reqField)
 			}
@@ -270,12 +286,12 @@ func (t *queryTask) createPlan(ctx context.Context) error {
 		metrics.ProxyParseExpressionLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "query", metrics.SuccessLabel).Observe(float64(time.Since(start).Milliseconds()))
 	}
 
-	t.request.OutputFields, t.userOutputFields, t.userDynamicFields, err = translateOutputFields(t.request.OutputFields, t.schema, true)
+	t.translatedOutputFields, t.userOutputFields, t.userDynamicFields, _, err = translateOutputFields(t.request.OutputFields, t.schema, false)
 	if err != nil {
 		return err
 	}
 
-	outputFieldIDs, err := translateToOutputFieldIDs(t.request.GetOutputFields(), schema.CollectionSchema)
+	outputFieldIDs, err := translateToOutputFieldIDs(t.translatedOutputFields, schema.CollectionSchema)
 	if err != nil {
 		return err
 	}
@@ -474,6 +490,14 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 			guaranteeTs = parseGuaranteeTsFromConsistency(guaranteeTs, t.BeginTs(), consistencyLevel)
 		}
 	}
+
+	// use collection schema updated timestamp if it's greater than calculate guarantee timestamp
+	// this make query view updated happens before new read request happens
+	// see also schema change design
+	if collectionInfo.updateTimestamp > guaranteeTs {
+		guaranteeTs = collectionInfo.updateTimestamp
+	}
+
 	t.GuaranteeTimestamp = guaranteeTs
 	// need modify mvccTs and guaranteeTs for iterator specially
 	if t.queryParams.isIterator && t.request.GetGuaranteeTimestamp() > 0 {
@@ -482,6 +506,15 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	}
 	t.RetrieveRequest.IsIterator = queryParams.isIterator
 
+	if collectionInfo.collectionTTL != 0 {
+		physicalTime := tsoutil.PhysicalTime(t.GetBase().GetTimestamp())
+		expireTime := physicalTime.Add(-time.Duration(collectionInfo.collectionTTL))
+		t.CollectionTtlTimestamps = tsoutil.ComposeTSByTime(expireTime, 0)
+		// preventing overflow, abort
+		if t.CollectionTtlTimestamps > t.GetBase().GetTimestamp() {
+			return merr.WrapErrServiceInternal(fmt.Sprintf("ttl timestamp overflow, base timestamp: %d, ttl duration %v", t.GetBase().GetTimestamp(), collectionInfo.collectionTTL))
+		}
+	}
 	deadline, ok := t.TraceCtx().Deadline()
 	if ok {
 		t.TimeoutTimestamp = tsoutil.ComposeTSByTime(deadline, 0)
@@ -491,7 +524,8 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	log.Debug("Query PreExecute done.",
 		zap.Uint64("guarantee_ts", guaranteeTs),
 		zap.Uint64("mvcc_ts", t.GetMvccTimestamp()),
-		zap.Uint64("timeout_ts", t.GetTimeoutTimestamp()))
+		zap.Uint64("timeout_ts", t.GetTimeoutTimestamp()),
+		zap.Uint64("collection_ttl_timestamps", t.CollectionTtlTimestamps))
 	return nil
 }
 
@@ -517,6 +551,62 @@ func (t *queryTask) Execute(ctx context.Context) error {
 
 	log.Debug("Query Execute done.")
 	return nil
+}
+
+// FieldsData in results are flattened, so we need to reconstruct the struct fields
+func reconstructStructFieldData(results *milvuspb.QueryResults, schema *schemapb.CollectionSchema) {
+	if len(results.OutputFields) == 1 && results.OutputFields[0] == "count(*)" {
+		return
+	}
+
+	if len(schema.StructArrayFields) == 0 {
+		return
+	}
+
+	regularFieldIDs := make(map[int64]interface{})
+	subFieldToStructMap := make(map[int64]int64)
+	groupedStructFields := make(map[int64][]*schemapb.FieldData)
+	structFieldNames := make(map[int64]string)
+	reconstructedOutputFields := make([]string, 0, len(results.FieldsData))
+
+	// record all regular field IDs
+	for _, field := range schema.Fields {
+		regularFieldIDs[field.GetFieldID()] = nil
+	}
+
+	// build the mapping from sub-field ID to struct field ID
+	for _, structField := range schema.StructArrayFields {
+		for _, subField := range structField.GetFields() {
+			subFieldToStructMap[subField.GetFieldID()] = structField.GetFieldID()
+		}
+		structFieldNames[structField.GetFieldID()] = structField.GetName()
+	}
+
+	fieldsData := make([]*schemapb.FieldData, 0, len(results.FieldsData))
+	for _, field := range results.FieldsData {
+		fieldID := field.GetFieldId()
+		if _, ok := regularFieldIDs[fieldID]; ok {
+			fieldsData = append(fieldsData, field)
+			reconstructedOutputFields = append(reconstructedOutputFields, field.GetFieldName())
+		} else {
+			structFieldID := subFieldToStructMap[fieldID]
+			groupedStructFields[structFieldID] = append(groupedStructFields[structFieldID], field)
+		}
+	}
+
+	for structFieldID, fields := range groupedStructFields {
+		fieldData := &schemapb.FieldData{
+			FieldName: structFieldNames[structFieldID],
+			FieldId:   structFieldID,
+			Type:      schemapb.DataType_ArrayOfStruct,
+			Field:     &schemapb.FieldData_StructArrays{StructArrays: &schemapb.StructArrayField{Fields: fields}},
+		}
+		fieldsData = append(fieldsData, fieldData)
+		reconstructedOutputFields = append(reconstructedOutputFields, structFieldNames[structFieldID])
+	}
+
+	results.FieldsData = fieldsData
+	results.OutputFields = reconstructedOutputFields
 }
 
 func (t *queryTask) PostExecute(ctx context.Context) error {
@@ -560,6 +650,14 @@ func (t *queryTask) PostExecute(ctx context.Context) error {
 		return err
 	}
 	t.result.OutputFields = t.userOutputFields
+	reconstructStructFieldData(t.result, t.schema.CollectionSchema)
+
+	primaryFieldSchema, err := t.schema.GetPkField()
+	if err != nil {
+		log.Warn("failed to get primary field schema", zap.Error(err))
+		return err
+	}
+	t.result.PrimaryFieldName = primaryFieldSchema.GetName()
 	metrics.ProxyReduceResultLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.QueryLabel).Observe(float64(tr.RecordSpan().Milliseconds()))
 
 	if t.queryParams.isIterator && t.request.GetGuaranteeTimestamp() == 0 {
@@ -591,7 +689,7 @@ func (t *queryTask) queryShard(ctx context.Context, nodeID int64, qn types.Query
 		retrieveReq.MvccTimestamp = mvccTs
 		retrieveReq.GuaranteeTimestamp = mvccTs
 	}
-
+	retrieveReq.ConsistencyLevel = t.ConsistencyLevel
 	req := &querypb.QueryRequest{
 		Req:         retrieveReq,
 		DmlChannels: []string{channel},

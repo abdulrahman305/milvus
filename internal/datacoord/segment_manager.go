@@ -67,6 +67,15 @@ func putAllocation(a *Allocation) {
 	allocPool.Put(a)
 }
 
+type AllocNewGrowingSegmentRequest struct {
+	CollectionID         UniqueID
+	PartitionID          UniqueID
+	SegmentID            UniqueID
+	ChannelName          string
+	StorageVersion       int64
+	IsCreatedByStreaming bool
+}
+
 // Manager manages segment related operations.
 //
 //go:generate mockery --name=Manager --structname=MockManager --output=./  --filename=mock_segment_manager.go --with-expecter --inpackage
@@ -77,7 +86,7 @@ type Manager interface {
 	AllocSegment(ctx context.Context, collectionID, partitionID UniqueID, channelName string, requestRows int64, storageVersion int64) ([]*Allocation, error)
 
 	// AllocNewGrowingSegment allocates segment for streaming node.
-	AllocNewGrowingSegment(ctx context.Context, collectionID, partitionID, segmentID UniqueID, channelName string, storageVersion int64) (*SegmentInfo, error)
+	AllocNewGrowingSegment(ctx context.Context, req AllocNewGrowingSegmentRequest) (*SegmentInfo, error)
 
 	// DropSegment drops the segment from manager.
 	DropSegment(ctx context.Context, channel string, segmentID UniqueID)
@@ -92,6 +101,8 @@ type Manager interface {
 	DropSegmentsOfChannel(ctx context.Context, channel string)
 	// CleanZeroSealedSegmentsOfChannel try to clean real empty sealed segments in a channel
 	CleanZeroSealedSegmentsOfChannel(ctx context.Context, channel string, cpTs Timestamp)
+	// DropSegmentsOfPartition drops all segments in a partition
+	DropSegmentsOfPartition(ctx context.Context, channel string, partitionID []int64)
 }
 
 // Allocation records the allocation info
@@ -368,10 +379,10 @@ func (s *SegmentManager) genExpireTs(ctx context.Context) (Timestamp, error) {
 }
 
 // AllocNewGrowingSegment allocates segment for streaming node.
-func (s *SegmentManager) AllocNewGrowingSegment(ctx context.Context, collectionID, partitionID, segmentID UniqueID, channelName string, storageVersion int64) (*SegmentInfo, error) {
-	s.channelLock.Lock(channelName)
-	defer s.channelLock.Unlock(channelName)
-	return s.openNewSegmentWithGivenSegmentID(ctx, collectionID, partitionID, segmentID, channelName, storageVersion)
+func (s *SegmentManager) AllocNewGrowingSegment(ctx context.Context, req AllocNewGrowingSegmentRequest) (*SegmentInfo, error) {
+	s.channelLock.Lock(req.ChannelName)
+	defer s.channelLock.Unlock(req.ChannelName)
+	return s.openNewSegmentWithGivenSegmentID(ctx, req)
 }
 
 func (s *SegmentManager) openNewSegment(ctx context.Context, collectionID UniqueID, partitionID UniqueID, channelName string, storageVersion int64) (*SegmentInfo, error) {
@@ -383,40 +394,53 @@ func (s *SegmentManager) openNewSegment(ctx context.Context, collectionID Unique
 		log.Error("failed to open new segment while AllocID", zap.Error(err))
 		return nil, err
 	}
-	return s.openNewSegmentWithGivenSegmentID(ctx, collectionID, partitionID, id, channelName, storageVersion)
+	return s.openNewSegmentWithGivenSegmentID(ctx, AllocNewGrowingSegmentRequest{
+		CollectionID:         collectionID,
+		PartitionID:          partitionID,
+		SegmentID:            id,
+		ChannelName:          channelName,
+		StorageVersion:       storageVersion,
+		IsCreatedByStreaming: false,
+	})
 }
 
-func (s *SegmentManager) openNewSegmentWithGivenSegmentID(ctx context.Context, collectionID UniqueID, partitionID UniqueID, segmentID UniqueID, channelName string, storageVersion int64) (*SegmentInfo, error) {
-	maxNumOfRows, err := s.estimateMaxNumOfRows(collectionID)
-	if err != nil {
-		log.Error("failed to open new segment while estimateMaxNumOfRows", zap.Error(err))
-		return nil, err
+func (s *SegmentManager) openNewSegmentWithGivenSegmentID(ctx context.Context, req AllocNewGrowingSegmentRequest) (*SegmentInfo, error) {
+	var maxNumOfRows int
+	if !req.IsCreatedByStreaming {
+		var err error
+		maxNumOfRows, err = s.estimateMaxNumOfRows(req.CollectionID)
+		if err != nil {
+			log.Error("failed to open new segment while estimateMaxNumOfRows", zap.Error(err))
+			return nil, err
+		}
 	}
 
 	segmentInfo := &datapb.SegmentInfo{
-		ID:             segmentID,
-		CollectionID:   collectionID,
-		PartitionID:    partitionID,
-		InsertChannel:  channelName,
-		NumOfRows:      0,
-		State:          commonpb.SegmentState_Growing,
-		MaxRowNum:      int64(maxNumOfRows),
-		Level:          datapb.SegmentLevel_L1,
-		LastExpireTime: 0,
-		StorageVersion: storageVersion,
+		ID:                   req.SegmentID,
+		CollectionID:         req.CollectionID,
+		PartitionID:          req.PartitionID,
+		InsertChannel:        req.ChannelName,
+		NumOfRows:            0,
+		State:                commonpb.SegmentState_Growing,
+		MaxRowNum:            int64(maxNumOfRows), // deprecated properties, we use binary size to limit the segment size but not estimate rows.
+		Level:                datapb.SegmentLevel_L1,
+		LastExpireTime:       0,
+		StorageVersion:       req.StorageVersion,
+		IsCreatedByStreaming: req.IsCreatedByStreaming,
 	}
 	segment := NewSegmentInfo(segmentInfo)
 	if err := s.meta.AddSegment(ctx, segment); err != nil {
 		log.Error("failed to add segment to DataCoord", zap.Error(err))
 		return nil, err
 	}
-	growing, _ := s.channel2Growing.GetOrInsert(channelName, typeutil.NewUniqueSet())
-	growing.Insert(segmentID)
+	growing, _ := s.channel2Growing.GetOrInsert(req.ChannelName, typeutil.NewUniqueSet())
+	growing.Insert(req.SegmentID)
 	log.Info("datacoord: estimateTotalRows: ",
 		zap.Int64("CollectionID", segmentInfo.CollectionID),
 		zap.Int64("SegmentID", segmentInfo.ID),
-		zap.Int("Rows", maxNumOfRows),
-		zap.String("Channel", segmentInfo.InsertChannel))
+		zap.String("Channel", segmentInfo.InsertChannel),
+		zap.Bool("IsCreatedByStreaming", segmentInfo.IsCreatedByStreaming),
+	)
 
 	return segment, s.helper.afterCreateSegment(segmentInfo)
 }
@@ -683,4 +707,49 @@ func (s *SegmentManager) DropSegmentsOfChannel(ctx context.Context, channel stri
 		return true
 	})
 	s.channel2Growing.Remove(channel)
+}
+
+func (s *SegmentManager) DropSegmentsOfPartition(ctx context.Context, channel string, partitionIDs []int64) {
+	s.channelLock.Lock(channel)
+	defer s.channelLock.Unlock(channel)
+	if growing, ok := s.channel2Growing.Get(channel); ok {
+		for sid := range growing {
+			segment := s.meta.GetHealthySegment(ctx, sid)
+			if segment == nil {
+				log.Warn("failed to get segment, remove it",
+					zap.String("channel", channel),
+					zap.Int64("segmentID", sid))
+				growing.Remove(sid)
+				continue
+			}
+
+			if contains(partitionIDs, segment.GetPartitionID()) {
+				growing.Remove(sid)
+			}
+			s.meta.SetAllocations(sid, nil)
+			for _, allocation := range segment.allocations {
+				putAllocation(allocation)
+			}
+		}
+	}
+
+	if sealed, ok := s.channel2Sealed.Get(channel); ok {
+		for sid := range sealed {
+			segment := s.meta.GetHealthySegment(ctx, sid)
+			if segment == nil {
+				log.Warn("failed to get segment, remove it",
+					zap.String("channel", channel),
+					zap.Int64("segmentID", sid))
+				sealed.Remove(sid)
+				continue
+			}
+			if contains(partitionIDs, segment.GetPartitionID()) {
+				sealed.Remove(sid)
+			}
+			s.meta.SetAllocations(sid, nil)
+			for _, allocation := range segment.allocations {
+				putAllocation(allocation)
+			}
+		}
+	}
 }

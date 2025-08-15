@@ -67,9 +67,9 @@ VectorDiskAnnIndex<T>::VectorDiskAnnIndex(
     } else {
         auto err = get_index_obj.error();
         if (err == knowhere::Status::invalid_index_error) {
-            PanicInfo(ErrorCode::Unsupported, get_index_obj.what());
+            ThrowInfo(ErrorCode::Unsupported, get_index_obj.what());
         }
-        PanicInfo(ErrorCode::KnowhereError, get_index_obj.what());
+        ThrowInfo(ErrorCode::KnowhereError, get_index_obj.what());
     }
 }
 
@@ -96,7 +96,8 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
             GetValueFromConfig<std::vector<std::string>>(config, "index_files");
         AssertInfo(index_files.has_value(),
                    "index file paths is empty when load disk ann index data");
-        file_manager_->CacheIndexToDisk(index_files.value());
+        file_manager_->CacheIndexToDisk(index_files.value(),
+                                        config[milvus::LOAD_PRIORITY]);
         read_file_span->End();
     }
 
@@ -107,7 +108,7 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
         milvus::tracer::GetTracer()->WithActiveSpan(span_load_engine);
     auto stat = index_.Deserialize(knowhere::BinarySet(), load_config);
     if (stat != knowhere::Status::success)
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to Deserialize index, " + KnowhereStatusString(stat));
     span_load_engine->End();
 
@@ -120,7 +121,7 @@ VectorDiskAnnIndex<T>::Upload(const Config& config) {
     BinarySet ret;
     auto stat = index_.Serialize(ret);
     if (stat != knowhere::Status::success) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to serialize index, " + KnowhereStatusString(stat));
     }
     auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
@@ -137,12 +138,7 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
     build_config.update(config);
 
     auto segment_id = file_manager_->GetFieldDataMeta().segment_id;
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build disk ann index");
-    auto local_data_path =
-        file_manager_->CacheRawDataToDisk<T>(insert_files.value());
+    auto local_data_path = file_manager_->CacheRawDataToDisk<T>(config);
     build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
 
     auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
@@ -170,11 +166,11 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
         // into the index Build call directly
     }
 
-    build_config.erase("insert_files");
+    build_config.erase(INSERT_FILES_KEY);
     build_config.erase(VEC_OPT_FIELDS);
     auto stat = index_.Build({}, build_config);
     if (stat != knowhere::Status::success)
-        PanicInfo(ErrorCode::IndexBuildError,
+        ThrowInfo(ErrorCode::IndexBuildError,
                   "failed to build disk index, " + KnowhereStatusString(stat));
 
     local_chunk_manager->RemoveDir(
@@ -228,7 +224,7 @@ VectorDiskAnnIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
 
     auto stat = index_.Build({}, build_config);
     if (stat != knowhere::Status::success)
-        PanicInfo(ErrorCode::IndexBuildError,
+        ThrowInfo(ErrorCode::IndexBuildError,
                   "failed to build index, " + KnowhereStatusString(stat));
     local_chunk_manager->RemoveDir(
         storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
@@ -271,7 +267,7 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
                 search_info, topk, GetMetricType(), search_config)) {
             auto res = index_.RangeSearch(dataset, search_config, bitset);
             if (!res.has_value()) {
-                PanicInfo(ErrorCode::UnexpectedError,
+                ThrowInfo(ErrorCode::UnexpectedError,
                           fmt::format("failed to range search: {}: {}",
                                       KnowhereStatusString(res.error()),
                                       res.what()));
@@ -281,7 +277,7 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
         } else {
             auto res = index_.Search(dataset, search_config, bitset);
             if (!res.has_value()) {
-                PanicInfo(ErrorCode::UnexpectedError,
+                ThrowInfo(ErrorCode::UnexpectedError,
                           fmt::format("failed to search: {}: {}",
                                       KnowhereStatusString(res.error()),
                                       res.what()));
@@ -330,12 +326,18 @@ std::vector<uint8_t>
 VectorDiskAnnIndex<T>::GetVector(const DatasetPtr dataset) const {
     auto index_type = GetIndexType();
     if (IndexIsSparse(index_type)) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to get vector, index is sparse");
     }
+
+    // if dataset is empty, return empty vector
+    if (dataset->GetRows() == 0) {
+        return {};
+    }
+
     auto res = index_.GetVectorByIds(dataset);
     if (!res.has_value()) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   fmt::format("failed to get vector: {}: {}",
                               KnowhereStatusString(res.error()),
                               res.what()));

@@ -7,25 +7,23 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
-	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/mocks/mock_metastore"
 	"github.com/milvus-io/milvus/internal/mocks/mock_storage"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_wal"
+	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/wal/mock_recovery"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
 	internaltypes "github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/mocks/streaming/mock_walimpls"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/rmq"
@@ -35,6 +33,8 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	defaultCollectionNotFoundTolerance = 2
+
 	paramtable.Init()
 	if code := m.Run(); code != 0 {
 		os.Exit(code)
@@ -45,45 +45,56 @@ func TestWALFlusher(t *testing.T) {
 	streamingutil.SetStreamingServiceEnabled()
 	defer streamingutil.UnsetStreamingServiceEnabled()
 
-	rootCoord := mocks.NewMockRootCoordClient(t)
-	rootCoord.EXPECT().GetPChannelInfo(mock.Anything, mock.Anything).Return(&rootcoordpb.GetPChannelInfoResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
-		Collections: []*rootcoordpb.CollectionInfoOnPChannel{
-			{
-				CollectionId: 100,
-				Vchannel:     "vchannel-1",
-			},
-			{
-				CollectionId: 100,
-				Vchannel:     "vchannel-2",
-			},
+	mixcoord := newMockMixcoord(t, false)
+	mixcoord.EXPECT().AllocSegment(mock.Anything, mock.Anything).Return(&datapb.AllocSegmentResponse{
+		Status: merr.Status(nil),
+	}, nil)
+	mixcoord.EXPECT().DropVirtualChannel(mock.Anything, mock.Anything).Return(&datapb.DropVirtualChannelResponse{
+		Status: merr.Status(nil),
+	}, nil)
+	fMixcoord := syncutil.NewFuture[internaltypes.MixCoordClient]()
+	fMixcoord.Set(mixcoord)
+	rs := mock_recovery.NewMockRecoveryStorage(t)
+	rs.EXPECT().GetSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "ID", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "Vector", DataType: schemapb.DataType_FloatVector},
 		},
 	}, nil)
-	snMeta := mock_metastore.NewMockStreamingNodeCataLog(t)
-	snMeta.EXPECT().GetConsumeCheckpoint(mock.Anything, mock.Anything).Return(nil, nil)
-	snMeta.EXPECT().SaveConsumeCheckpoint(mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	datacoord := newMockDatacoord(t, false)
-	fDatacoord := syncutil.NewFuture[internaltypes.DataCoordClient]()
-	fDatacoord.Set(datacoord)
-	fRootCoord := syncutil.NewFuture[internaltypes.RootCoordClient]()
-	fRootCoord.Set(rootCoord)
+	rs.EXPECT().ObserveMessage(mock.Anything, mock.Anything).Return(nil)
+	rs.EXPECT().Close().Return()
 	resource.InitForTest(
 		t,
-		resource.OptDataCoordClient(fDatacoord),
-		resource.OptRootCoordClient(fRootCoord),
-		resource.OptStreamingNodeCatalog(snMeta),
+		resource.OptMixCoordClient(fMixcoord),
 		resource.OptChunkManager(mock_storage.NewMockChunkManager(t)),
 	)
-	walImpl := mock_walimpls.NewMockWALImpls(t)
-	walImpl.EXPECT().Channel().Return(types.PChannelInfo{Name: "pchannel"})
-
 	l := newMockWAL(t, false)
-	param := interceptors.InterceptorBuildParam{
-		WALImpls: walImpl,
-		WAL:      syncutil.NewFuture[wal.WAL](),
+	param := &RecoverWALFlusherParam{
+		ChannelInfo: l.Channel(),
+		WAL:         syncutil.NewFuture[wal.WAL](),
+		RecoverySnapshot: &recovery.RecoverySnapshot{
+			VChannels: map[string]*streamingpb.VChannelMeta{
+				"vchannel-1": {
+					CollectionInfo: &streamingpb.CollectionInfoOfVChannel{
+						CollectionId: 100,
+					},
+				},
+				"vchannel-2": {
+					CollectionInfo: &streamingpb.CollectionInfoOfVChannel{
+						CollectionId: 100,
+					},
+				},
+				"vchannel-3": {
+					CollectionInfo: &streamingpb.CollectionInfoOfVChannel{
+						CollectionId: 100,
+					},
+				},
+			},
+			Checkpoint: &recovery.WALCheckpoint{
+				TimeTick: 0,
+			},
+		},
+		RecoveryStorage: rs,
 	}
 	param.WAL.Set(l)
 	flusher := RecoverWALFlusher(param)
@@ -91,16 +102,19 @@ func TestWALFlusher(t *testing.T) {
 	flusher.Close()
 }
 
-func newMockDatacoord(t *testing.T, maybe bool) *mocks.MockDataCoordClient {
-	datacoord := mocks.NewMockDataCoordClient(t)
-	failureCnt := atomic.NewInt32(2)
-	datacoord.EXPECT().DropVirtualChannel(mock.Anything, mock.Anything).Return(&datapb.DropVirtualChannelResponse{
+func newMockMixcoord(t *testing.T, maybe bool) *mocks.MockMixCoordClient {
+	mixcoord := mocks.NewMockMixCoordClient(t)
+	mixcoord.EXPECT().DropVirtualChannel(mock.Anything, mock.Anything).Return(&datapb.DropVirtualChannelResponse{
 		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
 	}, nil)
-	expect := datacoord.EXPECT().GetChannelRecoveryInfo(mock.Anything, mock.Anything).RunAndReturn(
+	expect := mixcoord.EXPECT().GetChannelRecoveryInfo(mock.Anything, mock.Anything).RunAndReturn(
 		func(ctx context.Context, request *datapb.GetChannelRecoveryInfoRequest, option ...grpc.CallOption,
 		) (*datapb.GetChannelRecoveryInfoResponse, error) {
-			if failureCnt.Dec() > 0 {
+			if request.Vchannel == "vchannel-3" {
+				return &datapb.GetChannelRecoveryInfoResponse{
+					Status: merr.Status(merr.ErrCollectionNotFound),
+				}, nil
+			} else if request.Vchannel == "vchannel-2" {
 				return &datapb.GetChannelRecoveryInfoResponse{
 					Status: merr.Status(merr.ErrChannelNotAvailable),
 				}, nil
@@ -124,7 +138,7 @@ func newMockDatacoord(t *testing.T, maybe bool) *mocks.MockDataCoordClient {
 	if maybe {
 		expect.Maybe()
 	}
-	return datacoord
+	return mixcoord
 }
 
 func newMockWAL(t *testing.T, maybe bool) *mock_wal.MockWAL {

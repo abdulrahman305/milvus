@@ -18,8 +18,11 @@
 
 #include <memory>
 #include <boost/dynamic_bitset.hpp>
+#include "cachinglayer/CacheSlot.h"
 #include "common/FieldData.h"
 #include "common/EasyAssert.h"
+#include "common/File.h"
+#include "common/JsonCastType.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/dataset.h"
 #include "knowhere/index/index_factory.h"
@@ -72,9 +75,20 @@ class IndexBase {
         return index_type_;
     }
 
-    virtual enum DataType
-    JsonCastType() const {
-        return DataType::NONE;
+    virtual JsonCastType
+    GetCastType() const {
+        return JsonCastType::UNKNOWN;
+    }
+
+    // TODO: how to get the cell byte size?
+    virtual size_t
+    CellByteSize() const {
+        return cell_size_;
+    }
+
+    virtual void
+    SetCellSize(size_t cell_size) {
+        cell_size_ = cell_size;
     }
 
  protected:
@@ -83,7 +97,16 @@ class IndexBase {
     }
 
     IndexType index_type_ = "";
+    size_t cell_size_ = 0;
+
+    std::unique_ptr<MmapFileRAII> mmap_file_raii_;
 };
 
 using IndexBasePtr = std::unique_ptr<IndexBase>;
+
+template <typename T>
+using CacheIndexPtr = std::shared_ptr<milvus::cachinglayer::CacheSlot<T>>;
+
+using CacheIndexBasePtr = CacheIndexPtr<IndexBase>;
+
 }  // namespace milvus::index

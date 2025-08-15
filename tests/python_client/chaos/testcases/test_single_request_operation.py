@@ -2,7 +2,8 @@ import time
 
 import pytest
 from time import sleep
-from pymilvus import connections
+import pymilvus
+from pymilvus import connections, utility
 from chaos.checker import (CollectionCreateChecker,
                            InsertChecker,
                            BulkInsertChecker,
@@ -14,9 +15,13 @@ from chaos.checker import (CollectionCreateChecker,
                            QueryChecker,
                            TextMatchChecker,
                            PhraseMatchChecker,
+                           JsonQueryChecker,
                            IndexCreateChecker,
                            DeleteChecker,
                            CollectionDropChecker,
+                           AlterCollectionChecker,
+                           AddFieldChecker,
+                           CollectionRenameChecker,
                            Op,
                            EventRecords,
                            ResultAnalyzer
@@ -47,15 +52,19 @@ class TestBase:
 class TestOperations(TestBase):
 
     @pytest.fixture(scope="function", autouse=True)
-    def connection(self, host, port, user, password, milvus_ns, minio_host, enable_import):
+    def connection(self, host, port, user, password, milvus_ns, minio_host, enable_import, minio_bucket):
         if user and password:
             # log.info(f"connect to {host}:{port} with user {user} and password {password}")
-            connections.connect('default', host=host, port=port, user=user, password=password, secure=True)
+            connections.connect('default', host=host, port=port, user=user, password=password)
         else:
             connections.connect('default', host=host, port=port)
         if connections.has_connection("default") is False:
             raise Exception("no connections")
         log.info("connect to milvus successfully")
+        pymilvus_version = pymilvus.__version__
+        server_version = utility.get_server_version()
+        log.info(f"server version: {server_version}")
+        log.info(f"pymilvus version: {pymilvus_version}")
         self.host = host
         self.port = port
         self.user = user
@@ -65,8 +74,7 @@ class TestOperations(TestBase):
         self.release_name = get_milvus_instance_name(self.milvus_ns, milvus_sys=self.milvus_sys)
         self.enable_import = enable_import
         self.minio_endpoint = f"{minio_host}:9000"
-        self.ms = MilvusSys()
-        self.bucket_name = self.ms.data_nodes[0]["infos"]["system_configurations"]["minio_bucket_name"]
+        self.bucket_name = minio_bucket
 
     def init_health_checkers(self, collection_name=None):
         c_name = collection_name
@@ -82,8 +90,12 @@ class TestOperations(TestBase):
             Op.query: QueryChecker(collection_name=c_name),
             Op.text_match: TextMatchChecker(collection_name=c_name),
             Op.phrase_match: PhraseMatchChecker(collection_name=c_name),
+            Op.json_query: JsonQueryChecker(collection_name=c_name),
             Op.delete: DeleteChecker(collection_name=c_name),
-            Op.drop: CollectionDropChecker(collection_name=c_name)
+            Op.drop: CollectionDropChecker(collection_name=c_name),
+            Op.alter_collection: AlterCollectionChecker(collection_name=c_name),
+            Op.add_field: AddFieldChecker(collection_name=c_name),
+            Op.rename_collection: CollectionRenameChecker(collection_name=c_name)
         }
         if bool(self.enable_import):
             checkers[Op.bulk_insert] = BulkInsertChecker(collection_name=c_name,

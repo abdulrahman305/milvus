@@ -16,7 +16,8 @@
 
 #include "RandomSampleNode.h"
 
-#include <exec/expression/Utils.h>
+#include "exec/expression/Utils.h"
+#include "monitor/Monitor.h"
 
 namespace milvus {
 namespace exec {

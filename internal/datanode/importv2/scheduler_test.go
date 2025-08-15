@@ -60,6 +60,11 @@ type mockReader struct {
 	io.Closer
 	io.ReaderAt
 	io.Seeker
+	size int64
+}
+
+func (mr *mockReader) Size() (int64, error) {
+	return mr.size, nil
 }
 
 type SchedulerSuite struct {
@@ -116,6 +121,10 @@ func (s *SchedulerSuite) SetupTest() {
 	s.scheduler = NewScheduler(s.manager).(*scheduler)
 }
 
+func (s *SchedulerSuite) TearDownTest() {
+	s.scheduler.Close()
+}
+
 func (s *SchedulerSuite) TestScheduler_Slots() {
 	preimportReq := &datapb.PreImportRequest{
 		JobID:        1,
@@ -125,12 +134,13 @@ func (s *SchedulerSuite) TestScheduler_Slots() {
 		Vchannels:    []string{"ch-0"},
 		Schema:       s.schema,
 		ImportFiles:  []*internalpb.ImportFile{{Paths: []string{"dummy.json"}}},
+		TaskSlot:     10,
 	}
 	preimportTask := NewPreImportTask(preimportReq, s.manager, s.cm)
 	s.manager.Add(preimportTask)
 
 	slots := s.scheduler.Slots()
-	s.Equal(paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt64()-1, slots)
+	s.Equal(int64(10), slots)
 }
 
 func (s *SchedulerSuite) TestScheduler_Start_Preimport() {
@@ -151,7 +161,7 @@ func (s *SchedulerSuite) TestScheduler_Start_Preimport() {
 	cm := mocks.NewChunkManager(s.T())
 	ioReader := strings.NewReader(string(bytes))
 	cm.EXPECT().Size(mock.Anything, mock.Anything).Return(1024, nil)
-	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader}, nil)
+	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader, Closer: io.NopCloser(ioReader)}, nil)
 	s.cm = cm
 
 	preimportReq := &datapb.PreImportRequest{
@@ -197,15 +207,9 @@ func (s *SchedulerSuite) TestScheduler_Start_Preimport_Failed() {
 	s.NoError(err)
 
 	cm := mocks.NewChunkManager(s.T())
-	type mockReader struct {
-		io.Reader
-		io.Closer
-		io.ReaderAt
-		io.Seeker
-	}
 	ioReader := strings.NewReader(string(bytes))
 	cm.EXPECT().Size(mock.Anything, mock.Anything).Return(1024, nil)
-	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader}, nil)
+	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader, Closer: io.NopCloser(ioReader)}, nil)
 	s.cm = cm
 
 	preimportReq := &datapb.PreImportRequest{
@@ -244,10 +248,10 @@ func (s *SchedulerSuite) TestScheduler_Start_Import() {
 
 	cm := mocks.NewChunkManager(s.T())
 	ioReader := strings.NewReader(string(bytes))
-	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader}, nil)
+	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader, Closer: io.NopCloser(ioReader)}, nil)
 	s.cm = cm
 
-	s.syncMgr.EXPECT().SyncData(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
+	s.syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
 		future := conc.Go(func() (struct{}, error) {
 			return struct{}{}, nil
 		})
@@ -305,10 +309,10 @@ func (s *SchedulerSuite) TestScheduler_Start_Import_Failed() {
 
 	cm := mocks.NewChunkManager(s.T())
 	ioReader := strings.NewReader(string(bytes))
-	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader}, nil)
+	cm.EXPECT().Reader(mock.Anything, mock.Anything).Return(&mockReader{Reader: ioReader, Closer: io.NopCloser(ioReader)}, nil)
 	s.cm = cm
 
-	s.syncMgr.EXPECT().SyncData(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
+	s.syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
 		future := conc.Go(func() (struct{}, error) {
 			return struct{}{}, errors.New("mock err")
 		})
@@ -385,7 +389,7 @@ func (s *SchedulerSuite) TestScheduler_ReadFileStat() {
 }
 
 func (s *SchedulerSuite) TestScheduler_ImportFile() {
-	s.syncMgr.EXPECT().SyncData(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
+	s.syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
 		future := conc.Go(func() (struct{}, error) {
 			return struct{}{}, nil
 		})
@@ -437,7 +441,14 @@ func (s *SchedulerSuite) TestScheduler_ImportFile() {
 }
 
 func (s *SchedulerSuite) TestScheduler_ImportFileWithFunction() {
-	s.syncMgr.EXPECT().SyncData(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
+	paramtable.Init()
+	paramtable.Get().CredentialCfg.Credential.GetFunc = func() map[string]string {
+		return map[string]string{
+			"mock.apikey": "mock",
+		}
+	}
+
+	s.syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
 		future := conc.Go(func() (struct{}, error) {
 			return struct{}{}, nil
 		})
@@ -445,6 +456,11 @@ func (s *SchedulerSuite) TestScheduler_ImportFileWithFunction() {
 	})
 	ts := function.CreateOpenAIEmbeddingServer()
 	defer ts.Close()
+	paramtable.Get().FunctionCfg.TextEmbeddingProviders.GetFunc = func() map[string]string {
+		return map[string]string{
+			"openai.url": ts.URL,
+		}
+	}
 	schema := &schemapb.CollectionSchema{
 		Fields: []*schemapb.FieldSchema{
 			{
@@ -484,8 +500,7 @@ func (s *SchedulerSuite) TestScheduler_ImportFileWithFunction() {
 				Params: []*commonpb.KeyValuePair{
 					{Key: "provider", Value: "openai"},
 					{Key: "model_name", Value: "text-embedding-ada-002"},
-					{Key: "api_key", Value: "mock"},
-					{Key: "url", Value: ts.URL},
+					{Key: "credential", Value: "mock"},
 					{Key: "dim", Value: "4"},
 				},
 			},

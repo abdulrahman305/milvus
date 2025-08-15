@@ -27,7 +27,7 @@ import (
 
 func (s *MiniClusterSuite) WaitForFlush(ctx context.Context, segIDs []int64, flushTs uint64, dbName, collectionName string) {
 	flushed := func() bool {
-		resp, err := s.Cluster.Proxy.GetFlushState(ctx, &milvuspb.GetFlushStateRequest{
+		resp, err := s.Cluster.MilvusClient.GetFlushState(ctx, &milvuspb.GetFlushStateRequest{
 			SegmentIDs:     segIDs,
 			FlushTs:        flushTs,
 			DbName:         dbName,
@@ -131,6 +131,28 @@ func NewVarCharSameFieldData(fieldName string, numRows int, value string) *schem
 	}
 }
 
+func NewVarCharFieldData(fieldName string, numRows int, nullable bool) *schemapb.FieldData {
+	numValid := numRows
+	if nullable {
+		numValid = numRows / 2
+	}
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_String,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Scalars{
+			Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_StringData{
+					StringData: &schemapb.StringArray{
+						Data: testutils.GenerateStringArray(numValid),
+						// Data: testutils.GenerateStringArray(numRows),
+					},
+				},
+			},
+		},
+		ValidData: testutils.GenerateBoolArray(numRows),
+	}
+}
+
 func NewStringFieldData(fieldName string, numRows int) *schemapb.FieldData {
 	return testutils.NewStringFieldData(fieldName, numRows)
 }
@@ -157,6 +179,19 @@ func NewSparseFloatVectorFieldData(fieldName string, numRows int) *schemapb.Fiel
 
 func NewInt8VectorFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
 	return testutils.NewInt8VectorFieldData(fieldName, numRows, dim)
+}
+
+func NewStructArrayFieldData(schema *schemapb.StructArrayFieldSchema, fieldName string, numRow int, dim int) *schemapb.FieldData {
+	fieldData := &schemapb.FieldData{
+		Type:      schemapb.DataType_ArrayOfStruct,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_StructArrays{
+			StructArrays: &schemapb.StructArrayField{
+				Fields: testutils.GenerateArrayOfStructArray(schema, numRow, dim),
+			},
+		},
+	}
+	return fieldData
 }
 
 func GenerateInt64Array(numRows int, start int64) []int64 {

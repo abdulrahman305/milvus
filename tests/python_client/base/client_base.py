@@ -1,4 +1,3 @@
-import pytest
 import sys
 from typing import Dict, List
 from pymilvus import DefaultConfig
@@ -18,7 +17,7 @@ from common import common_func as cf
 from common import common_type as ct
 from common.common_params import IndexPrams
 
-from pymilvus import ResourceGroupInfo, DataType, utility
+from pymilvus import ResourceGroupInfo, DataType, utility, MilvusClient
 import pymilvus
 
 
@@ -139,6 +138,7 @@ class TestcaseBase(Base):
     Additional methods;
     Public methods that can be used for test cases.
     """
+    client = None
 
     def _connect(self, enable_milvus_client_api=False):
         """ Add a connection and create the connect """
@@ -153,6 +153,7 @@ class TestcaseBase(Base):
             self.connection_wrap.connect(alias=DefaultConfig.DEFAULT_USING,uri=uri,token=cf.param_info.param_token)
             res, is_succ = self.connection_wrap.MilvusClient(uri=uri,
                                                              token=cf.param_info.param_token)
+            self.client = MilvusClient(uri=uri, token=cf.param_info.param_token)
         else:
             if cf.param_info.param_user and cf.param_info.param_password:
                 res, is_succ = self.connection_wrap.connect(alias=DefaultConfig.DEFAULT_USING,
@@ -166,9 +167,27 @@ class TestcaseBase(Base):
                                                             host=cf.param_info.param_host,
                                                             port=cf.param_info.param_port)
 
+            uri = "http://" + cf.param_info.param_host + ":" + str(cf.param_info.param_port)
+            self.client = MilvusClient(uri=uri, token=cf.param_info.param_token)
         server_version = utility.get_server_version()
         log.info(f"server version: {server_version}")
         return res
+
+
+    def get_tokens_by_analyzer(self, text, analyzer_params):
+        if cf.param_info.param_uri:
+            uri = cf.param_info.param_uri
+        else:
+            uri = "http://" + cf.param_info.param_host + ":" + str(cf.param_info.param_port)
+
+        client = MilvusClient(
+            uri = uri,
+            token = cf.param_info.param_token
+        )
+        res = client.run_analyzer(text, analyzer_params, with_detail=True, with_hash=True)
+        tokens = [r['token'] for r in res.tokens]
+        return tokens
+
 
     # def init_async_milvus_client(self):
     #     uri = cf.param_info.param_uri or f"http://{cf.param_info.param_host}:{cf.param_info.param_port}"
@@ -182,7 +201,7 @@ class TestcaseBase(Base):
 
     def init_collection_wrap(self, name=None, schema=None, check_task=None, check_items=None,
                              enable_dynamic_field=False, with_json=True, **kwargs):
-        name = cf.gen_unique_str('coll_') if name is None else name
+        name = cf.gen_collection_name_by_testcase_name(2) if name is None else name
         schema = cf.gen_default_collection_schema(enable_dynamic_field=enable_dynamic_field, with_json=with_json) \
             if schema is None else schema
         if not self.connection_wrap.has_connection(alias=DefaultConfig.DEFAULT_USING)[0]:
@@ -260,7 +279,7 @@ class TestcaseBase(Base):
                                 auto_id=False, dim=ct.default_dim, is_index=True,
                                 primary_field=ct.default_int64_field_name, is_flush=True, name=None,
                                 enable_dynamic_field=False, with_json=True, random_primary_key=False,
-                                multiple_dim_array=[], is_partition_key=None, vector_data_type="FLOAT_VECTOR",
+                                multiple_dim_array=[], is_partition_key=None, vector_data_type=DataType.FLOAT_VECTOR,
                                 nullable_fields={}, default_value_fields={}, language=None, **kwargs):
         """
         target: create specified collections
@@ -276,7 +295,7 @@ class TestcaseBase(Base):
         log.info("Test case of search interface: initialize before test case")
         if not self.connection_wrap.has_connection(alias=DefaultConfig.DEFAULT_USING)[0]:
             self._connect()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name(2)
         if name is not None:
             collection_name = name
         if not isinstance(nullable_fields, dict):
@@ -302,7 +321,7 @@ class TestcaseBase(Base):
                                                                      primary_field=primary_field,
                                                                      nullable_fields=nullable_fields,
                                                                      default_value_fields=default_value_fields)
-        if vector_data_type == ct.sparse_vector:
+        if vector_data_type == DataType.SPARSE_FLOAT_VECTOR:
             default_schema = cf.gen_default_sparse_schema(auto_id=auto_id, primary_field=primary_field,
                                                           enable_dynamic_field=enable_dynamic_field,
                                                           with_json=with_json,
@@ -339,7 +358,7 @@ class TestcaseBase(Base):
             # This condition will be removed after auto index feature
             if is_binary:
                 collection_w.create_index(ct.default_binary_vec_field_name, ct.default_bin_flat_index)
-            elif vector_data_type == ct.sparse_vector:
+            elif vector_data_type == DataType.SPARSE_FLOAT_VECTOR:
                 for vector_name in vector_name_list:
                     collection_w.create_index(vector_name, ct.default_sparse_inverted_index)
             else:
@@ -347,8 +366,10 @@ class TestcaseBase(Base):
                     vector_name_list.append(ct.default_float_vec_field_name)
                 for vector_name in vector_name_list:
                     # Unlike dense vectors, sparse vectors cannot create flat index.
-                    if ct.sparse_vector in vector_name:
+                    if DataType.SPARSE_FLOAT_VECTOR.name in vector_name:
                         collection_w.create_index(vector_name, ct.default_sparse_inverted_index)
+                    elif vector_data_type == DataType.INT8_VECTOR:
+                        collection_w.create_index(vector_name, ct.int8_vector_index)
                     else:
                         collection_w.create_index(vector_name, ct.default_flat_index)
 
@@ -363,7 +384,8 @@ class TestcaseBase(Base):
         :return: collection wrap and partition wrap
         """
         self._connect()
-        collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix))
+        collection_name = cf.gen_collection_name_by_testcase_name(2)
+        collection_w = self.init_collection_wrap(name=collection_name)
         partition_w = self.init_partition_wrap(collection_wrap=collection_w)
         # insert [0, half) into partition_w
         df_partition = cf.gen_default_dataframe_data(nb=half, start=0)
@@ -387,7 +409,8 @@ class TestcaseBase(Base):
         :param is_dup: whether the primary keys of each segment is duplicated
         :return: collection wrap and partition wrap
         """
-        collection_w = self.init_collection_wrap(name=cf.gen_unique_str(collection_prefix), shards_num=1)
+        collection_name = cf.gen_collection_name_by_testcase_name(2)
+        collection_w = self.init_collection_wrap(name=collection_name, shards_num=1)
 
         for i in range(num_of_segment):
             start = 0 if is_dup else i * nb_of_segment

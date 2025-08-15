@@ -32,9 +32,9 @@ type CreateAliasTask struct {
 	baseTask
 	Condition
 	*milvuspb.CreateAliasRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 // TraceCtx returns the trace context of the task.
@@ -105,8 +105,11 @@ func (t *CreateAliasTask) PreExecute(ctx context.Context) error {
 // Execute defines the tual execution of create alias
 func (t *CreateAliasTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.CreateAlias(ctx, t.CreateAliasRequest)
-	return merr.CheckRPCCall(t.result, err)
+	t.result, err = t.mixCoord.CreateAlias(ctx, t.CreateAliasRequest)
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
+		return err
+	}
+	return nil
 }
 
 // PostExecute defines the post execution, do nothing for create alias
@@ -119,9 +122,9 @@ type DropAliasTask struct {
 	baseTask
 	Condition
 	*milvuspb.DropAliasRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 // TraceCtx returns the context for trace
@@ -170,17 +173,19 @@ func (t *DropAliasTask) OnEnqueue() error {
 }
 
 func (t *DropAliasTask) PreExecute(ctx context.Context) error {
-	collAlias := t.Alias
-	if err := ValidateCollectionAlias(collAlias); err != nil {
-		return err
-	}
+	// No need to check collection name
+	// Validation shall be preformed in `CreateCollection`
+	// also permit drop collection one with bad collection name
 	return nil
 }
 
 func (t *DropAliasTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.DropAlias(ctx, t.DropAliasRequest)
-	return merr.CheckRPCCall(t.result, err)
+	t.result, err = t.mixCoord.DropAlias(ctx, t.DropAliasRequest)
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *DropAliasTask) PostExecute(ctx context.Context) error {
@@ -192,9 +197,9 @@ type AlterAliasTask struct {
 	baseTask
 	Condition
 	*milvuspb.AlterAliasRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *AlterAliasTask) TraceCtx() context.Context {
@@ -255,8 +260,11 @@ func (t *AlterAliasTask) PreExecute(ctx context.Context) error {
 
 func (t *AlterAliasTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.AlterAlias(ctx, t.AlterAliasRequest)
-	return merr.CheckRPCCall(t.result, err)
+	t.result, err = t.mixCoord.AlterAlias(ctx, t.AlterAliasRequest)
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *AlterAliasTask) PostExecute(ctx context.Context) error {
@@ -269,9 +277,9 @@ type DescribeAliasTask struct {
 	Condition
 	nodeID UniqueID
 	*milvuspb.DescribeAliasRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.DescribeAliasResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.DescribeAliasResponse
 }
 
 func (a *DescribeAliasTask) TraceCtx() context.Context {
@@ -323,7 +331,7 @@ func (a *DescribeAliasTask) PreExecute(ctx context.Context) error {
 
 func (a *DescribeAliasTask) Execute(ctx context.Context) error {
 	var err error
-	a.result, err = a.rootCoord.DescribeAlias(ctx, a.DescribeAliasRequest)
+	a.result, err = a.mixCoord.DescribeAlias(ctx, a.DescribeAliasRequest)
 	return merr.CheckRPCCall(a.result, err)
 }
 
@@ -337,9 +345,9 @@ type ListAliasesTask struct {
 	Condition
 	nodeID UniqueID
 	*milvuspb.ListAliasesRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.ListAliasesResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.ListAliasesResponse
 }
 
 func (a *ListAliasesTask) TraceCtx() context.Context {
@@ -392,7 +400,7 @@ func (a *ListAliasesTask) PreExecute(ctx context.Context) error {
 
 func (a *ListAliasesTask) Execute(ctx context.Context) error {
 	var err error
-	a.result, err = a.rootCoord.ListAliases(ctx, a.ListAliasesRequest)
+	a.result, err = a.mixCoord.ListAliases(ctx, a.ListAliasesRequest)
 	return merr.CheckRPCCall(a.result, err)
 }
 

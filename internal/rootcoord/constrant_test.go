@@ -26,11 +26,13 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
+	"github.com/milvus-io/milvus/internal/util/testutil"
 	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestCheckGeneralCapacity(t *testing.T) {
+	testutil.ResetEnvironment()
 	ctx := context.Background()
 
 	catalog := mocks.NewRootCoordCatalog(t)
@@ -75,7 +77,7 @@ func TestCheckGeneralCapacity(t *testing.T) {
 	err = checkGeneralCapacity(ctx, 1, 2, 256, core)
 	assert.NoError(t, err)
 
-	catalog.EXPECT().AlterCollection(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	catalog.EXPECT().AlterCollection(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	err = meta.ChangeCollectionState(ctx, 1, pb.CollectionState_CollectionCreated, typeutil.MaxTimestamp)
 	assert.NoError(t, err)
 

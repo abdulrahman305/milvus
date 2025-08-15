@@ -89,6 +89,10 @@ func (m *GrpcRootCoordClient) SelectGrant(ctx context.Context, in *milvuspb.Sele
 	return &milvuspb.SelectGrantResponse{}, m.Err
 }
 
+func (m *GrpcRootCoordClient) AddCollectionField(ctx context.Context, in *milvuspb.AddCollectionFieldRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
 func (m *GrpcRootCoordClient) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest, opts ...grpc.CallOption) (*internalpb.ListPolicyResponse, error) {
 	return &internalpb.ListPolicyResponse{}, m.Err
 }
@@ -300,4 +304,8 @@ func (m *GrpcRootCoordClient) OperatePrivilegeGroup(ctx context.Context, in *mil
 
 func (m *GrpcRootCoordClient) Close() error {
 	return nil
+}
+
+func (m *GrpcRootCoordClient) GetQuotaMetrics(ctx context.Context, in *internalpb.GetQuotaMetricsRequest, opts ...grpc.CallOption) (*internalpb.GetQuotaMetricsResponse, error) {
+	return &internalpb.GetQuotaMetricsResponse{}, m.Err
 }

@@ -15,7 +15,9 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/segment/stats"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
 	"github.com/milvus-io/milvus/internal/util/idalloc"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
@@ -28,25 +30,33 @@ import (
 
 // flusherComponents is the components of the flusher.
 type flusherComponents struct {
-	wal               wal.WAL
-	broker            broker.Broker
-	cpUpdater         *util.ChannelCheckpointUpdater
-	chunkManager      storage.ChunkManager
-	dataServices      map[string]*dataSyncServiceWrapper
-	checkpointManager *pchannelCheckpointManager
-	logger            *log.MLogger
-}
-
-// StartMessageID returns the start message id of the flusher after recovering.
-func (impl *flusherComponents) StartMessageID() message.MessageID {
-	return impl.checkpointManager.StartMessageID()
+	wal                        wal.WAL
+	broker                     broker.Broker
+	cpUpdater                  *util.ChannelCheckpointUpdater
+	chunkManager               storage.ChunkManager
+	dataServices               map[string]*dataSyncServiceWrapper
+	logger                     *log.MLogger
+	recoveryCheckPointTimeTick uint64 // The time tick of the recovery storage.
+	rs                         recovery.RecoveryStorage
 }
 
 // WhenCreateCollection handles the create collection message.
 func (impl *flusherComponents) WhenCreateCollection(createCollectionMsg message.ImmutableCreateCollectionMessageV1) {
+	// because we need to get the schema from the recovery storage, we need to observe the message at recovery storage first.
+	impl.rs.ObserveMessage(context.Background(), createCollectionMsg)
 	if _, ok := impl.dataServices[createCollectionMsg.VChannel()]; ok {
 		impl.logger.Info("the data sync service of current vchannel is built, skip it", zap.String("vchannel", createCollectionMsg.VChannel()))
 		// May repeated consumed, so we ignore the message.
+		return
+	}
+	if createCollectionMsg.TimeTick() <= impl.recoveryCheckPointTimeTick {
+		// It should already be recovered from the recovery storage.
+		// if it's not in recovery storage, it means the createCollection is already dropped.
+		// so we can skip it.
+		impl.logger.Info("the create collection message is older than the recovery checkpoint, skip it",
+			zap.String("vchannel", createCollectionMsg.VChannel()),
+			zap.Uint64("timeTick", createCollectionMsg.TimeTick()),
+			zap.Uint64("recoveryCheckPointTimeTick", impl.recoveryCheckPointTimeTick))
 		return
 	}
 	createCollectionRequest, err := createCollectionMsg.Body()
@@ -70,6 +80,7 @@ func (impl *flusherComponents) WhenCreateCollection(createCollectionMsg message.
 			CheckpointUpdater:  impl.cpUpdater,
 			Allocator:          idalloc.NewMAllocator(resource.Resource().IDAllocator()),
 			MsgHandler:         newMsgHandler(resource.Resource().WriteBufferManager()),
+			SchemaManager:      newVersionedSchemaManager(createCollectionMsg.VChannel(), impl.rs),
 		},
 		msgChan,
 		&datapb.VchannelInfo{
@@ -83,14 +94,13 @@ func (impl *flusherComponents) WhenCreateCollection(createCollectionMsg message.
 				Timestamp: createCollectionMsg.TimeTick(),
 			},
 		},
-		schema,
 		func(t syncmgr.Task, err error) {
 			if err != nil || t == nil {
 				return
 			}
 			if tt, ok := t.(*syncmgr.SyncTask); ok {
 				insertLogs, _, _, _ := tt.Binlogs()
-				resource.Resource().SegmentAssignStatsManager().UpdateOnSync(tt.SegmentID(), stats.SyncOperationMetrics{
+				resource.Resource().SegmentStatsManager().UpdateOnSync(tt.SegmentID(), stats.SyncOperationMetrics{
 					BinLogCounterIncr:     1,
 					BinLogFileCounterIncr: uint64(len(insertLogs)),
 				})
@@ -109,7 +119,6 @@ func (impl *flusherComponents) WhenDropCollection(vchannel string) {
 		delete(impl.dataServices, vchannel)
 		impl.logger.Info("drop data sync service", zap.String("vchannel", vchannel))
 	}
-	impl.checkpointManager.DropVChannel(vchannel)
 }
 
 // HandleMessage handles the plain message.
@@ -140,8 +149,7 @@ func (impl *flusherComponents) addNewDataSyncService(
 	input chan<- *msgstream.MsgPack,
 	ds *pipeline.DataSyncService,
 ) {
-	impl.checkpointManager.AddVChannel(createCollectionMsg.VChannel(), createCollectionMsg.LastConfirmedMessageID())
-	newDS := newDataSyncServiceWrapper(input, ds)
+	newDS := newDataSyncServiceWrapper(createCollectionMsg.VChannel(), input, ds, createCollectionMsg.TimeTick())
 	newDS.Start()
 	impl.dataServices[createCollectionMsg.VChannel()] = newDS
 	impl.logger.Info("create data sync service done", zap.String("vchannel", createCollectionMsg.VChannel()))
@@ -154,7 +162,6 @@ func (impl *flusherComponents) Close() {
 		impl.logger.Info("data sync service closed for flusher closing", zap.String("vchannel", vchannel))
 	}
 	impl.cpUpdater.Close()
-	impl.checkpointManager.Close()
 }
 
 // recover recover the components of the flusher.
@@ -168,12 +175,23 @@ func (impl *flusherComponents) recover(ctx context.Context, recoverInfos map[str
 		futures[vchannel] = future
 	}
 	dataServices := make(map[string]*dataSyncServiceWrapper, len(futures))
+	var lastErr error
 	for vchannel, future := range futures {
 		ds, err := future.Await()
 		if err != nil {
-			return err
+			lastErr = err
+			continue
 		}
 		dataServices[vchannel] = ds.(*dataSyncServiceWrapper)
+	}
+	if lastErr != nil {
+		// release all the data sync services if operation is canceled.
+		// otherwise, the write buffer will leak.
+		for _, ds := range dataServices {
+			ds.Close()
+		}
+		impl.logger.Warn("failed to build data sync service, may be canceled when recovering", zap.Error(lastErr))
+		return lastErr
 	}
 	impl.dataServices = dataServices
 	for vchannel, ds := range dataServices {
@@ -185,6 +203,35 @@ func (impl *flusherComponents) recover(ctx context.Context, recoverInfos map[str
 
 // buildDataSyncServiceWithRetry builds the data sync service with retry.
 func (impl *flusherComponents) buildDataSyncServiceWithRetry(ctx context.Context, recoverInfo *datapb.GetChannelRecoveryInfoResponse) (*dataSyncServiceWrapper, error) {
+	// Flush all the growing segment that is not created by streaming.
+	for _, segment := range recoverInfo.SegmentsNotCreatedByStreaming {
+		logger := impl.logger.With(
+			zap.Int64("collectionID", segment.CollectionId),
+			zap.String("vchannel", recoverInfo.GetInfo().GetChannelName()),
+			zap.Int64("partitionID", segment.PartitionId),
+			zap.Int64("segmentID", segment.SegmentId),
+		)
+		if err := retry.Do(ctx, func() error {
+			msg := message.NewFlushMessageBuilderV2().
+				WithVChannel(recoverInfo.GetInfo().GetChannelName()).
+				WithHeader(&message.FlushMessageHeader{
+					CollectionId: segment.CollectionId,
+					PartitionId:  segment.PartitionId,
+					SegmentId:    segment.SegmentId,
+				}).
+				WithBody(&message.FlushMessageBody{}).MustBuildMutable()
+			appendResult, err := impl.wal.Append(utility.WithFlushFromOldArch(ctx), msg)
+			if err != nil {
+				logger.Warn("fail to append flush message for segments that not created by streaming service into wal", zap.Error(err))
+				return err
+			}
+			logger.Info("append flush message for segments that not created by streaming service into wal", zap.Stringer("msgID", appendResult.MessageID), zap.Uint64("timeTick", appendResult.TimeTick))
+			return nil
+		}, retry.AttemptAlways()); err != nil {
+			return nil, err
+		}
+	}
+
 	var ds *dataSyncServiceWrapper
 	err := retry.Do(ctx, func() error {
 		var err error
@@ -201,6 +248,8 @@ func (impl *flusherComponents) buildDataSyncServiceWithRetry(ctx context.Context
 func (impl *flusherComponents) buildDataSyncService(ctx context.Context, recoverInfo *datapb.GetChannelRecoveryInfoResponse) (*dataSyncServiceWrapper, error) {
 	// Build and add pipeline.
 	input := make(chan *msgstream.MsgPack, 10)
+	schemaManager := newVersionedSchemaManager(recoverInfo.GetInfo().GetChannelName(), impl.rs)
+	schema := schemaManager.GetSchema(0)
 	ds, err := pipeline.NewStreamingNodeDataSyncService(ctx,
 		&util.PipelineParams{
 			Ctx:                context.Background(),
@@ -211,8 +260,9 @@ func (impl *flusherComponents) buildDataSyncService(ctx context.Context, recover
 			CheckpointUpdater:  impl.cpUpdater,
 			Allocator:          idalloc.NewMAllocator(resource.Resource().IDAllocator()),
 			MsgHandler:         newMsgHandler(resource.Resource().WriteBufferManager()),
+			SchemaManager:      newVersionedSchemaManager(recoverInfo.GetInfo().GetChannelName(), impl.rs),
 		},
-		&datapb.ChannelWatchInfo{Vchan: recoverInfo.GetInfo(), Schema: recoverInfo.GetSchema()},
+		&datapb.ChannelWatchInfo{Vchan: recoverInfo.GetInfo(), Schema: schema},
 		input,
 		func(t syncmgr.Task, err error) {
 			if err != nil || t == nil {
@@ -220,7 +270,7 @@ func (impl *flusherComponents) buildDataSyncService(ctx context.Context, recover
 			}
 			if tt, ok := t.(*syncmgr.SyncTask); ok {
 				insertLogs, _, _, _ := tt.Binlogs()
-				resource.Resource().SegmentAssignStatsManager().UpdateOnSync(tt.SegmentID(), stats.SyncOperationMetrics{
+				resource.Resource().SegmentStatsManager().UpdateOnSync(tt.SegmentID(), stats.SyncOperationMetrics{
 					BinLogCounterIncr:     1,
 					BinLogFileCounterIncr: uint64(len(insertLogs)),
 				})
@@ -231,5 +281,5 @@ func (impl *flusherComponents) buildDataSyncService(ctx context.Context, recover
 	if err != nil {
 		return nil, err
 	}
-	return newDataSyncServiceWrapper(input, ds), nil
+	return newDataSyncServiceWrapper(recoverInfo.Info.ChannelName, input, ds, recoverInfo.Info.GetSeekPosition().GetTimestamp()), nil
 }

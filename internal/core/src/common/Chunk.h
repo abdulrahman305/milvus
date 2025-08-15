@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <sys/types.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -20,6 +21,8 @@
 #include "arrow/array/array_base.h"
 #include "arrow/record_batch.h"
 #include "common/Array.h"
+#include "common/File.h"
+#include "common/VectorArray.h"
 #include "common/ChunkTarget.h"
 #include "common/EasyAssert.h"
 #include "common/FieldDataInterface.h"
@@ -36,8 +39,16 @@ constexpr uint64_t MMAP_ARRAY_PADDING = 1;
 class Chunk {
  public:
     Chunk() = default;
-    Chunk(int64_t row_nums, char* data, uint64_t size, bool nullable)
-        : data_(data), row_nums_(row_nums), size_(size), nullable_(nullable) {
+    Chunk(int64_t row_nums,
+          char* data,
+          uint64_t size,
+          bool nullable,
+          std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : data_(data),
+          row_nums_(row_nums),
+          size_(size),
+          nullable_(nullable),
+          mmap_file_raii_(std::move(mmap_file_raii)) {
         if (nullable) {
             valid_.reserve(row_nums);
             for (int i = 0; i < row_nums; i++) {
@@ -51,6 +62,11 @@ class Chunk {
 
     uint64_t
     Size() const {
+        return size_;
+    }
+
+    size_t
+    CellByteSize() const {
         return size_;
     }
 
@@ -73,7 +89,7 @@ class Chunk {
     }
 
     virtual bool
-    isValid(int offset) {
+    isValid(int offset) const {
         if (nullable_) {
             return valid_[offset];
         }
@@ -87,7 +103,10 @@ class Chunk {
     bool nullable_;
     FixedVector<bool>
         valid_;  // parse null bitmap to valid_ to be compatible with SpanBase
+
+    std::unique_ptr<MmapFileRAII> mmap_file_raii_;
 };
+
 // for fixed size data, includes fixed size array
 class FixedWidthChunk : public Chunk {
  public:
@@ -96,8 +115,9 @@ class FixedWidthChunk : public Chunk {
                     char* data,
                     uint64_t size,
                     uint64_t element_size,
-                    bool nullable)
-        : Chunk(row_nums, data, size, nullable),
+                    bool nullable,
+                    std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)),
           dim_(dim),
           element_size_(element_size) {
         auto null_bitmap_bytes_num = nullable_ ? (row_nums_ + 7) / 8 : 0;
@@ -152,16 +172,23 @@ class FixedWidthChunk : public Chunk {
 class StringChunk : public Chunk {
  public:
     StringChunk() = default;
-    StringChunk(int32_t row_nums, char* data, uint64_t size, bool nullable)
-        : Chunk(row_nums, data, size, nullable) {
+    StringChunk(int32_t row_nums,
+                char* data,
+                uint64_t size,
+                bool nullable,
+                std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)) {
         auto null_bitmap_bytes_num = nullable_ ? (row_nums_ + 7) / 8 : 0;
         offsets_ = reinterpret_cast<uint32_t*>(data + null_bitmap_bytes_num);
     }
 
     std::string_view
     operator[](const int i) const {
-        if (i < 0 || i > row_nums_) {
-            PanicInfo(ErrorCode::OutOfRange, "index out of range");
+        if (i < 0 || i >= row_nums_) {
+            ThrowInfo(ErrorCode::OutOfRange,
+                      "index out of range {} at {}",
+                      i,
+                      row_nums_);
         }
 
         return {data_ + offsets_[i], offsets_[i + 1] - offsets_[i]};
@@ -214,7 +241,6 @@ class StringChunk : public Chunk {
 
 using JSONChunk = StringChunk;
 
-
 // An ArrayChunk is a class that represents a collection of arrays stored in a contiguous memory block.
 // It is initialized with the number of rows, a pointer to the data, the size of the data, the element type,
 // and a boolean indicating whether the data can contain null values. The data is accessed using offsets and lengths,
@@ -226,11 +252,11 @@ using JSONChunk = StringChunk;
 // create an ArrayChunk for these arrays. The data block might look like this:
 //
 // [null_bitmap][offsets_lens][array_data]
-// [00000000] [24, 3, 36, 2, 44, 4, 60] [1, 2, 3, 4, 5, 6, 7, 8, 9]
+// [00000000] [29, 3, 41, 2, 49, 4, 65] [1, 2, 3, 4, 5, 6, 7, 8, 9]
 //
 // For string arrays, the structure is more complex as each string element needs its own offset:
 // [null_bitmap][offsets_lens][array1_offsets][array1_data][array2_offsets][array2_data][array3_offsets][array3_data]
-// [00000000] [24, 3, 48, 2, 64, 4, 96] [0, 5, 11, 16] ["hello", "world", "!"] [0, 3, 6] ["foo", "bar"] [0, 6, 12, 18, 24] ["apple", "orange", "banana", "grape"]
+// [00000000] [29, 3, 53, 2, 69, 4, 101] [0, 5, 11, 16] ["hello", "world", "!"] [0, 3, 6] ["foo", "bar"] [0, 6, 12, 18, 24] ["apple", "orange", "banana", "grape"]
 //
 // Here, the null_bitmap is empty (indicating no nulls), the offsets_lens array contains pairs of (offset, length)
 // for each array, and the array_data contains the actual array elements.
@@ -246,8 +272,10 @@ class ArrayChunk : public Chunk {
                char* data,
                uint64_t size,
                milvus::DataType element_type,
-               bool nullable)
-        : Chunk(row_nums, data, size, nullable), element_type_(element_type) {
+               bool nullable,
+               std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)),
+          element_type_(element_type) {
         auto null_bitmap_bytes_num = 0;
         if (nullable) {
             null_bitmap_bytes_num = (row_nums + 7) / 8;
@@ -275,6 +303,20 @@ class ArrayChunk : public Chunk {
                          next_offset - offset - offsets_bytes_len,
                          element_type_,
                          offsets_ptr);
+    }
+
+    std::pair<std::vector<ArrayView>, FixedVector<bool>>
+    ViewsByOffsets(const FixedVector<int32_t>& offsets) {
+        std::vector<ArrayView> views;
+        FixedVector<bool> valid_res;
+        size_t size = offsets.size();
+        views.reserve(size);
+        valid_res.reserve(size);
+        for (auto i = 0; i < size; ++i) {
+            views.emplace_back(View(offsets[i]));
+            valid_res.emplace_back(isValid(offsets[i]));
+        }
+        return {std::move(views), std::move(valid_res)};
     }
 
     std::pair<std::vector<ArrayView>, FixedVector<bool>>
@@ -317,7 +359,7 @@ class ArrayChunk : public Chunk {
 
     const char*
     ValueAt(int64_t idx) const override {
-        PanicInfo(ErrorCode::Unsupported,
+        ThrowInfo(ErrorCode::Unsupported,
                   "ArrayChunk::ValueAt is not supported");
     }
 
@@ -326,13 +368,77 @@ class ArrayChunk : public Chunk {
     uint32_t* offsets_lens_;
 };
 
+// A VectorArrayChunk is similar to an ArrayChunk but is specialized for storing arrays of vectors.
+// Key differences and characteristics:
+// - No Nullability: VectorArrayChunk does not support null values. Unlike ArrayChunk, it does not have a null bitmap.
+// - Fixed Vector Dimensions: All vectors within a VectorArrayChunk have the same, fixed dimension, specified at creation.
+//   However, each row (array of vectors) can contain a variable number of these fixed-dimension vectors.
+//
+// Due to these characteristics, the data layout is simpler:
+// [offsets_lens][all_vector_data_concatenated]
+//
+// Example:
+// Suppose we have a data block containing arrays of vectors [[1, 2, 3], [4, 5, 6], [7, 8, 9]], [[10, 11, 12]], and [[13, 14, 15], [16, 17, 18]], and we want to
+// create a VectorArrayChunk for these arrays. The data block might look like this:
+//
+// [offsets_lens][all_vector_data_concatenated]
+// [28, 3, 36, 1, 76, 2, 100] [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+class VectorArrayChunk : public Chunk {
+ public:
+    VectorArrayChunk(int64_t dim,
+                     int32_t row_nums,
+                     char* data,
+                     uint64_t size,
+                     milvus::DataType element_type,
+                     std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : Chunk(row_nums, data, size, false, std::move(mmap_file_raii)),
+          dim_(dim),
+          element_type_(element_type) {
+        offsets_lens_ = reinterpret_cast<uint32_t*>(data);
+    }
+
+    VectorArrayView
+    View(int64_t idx) const {
+        int idx_off = 2 * idx;
+        auto offset = offsets_lens_[idx_off];
+        auto len = offsets_lens_[idx_off + 1];
+        auto next_offset = offsets_lens_[idx_off + 2];
+        auto data_ptr = data_ + offset;
+        return VectorArrayView(
+            data_ptr, dim_, len, next_offset - offset, element_type_);
+    }
+
+    std::vector<VectorArrayView>
+    Views() const {
+        std::vector<VectorArrayView> views;
+        views.reserve(row_nums_);
+        for (int64_t i = 0; i < row_nums_; i++) {
+            views.emplace_back(View(i));
+        }
+        return views;
+    }
+
+    const char*
+    ValueAt(int64_t idx) const override {
+        ThrowInfo(ErrorCode::Unsupported,
+                  "VectorArrayChunk::ValueAt is not supported");
+    }
+
+ private:
+    int64_t dim_;
+    uint32_t* offsets_lens_;
+    milvus::DataType element_type_;
+};
+
 class SparseFloatVectorChunk : public Chunk {
  public:
-    SparseFloatVectorChunk(int32_t row_nums,
-                           char* data,
-                           uint64_t size,
-                           bool nullable)
-        : Chunk(row_nums, data, size, nullable) {
+    SparseFloatVectorChunk(
+        int32_t row_nums,
+        char* data,
+        uint64_t size,
+        bool nullable,
+        std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)) {
         vec_.resize(row_nums);
         auto null_bitmap_bytes_num = (row_nums + 7) / 8;
         auto offsets_ptr =

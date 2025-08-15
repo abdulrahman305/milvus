@@ -21,6 +21,7 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include "common/JsonCastType.h"
 #include "common/Types.h"
 #include "common/type_c.h"
 #include "index/Index.h"
@@ -57,30 +58,33 @@ class IndexFactory {
     IndexLoadResource(DataType field_type,
                       IndexVersion index_version,
                       float index_size,
-                      std::map<std::string, std::string>& index_params,
+                      const std::map<std::string, std::string>& index_params,
                       bool mmap_enable);
 
     LoadResourceRequest
     VecIndexLoadResource(DataType field_type,
                          IndexVersion index_version,
                          float index_size,
-                         std::map<std::string, std::string>& index_params,
+                         const std::map<std::string, std::string>& index_params,
                          bool mmap_enable);
 
     LoadResourceRequest
-    ScalarIndexLoadResource(DataType field_type,
-                            IndexVersion index_version,
-                            float index_size,
-                            std::map<std::string, std::string>& index_params,
-                            bool mmap_enable);
+    ScalarIndexLoadResource(
+        DataType field_type,
+        IndexVersion index_version,
+        float index_size,
+        const std::map<std::string, std::string>& index_params,
+        bool mmap_enable);
 
     IndexBasePtr
     CreateIndex(const CreateIndexInfo& create_index_info,
-                const storage::FileManagerContext& file_manager_context);
+                const storage::FileManagerContext& file_manager_context,
+                bool use_build_pool = true);
 
     IndexBasePtr
     CreateVectorIndex(const CreateIndexInfo& create_index_info,
-                      const storage::FileManagerContext& file_manager_context);
+                      const storage::FileManagerContext& file_manager_context,
+                      bool use_knowhere_build_pool_ = true);
 
     // For base types like int, float, double, string, etc
     IndexBasePtr
@@ -89,6 +93,13 @@ class IndexFactory {
         const CreateIndexInfo& create_index_info,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
+
+    // Create ngram index
+    IndexBasePtr
+    CreateNgramIndex(DataType data_type,
+                     const NgramParams& params,
+                     const storage::FileManagerContext& file_manager_context =
+                         storage::FileManagerContext());
 
     // For types like array, struct, union, etc
     IndexBasePtr
@@ -105,9 +116,7 @@ class IndexFactory {
             storage::FileManagerContext());
 
     IndexBasePtr
-    CreateJsonIndex(IndexType index_type,
-                    DataType cast_dtype,
-                    const std::string& nested_path,
+    CreateJsonIndex(const CreateIndexInfo& create_index_info,
                     const storage::FileManagerContext& file_manager_context =
                         storage::FileManagerContext());
 

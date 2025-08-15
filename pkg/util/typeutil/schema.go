@@ -213,6 +213,27 @@ func CalcColumnSize(column *schemapb.FieldData) int {
 	return res
 }
 
+func calcVectorSize(column *schemapb.VectorField, vectorType schemapb.DataType) int {
+	res := 0
+	switch vectorType {
+	case schemapb.DataType_BinaryVector:
+		res += len(column.GetBinaryVector())
+	case schemapb.DataType_FloatVector:
+		res += len(column.GetFloatVector().Data) * 4
+	case schemapb.DataType_Float16Vector:
+		res += len(column.GetFloat16Vector()) * 2
+	case schemapb.DataType_BFloat16Vector:
+		res += len(column.GetBfloat16Vector()) * 2
+	case schemapb.DataType_SparseFloatVector:
+		panic("unimplemented")
+	case schemapb.DataType_Int8Vector:
+		res += len(column.GetInt8Vector())
+	default:
+		panic("Unknown data type:" + vectorType.String())
+	}
+	return res
+}
+
 func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int) (int, error) {
 	res := 0
 	for _, fs := range fieldsData {
@@ -227,12 +248,12 @@ func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int) (int, e
 			res += 8
 		case schemapb.DataType_VarChar, schemapb.DataType_Text:
 			if rowOffset >= len(fs.GetScalars().GetStringData().GetData()) {
-				return 0, fmt.Errorf("offset out range of field datas")
+				return 0, errors.New("offset out range of field datas")
 			}
 			res += len(fs.GetScalars().GetStringData().Data[rowOffset])
 		case schemapb.DataType_Array:
 			if rowOffset >= len(fs.GetScalars().GetArrayData().GetData()) {
-				return 0, fmt.Errorf("offset out range of field datas")
+				return 0, errors.New("offset out range of field datas")
 			}
 			array := fs.GetScalars().GetArrayData().GetData()[rowOffset]
 			res += CalcColumnSize(&schemapb.FieldData{
@@ -241,7 +262,7 @@ func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int) (int, e
 			})
 		case schemapb.DataType_JSON:
 			if rowOffset >= len(fs.GetScalars().GetJsonData().GetData()) {
-				return 0, fmt.Errorf("offset out range of field datas")
+				return 0, errors.New("offset out range of field datas")
 			}
 			res += len(fs.GetScalars().GetJsonData().GetData()[rowOffset])
 		case schemapb.DataType_BinaryVector:
@@ -259,6 +280,12 @@ func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int) (int, e
 			res += len(vec.Contents[rowOffset])
 		case schemapb.DataType_Int8Vector:
 			res += int(fs.GetVectors().GetDim())
+		case schemapb.DataType_ArrayOfVector:
+			arrayVector := fs.GetVectors().GetVectorArray()
+			if rowOffset >= len(arrayVector.GetData()) {
+				return 0, errors.New("offset out range of field datas")
+			}
+			res += calcVectorSize(arrayVector.GetData()[rowOffset], arrayVector.GetElementType())
 		default:
 			panic("Unknown data type:" + fs.GetType().String())
 		}
@@ -275,24 +302,33 @@ type SchemaHelper struct {
 	partitionKeyOffset  int
 	clusteringKeyOffset int
 	dynamicFieldOffset  int
-	loadFields          Set[int64]
+	// include sub fields in StructArrayField
+	allFields []*schemapb.FieldSchema
 }
 
-func CreateSchemaHelperWithLoadFields(schema *schemapb.CollectionSchema, loadFields []int64) (*SchemaHelper, error) {
+// CreateSchemaHelper returns a new SchemaHelper object
+func CreateSchemaHelper(schema *schemapb.CollectionSchema) (*SchemaHelper, error) {
 	if schema == nil {
 		return nil, errors.New("schema is nil")
 	}
+
+	allFields := make([]*schemapb.FieldSchema, 0, len(schema.Fields)+5)
+	allFields = append(allFields, schema.Fields...)
+	for _, structField := range schema.GetStructArrayFields() {
+		allFields = append(allFields, structField.GetFields()...)
+	}
+
 	schemaHelper := SchemaHelper{
 		schema:              schema,
+		allFields:           allFields,
 		nameOffset:          make(map[string]int),
 		idOffset:            make(map[int64]int),
 		primaryKeyOffset:    -1,
 		partitionKeyOffset:  -1,
 		clusteringKeyOffset: -1,
 		dynamicFieldOffset:  -1,
-		loadFields:          NewSet(loadFields...),
 	}
-	for offset, field := range schema.Fields {
+	for offset, field := range allFields {
 		if _, ok := schemaHelper.nameOffset[field.Name]; ok {
 			return nil, fmt.Errorf("duplicated fieldName: %s", field.Name)
 		}
@@ -332,43 +368,38 @@ func CreateSchemaHelperWithLoadFields(schema *schemapb.CollectionSchema, loadFie
 	return &schemaHelper, nil
 }
 
-// CreateSchemaHelper returns a new SchemaHelper object
-func CreateSchemaHelper(schema *schemapb.CollectionSchema) (*SchemaHelper, error) {
-	return CreateSchemaHelperWithLoadFields(schema, nil)
-}
-
 // GetPrimaryKeyField returns the schema of the primary key
 func (helper *SchemaHelper) GetPrimaryKeyField() (*schemapb.FieldSchema, error) {
 	if helper.primaryKeyOffset == -1 {
-		return nil, fmt.Errorf("failed to get primary key field: no primary in schema")
+		return nil, errors.New("failed to get primary key field: no primary in schema")
 	}
-	return helper.schema.Fields[helper.primaryKeyOffset], nil
+	return helper.allFields[helper.primaryKeyOffset], nil
 }
 
 // GetPartitionKeyField returns the schema of the partition key
 func (helper *SchemaHelper) GetPartitionKeyField() (*schemapb.FieldSchema, error) {
 	if helper.partitionKeyOffset == -1 {
-		return nil, fmt.Errorf("failed to get partition key field: no partition key in schema")
+		return nil, errors.New("failed to get partition key field: no partition key in schema")
 	}
-	return helper.schema.Fields[helper.partitionKeyOffset], nil
+	return helper.allFields[helper.partitionKeyOffset], nil
 }
 
 // GetClusteringKeyField returns the schema of the clustering key.
 // If not found, an error shall be returned.
 func (helper *SchemaHelper) GetClusteringKeyField() (*schemapb.FieldSchema, error) {
 	if helper.clusteringKeyOffset == -1 {
-		return nil, fmt.Errorf("failed to get clustering key field: not clustering key in schema")
+		return nil, errors.New("failed to get clustering key field: not clustering key in schema")
 	}
-	return helper.schema.Fields[helper.clusteringKeyOffset], nil
+	return helper.allFields[helper.clusteringKeyOffset], nil
 }
 
 // GetDynamicField returns the field schema of dynamic field if exists.
 // if there is no dynamic field defined in schema, error will be returned.
 func (helper *SchemaHelper) GetDynamicField() (*schemapb.FieldSchema, error) {
 	if helper.dynamicFieldOffset == -1 {
-		return nil, fmt.Errorf("failed to get dynamic field: no dynamic field in schema")
+		return nil, errors.New("failed to get dynamic field: no dynamic field in schema")
 	}
-	return helper.schema.Fields[helper.dynamicFieldOffset], nil
+	return helper.allFields[helper.dynamicFieldOffset], nil
 }
 
 // GetFieldFromName is used to find the schema by field name
@@ -377,7 +408,7 @@ func (helper *SchemaHelper) GetFieldFromName(fieldName string) (*schemapb.FieldS
 	if !ok {
 		return nil, fmt.Errorf("failed to get field schema by name: fieldName(%s) not found", fieldName)
 	}
-	return helper.schema.Fields[offset], nil
+	return helper.allFields[offset], nil
 }
 
 // GetFieldFromNameDefaultJSON is used to find the schema by field name, if not exist, use json field
@@ -386,20 +417,17 @@ func (helper *SchemaHelper) GetFieldFromNameDefaultJSON(fieldName string) (*sche
 	if !ok {
 		return helper.getDefaultJSONField(fieldName)
 	}
-	fieldSchema := helper.schema.Fields[offset]
-	if !helper.IsFieldLoaded(fieldSchema.GetFieldID()) {
-		return nil, errors.Newf("field %s is not loaded", fieldSchema)
-	}
+	fieldSchema := helper.allFields[offset]
 	return fieldSchema, nil
 }
 
-// GetFieldFromNameDefaultJSON returns whether is field loaded.
-// If load fields is not provided, treated as loaded
-func (helper *SchemaHelper) IsFieldLoaded(fieldID int64) bool {
-	if len(helper.loadFields) == 0 {
-		return true
+func (helper *SchemaHelper) GetStructArrayFieldFromName(fieldName string) *schemapb.StructArrayFieldSchema {
+	for _, field := range helper.schema.StructArrayFields {
+		if field.Name == fieldName {
+			return field
+		}
 	}
-	return helper.loadFields.Contain(fieldID)
+	return nil
 }
 
 func (helper *SchemaHelper) IsFieldTextMatchEnabled(fieldId int64) bool {
@@ -413,15 +441,12 @@ func (helper *SchemaHelper) IsFieldTextMatchEnabled(fieldId int64) bool {
 func (helper *SchemaHelper) getDefaultJSONField(fieldName string) (*schemapb.FieldSchema, error) {
 	for _, f := range helper.schema.GetFields() {
 		if f.DataType == schemapb.DataType_JSON && f.IsDynamic {
-			if !helper.IsFieldLoaded(f.GetFieldID()) {
-				return nil, errors.Newf("field %s is dynamic but dynamic field is not loaded", fieldName)
-			}
 			return f, nil
 		}
 	}
 	errMsg := fmt.Sprintf("field %s not exist", fieldName)
 	log.Warn(errMsg)
-	return nil, fmt.Errorf(errMsg)
+	return nil, fmt.Errorf("%s", errMsg)
 }
 
 // GetFieldFromID returns the schema of specified field
@@ -430,7 +455,7 @@ func (helper *SchemaHelper) GetFieldFromID(fieldID int64) (*schemapb.FieldSchema
 	if !ok {
 		return nil, fmt.Errorf("fieldID(%d) not found", fieldID)
 	}
-	return helper.schema.Fields[offset], nil
+	return helper.allFields[offset], nil
 }
 
 // GetVectorDimFromID returns the dimension of specified field
@@ -462,7 +487,7 @@ func (helper *SchemaHelper) GetFunctionByOutputField(field *schemapb.FieldSchema
 			}
 		}
 	}
-	return nil, fmt.Errorf("function not exist")
+	return nil, errors.New("function not exist")
 }
 
 // As of now, only BM25 function output field is not supported to retrieve raw field data
@@ -530,7 +555,11 @@ func IsFixDimVectorType(dataType schemapb.DataType) bool {
 
 // IsVectorType returns true if input is a vector type, otherwise false
 func IsVectorType(dataType schemapb.DataType) bool {
-	return IsBinaryVectorType(dataType) || IsFloatVectorType(dataType) || IsIntVectorType(dataType)
+	return IsBinaryVectorType(dataType) || IsFloatVectorType(dataType) || IsIntVectorType(dataType) || IsVectorArrayType(dataType)
+}
+
+func IsVectorArrayType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_ArrayOfVector
 }
 
 // IsIntegerType returns true if input is an integer type, otherwise false
@@ -597,7 +626,7 @@ func IsArrayContainStringElementType(dataType schemapb.DataType, elementType sch
 }
 
 func IsVariableDataType(dataType schemapb.DataType) bool {
-	return IsStringType(dataType) || IsArrayType(dataType) || IsJSONType(dataType)
+	return IsStringType(dataType) || IsArrayType(dataType) || IsJSONType(dataType) || IsVectorArrayType(dataType)
 }
 
 func IsPrimitiveType(dataType schemapb.DataType) bool {
@@ -724,21 +753,28 @@ func PrepareResultFieldData(sample []*schemapb.FieldData, topK int64) []*schemap
 // AppendFieldData appends fields data of specified index from src to dst
 func AppendFieldData(dst, src []*schemapb.FieldData, idx int64) (appendSize int64) {
 	for i, fieldData := range src {
+		if dst[i] == nil {
+			dst[i] = &schemapb.FieldData{
+				Type:      fieldData.Type,
+				FieldName: fieldData.FieldName,
+				FieldId:   fieldData.FieldId,
+				IsDynamic: fieldData.IsDynamic,
+			}
+		}
+		// assign null data
+		if len(fieldData.GetValidData()) != 0 {
+			if dst[i].ValidData == nil {
+				dst[i].ValidData = make([]bool, 0)
+			}
+			valid := fieldData.ValidData[idx]
+			dst[i].ValidData = append(dst[i].ValidData, valid)
+		}
 		switch fieldType := fieldData.Field.(type) {
 		case *schemapb.FieldData_Scalars:
 			if dst[i] == nil || dst[i].GetScalars() == nil {
-				dst[i] = &schemapb.FieldData{
-					Type:      fieldData.Type,
-					FieldName: fieldData.FieldName,
-					FieldId:   fieldData.FieldId,
-					IsDynamic: fieldData.IsDynamic,
-					Field: &schemapb.FieldData_Scalars{
-						Scalars: &schemapb.ScalarField{},
-					},
+				dst[i].Field = &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{},
 				}
-			}
-			if len(fieldData.GetValidData()) != 0 {
-				dst[i].ValidData = append(dst[i].ValidData, fieldData.ValidData[idx])
 			}
 			dstScalar := dst[i].GetScalars()
 			switch srcScalar := fieldType.Scalars.Data.(type) {
@@ -936,6 +972,18 @@ func AppendFieldData(dst, src []*schemapb.FieldData, idx int64) (appendSize int6
 				}
 				/* #nosec G103 */
 				appendSize += int64(unsafe.Sizeof(srcVector.Int8Vector[idx*dim : (idx+1)*dim]))
+			case *schemapb.VectorField_VectorArray:
+				if dstVector.GetVectorArray() == nil {
+					dstVector.Data = &schemapb.VectorField_VectorArray{
+						VectorArray: &schemapb.VectorArray{
+							Data:        []*schemapb.VectorField{srcVector.VectorArray.Data[idx]},
+							Dim:         srcVector.VectorArray.Dim,
+							ElementType: srcVector.VectorArray.ElementType,
+						},
+					}
+				} else {
+					dstVector.GetVectorArray().Data = append(dstVector.GetVectorArray().Data, srcVector.VectorArray.Data[idx])
+				}
 			default:
 				log.Error("Not supported field type", zap.String("field type", fieldData.Type.String()))
 			}
@@ -1008,22 +1056,17 @@ func DeleteFieldData(dst []*schemapb.FieldData) {
 func MergeFieldData(dst []*schemapb.FieldData, src []*schemapb.FieldData) error {
 	fieldID2Data := make(map[int64]*schemapb.FieldData)
 	for _, data := range dst {
+		if _, ok := data.Field.(*schemapb.FieldData_StructArrays); ok {
+			panic("struct is not flattened")
+		}
+
 		fieldID2Data[data.FieldId] = data
 	}
 	for _, srcFieldData := range src {
 		switch fieldType := srcFieldData.Field.(type) {
 		case *schemapb.FieldData_Scalars:
 			if _, ok := fieldID2Data[srcFieldData.FieldId]; !ok {
-				scalarFieldData := &schemapb.FieldData{
-					Type:      srcFieldData.Type,
-					FieldName: srcFieldData.FieldName,
-					FieldId:   srcFieldData.FieldId,
-					Field: &schemapb.FieldData_Scalars{
-						Scalars: &schemapb.ScalarField{},
-					},
-				}
-				dst = append(dst, scalarFieldData)
-				fieldID2Data[srcFieldData.FieldId] = scalarFieldData
+				return errors.New("fields in src but not in dst: " + srcFieldData.Type.String())
 			}
 			fieldData := fieldID2Data[srcFieldData.FieldId]
 			fieldData.ValidData = append(fieldData.ValidData, srcFieldData.GetValidData()...)
@@ -1125,20 +1168,8 @@ func MergeFieldData(dst []*schemapb.FieldData, src []*schemapb.FieldData) error 
 				return errors.New("unsupported data type: " + srcFieldData.Type.String())
 			}
 		case *schemapb.FieldData_Vectors:
-			dim := fieldType.Vectors.Dim
 			if _, ok := fieldID2Data[srcFieldData.FieldId]; !ok {
-				vectorFieldData := &schemapb.FieldData{
-					Type:      srcFieldData.Type,
-					FieldName: srcFieldData.FieldName,
-					FieldId:   srcFieldData.FieldId,
-					Field: &schemapb.FieldData_Vectors{
-						Vectors: &schemapb.VectorField{
-							Dim: dim,
-						},
-					},
-				}
-				dst = append(dst, vectorFieldData)
-				fieldID2Data[srcFieldData.FieldId] = vectorFieldData
+				return errors.New("fields in src but not in dst: " + srcFieldData.Type.String())
 			}
 			dstVector := fieldID2Data[srcFieldData.FieldId].GetVectors()
 			switch srcVector := fieldType.Vectors.Data.(type) {
@@ -1196,6 +1227,18 @@ func MergeFieldData(dst []*schemapb.FieldData, src []*schemapb.FieldData) error 
 					dstInt8Vector := dstVector.Data.(*schemapb.VectorField_Int8Vector)
 					dstInt8Vector.Int8Vector = append(dstInt8Vector.Int8Vector, srcVector.Int8Vector...)
 				}
+			case *schemapb.VectorField_VectorArray:
+				if dstVector.GetVectorArray() == nil {
+					dstVector.Data = &schemapb.VectorField_VectorArray{
+						VectorArray: &schemapb.VectorArray{
+							Dim:         srcVector.VectorArray.Dim,
+							ElementType: srcVector.VectorArray.ElementType,
+							Data:        srcVector.VectorArray.Data,
+						},
+					}
+				} else {
+					dstVector.GetVectorArray().Data = append(dstVector.GetVectorArray().Data, srcVector.VectorArray.Data...)
+				}
 			default:
 				log.Error("Not supported data type", zap.String("data type", srcFieldData.Type.String()))
 				return errors.New("unsupported data type: " + srcFieldData.Type.String())
@@ -1206,14 +1249,25 @@ func MergeFieldData(dst []*schemapb.FieldData, src []*schemapb.FieldData) error 
 	return nil
 }
 
-// GetVectorFieldSchema get vector field schema from collection schema.
-func GetVectorFieldSchema(schema *schemapb.CollectionSchema) (*schemapb.FieldSchema, error) {
-	for _, fieldSchema := range schema.GetFields() {
-		if IsVectorType(fieldSchema.DataType) {
-			return fieldSchema, nil
-		}
+// GetTotalFieldsNum get total fields number
+// We exclude StructArrayField itself as it does not contain data directly.
+func GetTotalFieldsNum(schema *schemapb.CollectionSchema) int {
+	num := len(schema.GetFields())
+	for _, structArrayField := range schema.GetStructArrayFields() {
+		num += len(structArrayField.GetFields())
 	}
-	return nil, errors.New("vector field is not found")
+	return num
+}
+
+// GetAllFieldSchemas returns every FieldSchema contained
+// in CollectionSchema, including those under StructArrayField.
+func GetAllFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldSchema {
+	all := make([]*schemapb.FieldSchema, 0, len(schema.Fields)+5)
+	all = append(all, schema.Fields...)
+	for _, structField := range schema.GetStructArrayFields() {
+		all = append(all, structField.Fields...)
+	}
+	return all
 }
 
 // GetVectorFieldSchemas get vector fields schema from collection schema.
@@ -1224,7 +1278,24 @@ func GetVectorFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldS
 			ret = append(ret, fieldSchema)
 		}
 	}
+	for _, structArrayField := range schema.GetStructArrayFields() {
+		for _, fieldSchema := range structArrayField.GetFields() {
+			if IsVectorType(fieldSchema.DataType) {
+				ret = append(ret, fieldSchema)
+			}
+		}
+	}
 
+	return ret
+}
+
+func GetDenseVectorFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldSchema {
+	ret := make([]*schemapb.FieldSchema, 0)
+	for _, fieldSchema := range schema.GetFields() {
+		if IsDenseFloatVectorType(fieldSchema.DataType) || IsBinaryVectorType(fieldSchema.DataType) || IsIntVectorType(fieldSchema.DataType) {
+			ret = append(ret, fieldSchema)
+		}
+	}
 	return ret
 }
 
@@ -1310,15 +1381,39 @@ func GetPrimaryFieldData(datas []*schemapb.FieldData, primaryFieldSchema *schema
 }
 
 func GetField(schema *schemapb.CollectionSchema, fieldID int64) *schemapb.FieldSchema {
-	return lo.FindOrElse(schema.GetFields(), nil, func(field *schemapb.FieldSchema) bool {
+	preficate := func(field *schemapb.FieldSchema) bool {
 		return field.GetFieldID() == fieldID
-	})
+	}
+
+	if field := lo.FindOrElse(schema.GetFields(), nil, preficate); field != nil {
+		return field
+	}
+
+	for _, structField := range schema.GetStructArrayFields() {
+		if field := lo.FindOrElse(structField.Fields, nil, preficate); field != nil {
+			return field
+		}
+	}
+
+	return nil
 }
 
 func GetFieldByName(schema *schemapb.CollectionSchema, fieldName string) *schemapb.FieldSchema {
-	return lo.FindOrElse(schema.GetFields(), nil, func(field *schemapb.FieldSchema) bool {
+	preficate := func(field *schemapb.FieldSchema) bool {
 		return field.GetName() == fieldName
-	})
+	}
+
+	if field := lo.FindOrElse(schema.GetFields(), nil, preficate); field != nil {
+		return field
+	}
+
+	for _, structField := range schema.GetStructArrayFields() {
+		if field := lo.FindOrElse(structField.Fields, nil, preficate); field != nil {
+			return field
+		}
+	}
+
+	return nil
 }
 
 func IsPrimaryFieldDataExist(datas []*schemapb.FieldData, primaryFieldSchema *schemapb.FieldSchema) bool {
@@ -1471,7 +1566,32 @@ func GetPK(data *schemapb.IDs, idx int64) interface{} {
 	return nil
 }
 
-func GetData(field *schemapb.FieldData, idx int) interface{} {
+func GetDataIterator(field *schemapb.FieldData) func(int) any {
+	if field.GetValidData() != nil {
+		// unpack valid data
+		idxs := make([]int, len(field.ValidData))
+		validCnt := 0
+		for i, valid := range field.ValidData {
+			if valid {
+				idxs[i] = validCnt
+				validCnt++
+			} else {
+				idxs[i] = -1
+			}
+		}
+		return func(idx int) any {
+			if idxs[idx] == -1 {
+				return nil
+			}
+			return getData(field, idxs[idx])
+		}
+	}
+	return func(idx int) any {
+		return getData(field, idx)
+	}
+}
+
+func getData(field *schemapb.FieldData, idx int) any {
 	switch field.GetType() {
 	case schemapb.DataType_Bool:
 		return field.GetScalars().GetBoolData().GetData()[idx]
@@ -1558,11 +1678,11 @@ func ComparePKInSlice(data *schemapb.IDs, i, j int) bool {
 
 // ComparePK returns if i-th PK of dataA > j-th PK of dataB
 func ComparePK(pkA, pkB interface{}) bool {
-	switch pkA.(type) {
+	switch v := pkA.(type) {
 	case int64:
-		return pkA.(int64) < pkB.(int64)
+		return v < pkB.(int64)
 	case string:
-		return pkA.(string) < pkB.(string)
+		return v < pkB.(string)
 	}
 	return false
 }
@@ -1661,64 +1781,6 @@ func SelectMinPKWithTimestamp[T interface {
 	}
 
 	return sel, drainResult
-}
-
-func AppendGroupByValue(dstResData *schemapb.SearchResultData,
-	groupByVal interface{}, srcDataType schemapb.DataType,
-) error {
-	if dstResData.GroupByFieldValue == nil {
-		dstResData.GroupByFieldValue = &schemapb.FieldData{
-			Type: srcDataType,
-			Field: &schemapb.FieldData_Scalars{
-				Scalars: &schemapb.ScalarField{},
-			},
-		}
-	}
-	dstScalarField := dstResData.GroupByFieldValue.GetScalars()
-	switch srcDataType {
-	case schemapb.DataType_Bool:
-		if dstScalarField.GetBoolData() == nil {
-			dstScalarField.Data = &schemapb.ScalarField_BoolData{
-				BoolData: &schemapb.BoolArray{
-					Data: []bool{},
-				},
-			}
-		}
-		dstScalarField.GetBoolData().Data = append(dstScalarField.GetBoolData().Data, groupByVal.(bool))
-	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
-		if dstScalarField.GetIntData() == nil {
-			dstScalarField.Data = &schemapb.ScalarField_IntData{
-				IntData: &schemapb.IntArray{
-					Data: []int32{},
-				},
-			}
-		}
-		dstScalarField.GetIntData().Data = append(dstScalarField.GetIntData().Data, groupByVal.(int32))
-	case schemapb.DataType_Int64:
-		if dstScalarField.GetLongData() == nil {
-			dstScalarField.Data = &schemapb.ScalarField_LongData{
-				LongData: &schemapb.LongArray{
-					Data: []int64{},
-				},
-			}
-		}
-		dstScalarField.GetLongData().Data = append(dstScalarField.GetLongData().Data, groupByVal.(int64))
-	case schemapb.DataType_VarChar:
-		if dstScalarField.GetStringData() == nil {
-			dstScalarField.Data = &schemapb.ScalarField_StringData{
-				StringData: &schemapb.StringArray{
-					Data: []string{},
-				},
-			}
-		}
-		dstScalarField.GetStringData().Data = append(dstScalarField.GetStringData().Data, groupByVal.(string))
-	default:
-		log.Error("Not supported field type from group_by value field", zap.String("field type",
-			srcDataType.String()))
-		return fmt.Errorf("not supported field type from group_by value field: %s",
-			srcDataType.String())
-	}
-	return nil
 }
 
 func appendSparseFloatArray(dst, src *schemapb.SparseFloatArray) {
@@ -1950,11 +2012,11 @@ func CreateSparseFloatRowFromMap(input map[string]interface{}) ([]byte, error) {
 			values = append(values, val)
 		}
 	} else {
-		return nil, fmt.Errorf("invalid JSON input")
+		return nil, errors.New("invalid JSON input")
 	}
 
 	if len(indices) != len(values) {
-		return nil, fmt.Errorf("indices and values length mismatch")
+		return nil, errors.New("indices and values length mismatch")
 	}
 
 	sortedIndices, sortedValues := SortSparseFloatRow(indices, values)

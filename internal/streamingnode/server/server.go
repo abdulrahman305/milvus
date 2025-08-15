@@ -47,6 +47,9 @@ func (s *Server) init() {
 	if err := initcore.InitStorageV2FileSystem(paramtable.Get()); err != nil {
 		panic(fmt.Sprintf("unrecoverable error happens at init storage v2 file system, %+v", err))
 	}
+
+	// init paramtable change callback for core related config
+	initcore.SetupCoreConfigChangelCallback()
 }
 
 // Stop stops the streamingnode server.
@@ -64,7 +67,7 @@ func (s *Server) initBasicComponent() {
 	var err error
 	s.walManager, err = walmanager.OpenManager()
 	if err != nil {
-		panic("open wal manager failed")
+		panic(fmt.Sprintf("open wal manager failed, %+v", err))
 	}
 	// Register the wal manager to the local registry.
 	registry.RegisterLocalWALManager(s.walManager)

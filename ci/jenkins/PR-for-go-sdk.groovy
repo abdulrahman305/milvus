@@ -2,7 +2,7 @@
 
 def pod = libraryResource 'io/milvus/pod/tekton-4am.yaml'
 
-def milvus_helm_chart_version = '4.2.8'
+def milvus_helm_chart_version = '5.0.0'
 
 pipeline {
     options {
@@ -57,7 +57,7 @@ pipeline {
                                               gitBaseRef: gitBaseRef,
                                               pullRequestNumber: "$env.CHANGE_ID",
                                               suppress_suffix_of_image_tag: true,
-                                              make_cmd: "make clean && make install use_disk_index=ON",
+                                              make_cmd: "make clean && make jobs=8 install use_disk_index=ON",
                                               images: '["milvus","gotestsum","helm"]'
 
                         milvus_image_tag = tekton.query_result job_name, 'milvus-image-tag'
@@ -87,7 +87,7 @@ pipeline {
                 axes {
                     axis {
                         name 'milvus_deployment_option'
-                        values 'standalone', 'distributed'
+                        values 'standalone'
                     }
                 }
                 stages {

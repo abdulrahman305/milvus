@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 	"github.com/milvus-io/milvus/internal/util/function/models/openai"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -42,10 +43,7 @@ type OpenAIEmbeddingProvider struct {
 
 func createOpenAIEmbeddingClient(apiKey string, url string) (*openai.OpenAIEmbeddingClient, error) {
 	if apiKey == "" {
-		apiKey = os.Getenv(openaiAKEnvStr)
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("Missing credentials. Please pass `api_key`, or configure the %s environment variable in the Milvus service.", openaiAKEnvStr)
+		return nil, fmt.Errorf("Missing credentials config or configure the %s environment variable in the Milvus service.", openaiAKEnvStr)
 	}
 
 	if url == "" {
@@ -56,16 +54,16 @@ func createOpenAIEmbeddingClient(apiKey string, url string) (*openai.OpenAIEmbed
 	return c, nil
 }
 
-func createAzureOpenAIEmbeddingClient(apiKey string, url string) (*openai.AzureOpenAIEmbeddingClient, error) {
+func createAzureOpenAIEmbeddingClient(apiKey string, url string, resourceName string) (*openai.AzureOpenAIEmbeddingClient, error) {
 	if apiKey == "" {
-		apiKey = os.Getenv(azureOpenaiAKEnvStr)
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("Missing credentials. Please pass `api_key`, or configure the %s environment variable in the Milvus service", azureOpenaiAKEnvStr)
+		return nil, fmt.Errorf("Missing credentials config or configure the %s environment variable in the Milvus service", azureOpenaiAKEnvStr)
 	}
 
 	if url == "" {
-		if resourceName := os.Getenv(azureOpenaiResourceName); resourceName != "" {
+		if resourceName == "" {
+			resourceName = os.Getenv(azureOpenaiResourceName)
+		}
+		if resourceName != "" {
 			url = fmt.Sprintf("https://%s.openai.azure.com", resourceName)
 		}
 	}
@@ -76,15 +74,14 @@ func createAzureOpenAIEmbeddingClient(apiKey string, url string) (*openai.AzureO
 	return c, nil
 }
 
-func newOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, isAzure bool) (*OpenAIEmbeddingProvider, error) {
+func newOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, params map[string]string, isAzure bool, credentials *credentials.Credentials) (*OpenAIEmbeddingProvider, error) {
 	fieldDim, err := typeutil.GetDim(fieldSchema)
 	if err != nil {
 		return nil, err
 	}
-	apiKey, url := parseAKAndURL(functionSchema.Params)
+
 	var modelName, user string
 	var dim int64
-
 	for _, param := range functionSchema.Params {
 		switch strings.ToLower(param.Key) {
 		case modelNameParamKey:
@@ -102,12 +99,21 @@ func newOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchem
 
 	var c openai.OpenAIEmbeddingInterface
 	if !isAzure {
+		apiKey, url, err := parseAKAndURL(credentials, functionSchema.Params, params, openaiAKEnvStr)
+		if err != nil {
+			return nil, err
+		}
 		c, err = createOpenAIEmbeddingClient(apiKey, url)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		c, err = createAzureOpenAIEmbeddingClient(apiKey, url)
+		apiKey, url, err := parseAKAndURL(credentials, functionSchema.Params, params, azureOpenaiAKEnvStr)
+		if err != nil {
+			return nil, err
+		}
+		resourceName := params["resource_name"]
+		c, err = createAzureOpenAIEmbeddingClient(apiKey, url, resourceName)
 		if err != nil {
 			return nil, err
 		}
@@ -125,12 +131,12 @@ func newOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchem
 	return &provider, nil
 }
 
-func NewOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema) (*OpenAIEmbeddingProvider, error) {
-	return newOpenAIEmbeddingProvider(fieldSchema, functionSchema, false)
+func NewOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, params map[string]string, credentials *credentials.Credentials) (*OpenAIEmbeddingProvider, error) {
+	return newOpenAIEmbeddingProvider(fieldSchema, functionSchema, params, false, credentials)
 }
 
-func NewAzureOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema) (*OpenAIEmbeddingProvider, error) {
-	return newOpenAIEmbeddingProvider(fieldSchema, functionSchema, true)
+func NewAzureOpenAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, params map[string]string, credentials *credentials.Credentials) (*OpenAIEmbeddingProvider, error) {
+	return newOpenAIEmbeddingProvider(fieldSchema, functionSchema, params, true, credentials)
 }
 
 func (provider *OpenAIEmbeddingProvider) MaxBatch() int {

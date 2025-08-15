@@ -42,6 +42,7 @@
 #include "common/Exception.h"
 #include "storage/ChunkManager.h"
 #include "storage/Types.h"
+#include "log/Log.h"
 
 namespace milvus::storage {
 
@@ -52,18 +53,28 @@ enum class RemoteStorageType {
 };
 
 template <typename... Args>
-
-static SegcoreError
-ThrowS3Error(const std::string& func,
-             const Aws::S3::S3Error& err,
-             const std::string& fmtString,
-             Args&&... args) {
+static std::string
+S3ErrorMessage(const std::string& func,
+               const Aws::S3::S3Error& err,
+               const std::string& fmt_string,
+               Args&&... args) {
     std::ostringstream oss;
-    const auto& message = fmt::format(fmtString, std::forward<Args>(args)...);
+    const auto& message = fmt::format(fmt_string, std::forward<Args>(args)...);
     oss << "Error in " << func << "[errcode:" << int(err.GetResponseCode())
         << ", exception:" << err.GetExceptionName()
         << ", errmessage:" << err.GetMessage() << ", params:" << message << "]";
-    throw SegcoreError(S3Error, oss.str());
+    return oss.str();
+}
+
+template <typename... Args>
+static SegcoreError
+ThrowS3Error(const std::string& func,
+             const Aws::S3::S3Error& err,
+             const std::string& fmt_string,
+             Args&&... args) {
+    std::string error_message = S3ErrorMessage(func, err, fmt_string, args...);
+    LOG_WARN(error_message);
+    throw SegcoreError(S3Error, error_message);
 }
 
 static bool
@@ -118,7 +129,7 @@ class MinioChunkManager : public ChunkManager {
          uint64_t offset,
          void* buf,
          uint64_t len) {
-        PanicInfo(NotImplemented, GetName() + "Read with offset not implement");
+        ThrowInfo(NotImplemented, GetName() + "Read with offset not implement");
     }
 
     virtual void
@@ -126,7 +137,7 @@ class MinioChunkManager : public ChunkManager {
           uint64_t offset,
           void* buf,
           uint64_t len) {
-        PanicInfo(NotImplemented,
+        ThrowInfo(NotImplemented,
                   GetName() + "Write with offset not implement");
     }
 
@@ -315,7 +326,7 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
         request->SetResponseStreamFactory(streamFactory);
         auto auth_header = credentials_->AuthorizationHeader();
         if (!auth_header.ok()) {
-            PanicInfo(
+            ThrowInfo(
                 S3Error,
                 fmt::format("get authorization failed, errcode: {}",
                             StatusCodeToString(auth_header.status().code())));

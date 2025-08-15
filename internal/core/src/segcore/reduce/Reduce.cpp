@@ -15,9 +15,10 @@
 #include <cstdint>
 #include <vector>
 
+#include "common/EasyAssert.h"
+#include "monitor/Monitor.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/Utils.h"
-#include "common/EasyAssert.h"
 #include "segcore/pkVisitor.h"
 #include "segcore/ReduceUtils.h"
 
@@ -335,9 +336,9 @@ ReduceHelper::GetSearchResultDataSlice(int slice_index) {
 
     // reserve space for pks
     auto primary_field_id =
-        plan_->schema_.get_primary_field_id().value_or(milvus::FieldId(-1));
+        plan_->schema_->get_primary_field_id().value_or(milvus::FieldId(-1));
     AssertInfo(primary_field_id.get() != INVALID_FIELD_ID, "Primary key is -1");
-    auto pk_type = plan_->schema_[primary_field_id].get_data_type();
+    auto pk_type = plan_->schema_->operator[](primary_field_id).get_data_type();
     switch (pk_type) {
         case milvus::DataType::INT64: {
             auto ids = std::make_unique<milvus::proto::schema::LongArray>();
@@ -356,7 +357,7 @@ ReduceHelper::GetSearchResultDataSlice(int slice_index) {
             break;
         }
         default: {
-            PanicInfo(DataTypeInvalid,
+            ThrowInfo(DataTypeInvalid,
                       fmt::format("unsupported primary key type {}", pk_type));
         }
     }
@@ -404,7 +405,7 @@ ReduceHelper::GetSearchResultDataSlice(int slice_index) {
                         break;
                     }
                     default: {
-                        PanicInfo(DataTypeInvalid,
+                        ThrowInfo(DataTypeInvalid,
                                   fmt::format("unsupported primary key type {}",
                                               pk_type));
                     }
@@ -430,7 +431,7 @@ ReduceHelper::GetSearchResultDataSlice(int slice_index) {
 
     // set output fields
     for (auto field_id : plan_->target_entries_) {
-        auto& field_meta = plan_->schema_[field_id];
+        auto& field_meta = plan_->schema_->operator[](field_id);
         auto field_data =
             milvus::segcore::MergeDataArray(result_pairs, field_meta);
         if (field_meta.get_data_type() == DataType::ARRAY) {
@@ -438,6 +439,8 @@ ReduceHelper::GetSearchResultDataSlice(int slice_index) {
                 ->mutable_array_data()
                 ->set_element_type(
                     proto::schema::DataType(field_meta.get_element_type()));
+        } else if (field_meta.get_data_type() == DataType::VECTOR_ARRAY) {
+            ThrowInfo(NotImplemented, "VECTOR_ARRAY is not implemented");
         }
         search_result_data->mutable_fields_data()->AddAllocated(
             field_data.release());

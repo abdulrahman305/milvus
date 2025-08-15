@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -55,7 +56,7 @@ type SearchOption interface {
 var _ SearchOption = (*searchOption)(nil)
 
 type searchOption struct {
-	annRequest                 *annRequest
+	annRequest                 *AnnRequest
 	collectionName             string
 	partitionNames             []string
 	outputFields               []string
@@ -63,7 +64,7 @@ type searchOption struct {
 	useDefaultConsistencyLevel bool
 }
 
-type annRequest struct {
+type AnnRequest struct {
 	vectors []entity.Vector
 
 	annField        string
@@ -78,10 +79,12 @@ type annRequest struct {
 	topK            int
 	offset          int
 	templateParams  map[string]any
+
+	functionRerankers []*entity.Function
 }
 
-func NewAnnRequest(annField string, limit int, vectors ...entity.Vector) *annRequest {
-	return &annRequest{
+func NewAnnRequest(annField string, limit int, vectors ...entity.Vector) *AnnRequest {
+	return &AnnRequest{
 		annField:       annField,
 		vectors:        vectors,
 		topK:           limit,
@@ -90,7 +93,7 @@ func NewAnnRequest(annField string, limit int, vectors ...entity.Vector) *annReq
 	}
 }
 
-func (r *annRequest) searchRequest() (*milvuspb.SearchRequest, error) {
+func (r *AnnRequest) searchRequest() (*milvuspb.SearchRequest, error) {
 	request := &milvuspb.SearchRequest{
 		Nq:      int64(len(r.vectors)),
 		Dsl:     r.expr,
@@ -141,6 +144,13 @@ func (r *annRequest) searchRequest() (*milvuspb.SearchRequest, error) {
 			return nil, err
 		}
 		request.ExprTemplateValues[key] = tmplVal
+	}
+
+	if len(r.functionRerankers) > 0 {
+		request.FunctionScore = &schemapb.FunctionScore{}
+		for _, fr := range r.functionRerankers {
+			request.FunctionScore.Functions = append(request.FunctionScore.Functions, fr.ProtoMessage())
+		}
 	}
 
 	return request, nil
@@ -226,53 +236,58 @@ func slice2TmplValue(val any) (*schemapb.TemplateValue, error) {
 	}, nil
 }
 
-func (r *annRequest) WithANNSField(annsField string) *annRequest {
+func (r *AnnRequest) WithANNSField(annsField string) *AnnRequest {
 	r.annField = annsField
 	return r
 }
 
-func (r *annRequest) WithGroupByField(groupByField string) *annRequest {
+func (r *AnnRequest) WithGroupByField(groupByField string) *AnnRequest {
 	r.groupByField = groupByField
 	return r
 }
 
-func (r *annRequest) WithGroupSize(groupSize int) *annRequest {
+func (r *AnnRequest) WithGroupSize(groupSize int) *AnnRequest {
 	r.groupSize = groupSize
 	return r
 }
 
-func (r *annRequest) WithStrictGroupSize(strictGroupSize bool) *annRequest {
+func (r *AnnRequest) WithStrictGroupSize(strictGroupSize bool) *AnnRequest {
 	r.strictGroupSize = strictGroupSize
 	return r
 }
 
-func (r *annRequest) WithSearchParam(key, value string) *annRequest {
+func (r *AnnRequest) WithSearchParam(key, value string) *AnnRequest {
 	r.searchParam[key] = value
 	return r
 }
 
-func (r *annRequest) WithAnnParam(ap index.AnnParam) *annRequest {
+func (r *AnnRequest) WithAnnParam(ap index.AnnParam) *AnnRequest {
 	r.annParam = ap
 	return r
 }
 
-func (r *annRequest) WithFilter(expr string) *annRequest {
+func (r *AnnRequest) WithFilter(expr string) *AnnRequest {
 	r.expr = expr
 	return r
 }
 
-func (r *annRequest) WithTemplateParam(key string, val any) *annRequest {
+func (r *AnnRequest) WithTemplateParam(key string, val any) *AnnRequest {
 	r.templateParams[key] = val
 	return r
 }
 
-func (r *annRequest) WithOffset(offset int) *annRequest {
+func (r *AnnRequest) WithOffset(offset int) *AnnRequest {
 	r.offset = offset
 	return r
 }
 
-func (r *annRequest) WithIgnoreGrowing(ignoreGrowing bool) *annRequest {
+func (r *AnnRequest) WithIgnoreGrowing(ignoreGrowing bool) *AnnRequest {
 	r.ignoreGrowing = ignoreGrowing
+	return r
+}
+
+func (r *AnnRequest) WithFunctionReranker(fr *entity.Function) *AnnRequest {
+	r.functionRerankers = append(r.functionRerankers, fr)
 	return r
 }
 
@@ -357,6 +372,11 @@ func (opt *searchOption) WithSearchParam(key, value string) *searchOption {
 	return opt
 }
 
+func (opt *searchOption) WithFunctionReranker(fr *entity.Function) *searchOption {
+	opt.annRequest.WithFunctionReranker(fr)
+	return opt
+}
+
 func NewSearchOption(collectionName string, limit int, vectors []entity.Vector) *searchOption {
 	return &searchOption{
 		annRequest:                 NewAnnRequest("", limit, vectors...),
@@ -423,15 +443,16 @@ type hybridSearchOption struct {
 	collectionName string
 	partitionNames []string
 
-	reqs []*annRequest
+	reqs []*AnnRequest
 
 	outputFields          []string
 	useDefaultConsistency bool
 	consistencyLevel      entity.ConsistencyLevel
 
-	limit    int
-	offset   int
-	reranker Reranker
+	limit             int
+	offset            int
+	reranker          Reranker
+	functionRerankers []*entity.Function
 }
 
 func (opt *hybridSearchOption) WithConsistencyLevel(cl entity.ConsistencyLevel) *hybridSearchOption {
@@ -440,7 +461,12 @@ func (opt *hybridSearchOption) WithConsistencyLevel(cl entity.ConsistencyLevel) 
 	return opt
 }
 
+// Deprecated: typo, use WithPartitions instead
 func (opt *hybridSearchOption) WithPartitons(partitions ...string) *hybridSearchOption {
+	return opt.WithPartitions(partitions...)
+}
+
+func (opt *hybridSearchOption) WithPartitions(partitions ...string) *hybridSearchOption {
 	opt.partitionNames = partitions
 	return opt
 }
@@ -452,6 +478,11 @@ func (opt *hybridSearchOption) WithOutputFields(outputFields ...string) *hybridS
 
 func (opt *hybridSearchOption) WithReranker(reranker Reranker) *hybridSearchOption {
 	opt.reranker = reranker
+	return opt
+}
+
+func (opt *hybridSearchOption) WithFunctionRerankers(functionReranker *entity.Function) *hybridSearchOption {
+	opt.functionRerankers = append(opt.functionRerankers, functionReranker)
 	return opt
 }
 
@@ -479,7 +510,7 @@ func (opt *hybridSearchOption) HybridRequest() (*milvuspb.HybridSearchRequest, e
 		params = append(params, &commonpb.KeyValuePair{Key: spOffset, Value: strconv.FormatInt(int64(opt.offset), 10)})
 	}
 
-	return &milvuspb.HybridSearchRequest{
+	r := &milvuspb.HybridSearchRequest{
 		CollectionName:        opt.collectionName,
 		PartitionNames:        opt.partitionNames,
 		Requests:              requests,
@@ -487,13 +518,21 @@ func (opt *hybridSearchOption) HybridRequest() (*milvuspb.HybridSearchRequest, e
 		ConsistencyLevel:      commonpb.ConsistencyLevel(opt.consistencyLevel),
 		OutputFields:          opt.outputFields,
 		RankParams:            params,
-	}, nil
+	}
+
+	if len(opt.functionRerankers) > 0 {
+		r.FunctionScore = &schemapb.FunctionScore{}
+		for _, fr := range opt.functionRerankers {
+			r.FunctionScore.Functions = append(r.FunctionScore.Functions, fr.ProtoMessage())
+		}
+	}
+
+	return r, nil
 }
 
-func NewHybridSearchOption(collectionName string, limit int, annRequests ...*annRequest) *hybridSearchOption {
+func NewHybridSearchOption(collectionName string, limit int, annRequests ...*AnnRequest) *hybridSearchOption {
 	return &hybridSearchOption{
-		collectionName: collectionName,
-
+		collectionName:        collectionName,
 		reqs:                  annRequests,
 		useDefaultConsistency: true,
 		limit:                 limit,
@@ -608,5 +647,76 @@ func NewQueryOption(collectionName string) *queryOption {
 		useDefaultConsistencyLevel: true,
 		consistencyLevel:           entity.ClBounded,
 		templateParams:             make(map[string]any),
+	}
+}
+
+type RunAnalyzerOption interface {
+	Request() (*milvuspb.RunAnalyzerRequest, error)
+}
+
+type runAnalyzerOption struct {
+	text           []string
+	collectionName string
+	fieldName      string
+	analyzerNames  []string
+	analyzerParams string
+	withDetail     bool
+	withHash       bool
+	err            error
+}
+
+func (opt *runAnalyzerOption) Request() (*milvuspb.RunAnalyzerRequest, error) {
+	if opt.err != nil {
+		return nil, opt.err
+	}
+	return &milvuspb.RunAnalyzerRequest{
+		Placeholder:    lo.Map(opt.text, func(str string, _ int) []byte { return []byte(str) }),
+		AnalyzerParams: opt.analyzerParams,
+		CollectionName: opt.collectionName,
+		FieldName:      opt.fieldName,
+		AnalyzerNames:  opt.analyzerNames,
+		WithDetail:     opt.withDetail,
+		WithHash:       opt.withHash,
+	}, nil
+}
+
+func (opt *runAnalyzerOption) WithAnalyzerParamsStr(params string) *runAnalyzerOption {
+	opt.analyzerParams = params
+	return opt
+}
+
+func (opt *runAnalyzerOption) WithAnalyzerParams(params map[string]any) *runAnalyzerOption {
+	s, err := json.Marshal(params)
+	if err != nil {
+		opt.err = err
+	}
+	opt.analyzerParams = string(s)
+	return opt
+}
+
+func (opt *runAnalyzerOption) WithDetail() *runAnalyzerOption {
+	opt.withDetail = true
+	return opt
+}
+
+func (opt *runAnalyzerOption) WithHash() *runAnalyzerOption {
+	opt.withHash = true
+	return opt
+}
+
+func (opt *runAnalyzerOption) WithField(collectionName, fieldName string) *runAnalyzerOption {
+	opt.collectionName = collectionName
+	opt.fieldName = fieldName
+	return opt
+}
+
+func (opt *runAnalyzerOption) WithAnalyzerName(names ...string) *runAnalyzerOption {
+	opt.analyzerNames = names
+	return opt
+}
+
+func NewRunAnalyzerOption(text ...string) *runAnalyzerOption {
+	return &runAnalyzerOption{
+		text: text,
 	}
 }

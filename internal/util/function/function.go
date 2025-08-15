@@ -29,6 +29,9 @@ type FunctionRunner interface {
 
 	GetSchema() *schemapb.FunctionSchema
 	GetOutputFields() []*schemapb.FieldSchema
+	GetInputFields() []*schemapb.FieldSchema
+
+	Close()
 }
 
 func NewFunctionRunner(coll *schemapb.CollectionSchema, schema *schemapb.FunctionSchema) (FunctionRunner, error) {

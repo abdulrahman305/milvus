@@ -24,7 +24,6 @@
 #include "common/RegexQuery.h"
 #include "index/ScalarIndex.h"
 #include "storage/FileManager.h"
-#include "storage/DiskFileManagerImpl.h"
 #include "storage/MemFileManagerImpl.h"
 
 namespace milvus {
@@ -138,10 +137,26 @@ class BitmapIndex : public ScalarIndex<T> {
     }
 
     const TargetBitmap
-    PatternMatch(const std::string& pattern) override {
-        PatternMatchTranslator translator;
-        auto regex_pattern = translator(pattern);
-        return RegexQuery(regex_pattern);
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) override {
+        switch (op) {
+            case proto::plan::OpType::PrefixMatch:
+            case proto::plan::OpType::PostfixMatch:
+            case proto::plan::OpType::InnerMatch: {
+                auto dataset = std::make_unique<Dataset>();
+                dataset->Set(milvus::index::OPERATOR_TYPE, op);
+                dataset->Set(milvus::index::MATCH_VALUE, pattern);
+                return Query(std::move(dataset));
+            }
+            case proto::plan::OpType::Match: {
+                PatternMatchTranslator translator;
+                auto regex_pattern = translator(pattern);
+                return RegexQuery(regex_pattern);
+            }
+            default:
+                ThrowInfo(ErrorCode::OpTypeInvalid,
+                          "not supported op type: {} for index PatterMatch",
+                          op);
+        }
     }
 
     bool

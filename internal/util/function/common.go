@@ -26,6 +26,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 )
 
 type TextEmbeddingMode int
@@ -48,7 +49,7 @@ const (
 	modelNameParamKey    string = "model_name"
 	dimParamKey          string = "dim"
 	embeddingURLParamKey string = "url"
-	apiKeyParamKey       string = "api_key"
+	credentialParamKey   string = "credential"
 	truncateParamKey     string = "truncate"
 )
 
@@ -71,9 +72,9 @@ const (
 // bedrock emebdding
 
 const (
-	awsAKIdParamKey   string = "aws_access_key_id"
-	awsSAKParamKey    string = "aws_secret_access_key"
-	regionParamKey    string = "regin"
+	// awsAKIdParamKey   string = "aws_access_key_id"
+	// awsSAKParamKey    string = "aws_secret_access_key"
+	regionParamKey    string = "region"
 	normalizeParamKey string = "normalize"
 
 	bedrockAccessKeyId string = "MILVUSAI_BEDROCK_ACCESS_KEY_ID"
@@ -108,33 +109,53 @@ const (
 	siliconflowAKEnvStr string = "MILVUSAI_SILICONFLOW_API_KEY"
 )
 
-// TEI
+// TEI and vllm
 
 const (
 	ingestionPromptParamKey     string = "ingestion_prompt"
 	searchPromptParamKey        string = "search_prompt"
 	maxClientBatchSizeParamKey  string = "max_client_batch_size"
 	truncationDirectionParamKey string = "truncation_direction"
-	endpointParamKey            string = "endpoint"
+	EndpointParamKey            string = "endpoint"
 
-	enableTeiEnvStr string = "MILVUSAI_ENABLE_TEI"
+	EnableTeiEnvStr  string = "MILVUSAI_ENABLE_TEI"
+	EnableVllmEnvStr string = "MILVUSAI_ENABLE_VLLM"
 )
 
-const enableConfigAKAndURL string = "ENABLE_CONFIG_AK_AND_URL"
-
-func parseAKAndURL(params []*commonpb.KeyValuePair) (string, string) {
+func parseAKAndURL(credentials *credentials.Credentials, params []*commonpb.KeyValuePair, confParams map[string]string, apiKeyEnv string) (string, string, error) {
+	// function param > yaml > env
+	var err error
 	var apiKey, url string
-	if strings.ToLower(os.Getenv(enableConfigAKAndURL)) != "false" {
-		for _, param := range params {
-			switch strings.ToLower(param.Key) {
-			case apiKeyParamKey:
-				apiKey = param.Value
-			case embeddingURLParamKey:
-				url = param.Value
+
+	for _, param := range params {
+		switch strings.ToLower(param.Key) {
+		case credentialParamKey:
+			credentialName := param.Value
+			if apiKey, err = credentials.GetAPIKeyCredential(credentialName); err != nil {
+				return "", "", err
 			}
 		}
 	}
-	return apiKey, url
+
+	// from milvus.yaml
+	if apiKey == "" {
+		credentialName := confParams[credentialParamKey]
+		if credentialName != "" {
+			if apiKey, err = credentials.GetAPIKeyCredential(credentialName); err != nil {
+				return "", "", err
+			}
+		}
+	}
+
+	if url == "" {
+		url = confParams[embeddingURLParamKey]
+	}
+
+	// from env, url doesn't support configuration in in env
+	if apiKey == "" {
+		apiKey = os.Getenv(apiKeyEnv)
+	}
+	return apiKey, url, nil
 }
 
 func parseAndCheckFieldDim(dimStr string, fieldDim int64, fieldName string) (int64, error) {

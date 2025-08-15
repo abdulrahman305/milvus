@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug)]
 pub enum TantivyDataType {
@@ -7,4 +8,5 @@ pub enum TantivyDataType {
     I64,
     F64,
     Bool,
+    JSON,
 }

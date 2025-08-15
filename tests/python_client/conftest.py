@@ -22,8 +22,8 @@ def pytest_addoption(parser):
     parser.addoption("--host", action="store", default="localhost", help="service's ip")
     parser.addoption("--service", action="store", default="", help="service address")
     parser.addoption("--port", action="store", default=19530, help="service's port")
-    parser.addoption("--user", action="store", default="", help="user name for connection")
-    parser.addoption("--password", action="store", default="", help="password for connection")
+    parser.addoption("--user", action="store", default="root", help="user name for connection")
+    parser.addoption("--password", action="store", default="Milvus", help="password for connection")
     parser.addoption("--db_name", action="store", default="default", help="database name for connection")
     parser.addoption("--secure", action="store", default=False, help="secure for connection")
     parser.addoption("--milvus_ns", action="store", default="chaos-testing", help="milvus_ns")
@@ -51,7 +51,13 @@ def pytest_addoption(parser):
     parser.addoption('--uri', action='store', default="", help="uri for milvus client")
     parser.addoption('--token', action='store', default="root:Milvus", help="token for milvus client")
     parser.addoption("--request_duration", action="store", default="10m", help="request_duration")
+    parser.addoption('--data_size', type=int, action='store', default=3000, help="data size for deploy test")
+    parser.addoption("--is_check", action="store", type=bool, default=False, help="is_check")
+    # a tei endpoint for text embedding, default is http://text-embeddings-service.milvus-ci.svc.cluster.local:80 which is deployed in house
+    parser.addoption("--tei_endpoint", action="store", default="http://text-embeddings-service.milvus-ci.svc.cluster.local:80", help="tei embedding endpoint")
 
+    parser.addoption("--tei_reranker_endpoint", action="store", default="http://text-rerank-service.milvus-ci.svc.cluster.local:80", help="tei rerank endpoint")
+    parser.addoption("--vllm_reranker_endpoint", action="store", default="http://vllm-rerank-service.milvus-ci.svc.cluster.local:80", help="vllm rerank endpoint")
 
 @pytest.fixture
 def host(request):
@@ -208,6 +214,25 @@ def token(request):
 def request_duration(request):
     return request.config.getoption("--request_duration")
 
+@pytest.fixture
+def tei_endpoint(request):
+    return request.config.getoption("--tei_endpoint")
+
+@pytest.fixture
+def tei_reranker_endpoint(request):
+    return request.config.getoption("--tei_reranker_endpoint")
+
+@pytest.fixture
+def vllm_reranker_endpoint(request):
+    return request.config.getoption("--vllm_reranker_endpoint")
+
+@pytest.fixture
+def data_size(request):
+    return request.config.getoption("--data_size")
+
+@pytest.fixture
+def is_check(request):
+    return request.config.getoption("--is_check")
 
 """ fixture func """
 
@@ -225,6 +250,7 @@ def initialize_env(request):
     replica_num = request.config.getoption("--replica_num")
     uri = request.config.getoption("--uri")
     token = request.config.getoption("--token")
+    minio_bucket = request.config.getoption("--minio_bucket")
 
     """ params check """
     assert ip_check(host) and number_check(port)
@@ -237,7 +263,7 @@ def initialize_env(request):
 
     log.info("#" * 80)
     log.info("[initialize_milvus] Log cleaned up, start testing...")
-    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure, uri, token)
+    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure, uri, token, minio_bucket)
 
 
 # TODO: construct invalid index params for all index types

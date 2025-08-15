@@ -27,6 +27,7 @@
 #include "exec/QueryContext.h"
 #include "expr/ITypeExpr.h"
 #include "query/PlanProto.h"
+#include "ankerl/unordered_dense.h"
 
 namespace milvus {
 namespace exec {
@@ -55,7 +56,7 @@ class SingleElement : public BaseElement {
     template <typename T>
     void
     SetValue(const proto::plan::GenericValue& value) {
-        value_ = GetValueFromProto<T>(value);
+        value_ = GetValueWithCastNumber<T>(value);
     }
 
     template <typename T>
@@ -80,7 +81,7 @@ class SingleElement : public BaseElement {
         try {
             return std::get<T>(value_);
         } catch (const std::bad_variant_access& e) {
-            PanicInfo(ErrorCode::UnexpectedError,
+            ThrowInfo(ErrorCode::UnexpectedError,
                       "SingleElement GetValue() failed: {}",
                       e.what());
         }
@@ -122,7 +123,7 @@ class SortVectorElement : public MultiElement {
     explicit SortVectorElement(
         const std::vector<proto::plan::GenericValue>& values) {
         for (auto& value : values) {
-            values_.push_back(GetValueFromProto<T>(value));
+            values_.push_back(GetValueWithCastNumber<T>(value));
         }
         std::sort(values_.begin(), values_.end());
         sorted_ = true;
@@ -178,7 +179,7 @@ class FlatVectorElement : public MultiElement {
     explicit FlatVectorElement(
         const std::vector<proto::plan::GenericValue>& values) {
         for (auto& value : values) {
-            values_.push_back(GetValueFromProto<T>(value));
+            values_.push_back(GetValueWithCastNumber<T>(value));
         }
     }
 
@@ -223,7 +224,7 @@ class SetElement : public MultiElement {
  public:
     explicit SetElement(const std::vector<proto::plan::GenericValue>& values) {
         for (auto& value : values) {
-            values_.insert(GetValueFromProto<T>(value));
+            values_.insert(GetValueWithCastNumber<T>(value));
         }
     }
 
@@ -243,6 +244,7 @@ class SetElement : public MultiElement {
         if (std::holds_alternative<T>(value)) {
             return values_.count(std::get<T>(value)) > 0;
         }
+        return false;
     }
 
     void
@@ -256,7 +258,64 @@ class SetElement : public MultiElement {
     }
 
  public:
-    std::set<T> values_;
+    ankerl::unordered_dense::set<T> values_;
+};
+
+template <>
+class SetElement<bool> : public MultiElement {
+ public:
+    explicit SetElement(const std::vector<proto::plan::GenericValue>& values) {
+        for (auto& value : values) {
+            bool v = GetValueFromProto<bool>(value);
+            if (v) {
+                contains_true = true;
+            } else {
+                contains_false = true;
+            }
+        }
+    }
+
+    explicit SetElement(const std::vector<bool>& values) {
+        for (const auto& value : values) {
+            if (value) {
+                contains_true = true;
+            } else {
+                contains_false = true;
+            }
+        }
+    }
+
+    bool
+    Empty() const override {
+        return !contains_true && !contains_false;
+    }
+
+    bool
+    In(const ValueType& value) const override {
+        if (std::holds_alternative<bool>(value)) {
+            bool v = std::get<bool>(value);
+            return (v && contains_true) || (!v && contains_false);
+        }
+        return false;
+    }
+
+    void
+    AddElement(const bool& value) {
+        if (value) {
+            contains_true = true;
+        } else {
+            contains_false = true;
+        }
+    }
+
+    size_t
+    Size() const override {
+        return (contains_true ? 1 : 0) + (contains_false ? 1 : 0);
+    }
+
+ private:
+    bool contains_true = false;
+    bool contains_false = false;
 };
 
 }  //namespace exec

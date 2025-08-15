@@ -21,7 +21,6 @@
 #include <vector>
 
 #include "Types.h"
-#include "common/CDataType.h"
 
 // NOTE: field_id can be system field
 // NOTE: Refer to common/SystemProperty.cpp for details
@@ -29,6 +28,8 @@ struct FieldBinlogInfo {
     int64_t field_id;
     int64_t row_count = -1;
     std::vector<int64_t> entries_nums;
+    // estimated memory size for each binlog file, in bytes, used by caching layer
+    std::vector<int64_t> memory_sizes;
     bool enable_mmap{false};
     std::vector<std::string> insert_files;
 };
@@ -38,8 +39,9 @@ struct LoadFieldDataInfo {
     // Set empty to disable mmap,
     // mmap file path will be {mmap_dir_path}/{segment_id}/{field_id}
     std::string mmap_dir_path = "";
-    std::string url;
     int64_t storage_version = 0;
+    milvus::proto::common::LoadPriority load_priority =
+        milvus::proto::common::LoadPriority::HIGH;
 };
 
 struct LoadDeletedRecordInfo {

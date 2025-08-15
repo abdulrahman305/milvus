@@ -11,23 +11,16 @@
 
 #pragma once
 
-#include <unordered_map>
-#include <exception>
 #include <memory>
-#include <stdexcept>
 #include <cstdlib>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "common/FieldData.h"
-#include "common/QueryResult.h"
-// #include "common/Schema.h"
+#include "common/type_c.h"
 #include "common/Types.h"
 #include "index/Index.h"
-#include "log/Log.h"
-#include "segcore/DeletedRecord.h"
-#include "segcore/InsertRecord.h"
+#include "segcore/ConcurrentVector.h"
 
 namespace milvus::segcore {
 
@@ -55,10 +48,10 @@ GetRawDataSizeOfDataArray(const DataArray* data,
 // Note: this is temporary solution.
 // modify bulk script implement to make process more clear
 std::unique_ptr<DataArray>
-CreateScalarDataArray(int64_t count, const FieldMeta& field_meta);
+CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
-CreateVectorDataArray(int64_t count, const FieldMeta& field_meta);
+CreateEmptyVectorDataArray(int64_t count, const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
 CreateScalarDataArrayFrom(const void* data_raw,
@@ -116,11 +109,13 @@ ReverseDataFromIndex(const index::IndexBase* index,
 
 void
 LoadArrowReaderFromRemote(const std::vector<std::string>& remote_files,
-                          std::shared_ptr<ArrowReaderChannel> channel);
+                          std::shared_ptr<ArrowReaderChannel> channel,
+                          milvus::proto::common::LoadPriority priority);
 
 void
 LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
-                         FieldDataChannelPtr channel);
+                         FieldDataChannelPtr channel,
+                         milvus::proto::common::LoadPriority priority);
 /**
  * Returns an index pointing to the first element in the range [first, last) such that `value < element` is true
  * (i.e. that is strictly greater than value), or last if no such element is found.
@@ -136,4 +131,8 @@ upper_bound(const ConcurrentVector<Timestamp>& timestamps,
             int64_t first,
             int64_t last,
             Timestamp value);
+
+CacheWarmupPolicy
+getCacheWarmupPolicy(bool is_vector, bool is_index, bool in_load_list = true);
+
 }  // namespace milvus::segcore

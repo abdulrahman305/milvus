@@ -17,6 +17,7 @@ package querynodev2
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"path"
@@ -37,7 +38,9 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
@@ -46,11 +49,12 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
@@ -64,7 +68,6 @@ import (
 type ServiceSuite struct {
 	suite.Suite
 	// Data
-	msgChan        chan *msgstream.ConsumeMsgPack
 	collectionID   int64
 	collectionName string
 	schema         *schemapb.CollectionSchema
@@ -88,8 +91,7 @@ type ServiceSuite struct {
 	chunkManagerFactory *storage.ChunkManagerFactory
 
 	// Mock
-	factory   *dependency.MockFactory
-	msgStream *msgstream.MockMsgStream
+	factory *dependency.MockFactory
 }
 
 func (suite *ServiceSuite) SetupSuite() {
@@ -125,7 +127,6 @@ func (suite *ServiceSuite) SetupTest() {
 	ctx := context.Background()
 	// init mock
 	suite.factory = dependency.NewMockFactory(suite.T())
-	suite.msgStream = msgstream.NewMockMsgStream(suite.T())
 	// TODO:: cpp chunk manager not support local chunk manager
 	paramtable.Get().Save(paramtable.Get().LocalStorageCfg.Path.Key, suite.T().TempDir())
 	// suite.chunkManagerFactory = storage.NewChunkManagerFactory("local", storage.RootPath("/tmp/milvus-test"))
@@ -212,6 +213,7 @@ func (suite *ServiceSuite) TestGetStatistics_Normal() {
 	ctx := context.Background()
 	suite.TestWatchDmChannelsInt64()
 	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(context.TODO())
 
 	req := &querypb.GetStatisticsRequest{
 		Req: &internalpb.GetStatisticsRequest{
@@ -310,13 +312,6 @@ func (suite *ServiceSuite) TestWatchDmChannelsInt64() {
 		IndexInfoList: mock_segcore.GenTestIndexInfoList(suite.collectionID, schema),
 	}
 
-	// mocks
-	suite.factory.EXPECT().NewTtMsgStream(mock.Anything).Return(suite.msgStream, nil).Maybe()
-	suite.msgStream.EXPECT().AsConsumer(mock.Anything, []string{suite.pchannel}, mock.Anything, mock.Anything).Return(nil).Maybe()
-	suite.msgStream.EXPECT().Seek(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-	suite.msgStream.EXPECT().Chan().Return(suite.msgChan).Maybe()
-	suite.msgStream.EXPECT().Close().Maybe()
-
 	// watchDmChannels
 	status, err := suite.node.WatchDmChannels(ctx, req)
 	suite.NoError(err)
@@ -361,13 +356,6 @@ func (suite *ServiceSuite) TestWatchDmChannelsVarchar() {
 		},
 		IndexInfoList: mock_segcore.GenTestIndexInfoList(suite.collectionID, schema),
 	}
-
-	// mocks
-	suite.factory.EXPECT().NewTtMsgStream(mock.Anything).Return(suite.msgStream, nil).Maybe()
-	suite.msgStream.EXPECT().AsConsumer(mock.Anything, []string{suite.pchannel}, mock.Anything, mock.Anything).Return(nil).Maybe()
-	suite.msgStream.EXPECT().Seek(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-	suite.msgStream.EXPECT().Chan().Return(suite.msgChan).Maybe()
-	suite.msgStream.EXPECT().Close().Maybe()
 
 	// watchDmChannels
 	status, err := suite.node.WatchDmChannels(ctx, req)
@@ -1392,9 +1380,13 @@ func (suite *ServiceSuite) TestSearch_Failed() {
 	}
 
 	syncVersionAction := &querypb.SyncAction{
-		Type:           querypb.SyncType_UpdateVersion,
-		SealedInTarget: []int64{1, 2, 3},
-		TargetVersion:  time.Now().UnixMilli(),
+		Type: querypb.SyncType_UpdateVersion,
+		SealedSegmentRowCount: map[int64]int64{
+			1: 100,
+			2: 200,
+			3: 300,
+		},
+		TargetVersion: time.Now().UnixMilli(),
 	}
 
 	syncReq.Actions = []*querypb.SyncAction{syncVersionAction}
@@ -2334,6 +2326,109 @@ func (suite *ServiceSuite) TestLoadPartition() {
 	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
 }
 
+func (suite *ServiceSuite) TestUpdateSchema() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := &querypb.UpdateSchemaRequest{
+		CollectionID: suite.collectionID,
+		Schema:       suite.schema,
+		Version:      uint64(100),
+	}
+	manager := suite.node.manager.Collection
+	// reset manager to align default teardown logic
+	defer func() {
+		suite.node.manager.Collection = manager
+	}()
+	mockManager := segments.NewMockCollectionManager(suite.T())
+	suite.node.manager.Collection = mockManager
+
+	suite.Run("normal", func() {
+		mockManager.EXPECT().UpdateSchema(suite.collectionID, suite.schema, uint64(100)).Return(nil).Once()
+
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.NoError(merr.CheckRPCCall(status, err))
+	})
+
+	suite.Run("manager_returns_error", func() {
+		mockManager.EXPECT().UpdateSchema(suite.collectionID, suite.schema, uint64(100)).Return(merr.WrapErrServiceInternal("mocked")).Once()
+
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
+	})
+
+	suite.Run("abonormal_node", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		defer suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
+	})
+}
+
+func (suite *ServiceSuite) TestRunAnalyzer() {
+	ctx := context.Background()
+	suite.Run("delegator not exist", func() {
+		resp, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+		suite.Require().Error(merr.Error(resp.GetStatus()))
+	})
+
+	suite.Run("normal run", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().RunAnalyzer(mock.Anything, mock.Anything).Return(
+			[]*milvuspb.AnalyzerResult{}, nil)
+
+		_, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+	})
+
+	suite.Run("run analyzer failed", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().RunAnalyzer(mock.Anything, mock.Anything).Return(
+			nil, fmt.Errorf("mock error"))
+
+		resp, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+		suite.Require().Error(merr.Error(resp.GetStatus()))
+	})
+}
+
 func TestQueryNodeService(t *testing.T) {
+	wal := mock_streaming.NewMockWALAccesser(t)
+	local := mock_streaming.NewMockLocal(t)
+	local.EXPECT().GetLatestMVCCTimestampIfLocal(mock.Anything, mock.Anything).Return(0, nil).Maybe()
+	local.EXPECT().GetMetricsIfLocal(mock.Anything).Return(&types.StreamingNodeMetrics{}, nil).Maybe()
+	wal.EXPECT().Local().Return(local).Maybe()
+	wal.EXPECT().WALName().Return(rmq.WALName).Maybe()
+	scanner := mock_streaming.NewMockScanner(t)
+	scanner.EXPECT().Done().Return(make(chan struct{})).Maybe()
+	scanner.EXPECT().Error().Return(nil).Maybe()
+	scanner.EXPECT().Close().Return().Maybe()
+	wal.EXPECT().Read(mock.Anything, mock.Anything).Return(scanner).Maybe()
+
+	streaming.SetWALForTest(wal)
+	defer streaming.RecoverWALForTest()
+
 	suite.Run(t, new(ServiceSuite))
 }

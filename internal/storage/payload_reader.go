@@ -98,6 +98,9 @@ func (r *PayloadReader) GetDataFromPayload() (interface{}, []bool, int, error) {
 	case schemapb.DataType_Array:
 		val, validData, err := r.GetArrayFromPayload()
 		return val, validData, 0, err
+	case schemapb.DataType_ArrayOfVector:
+		val, err := r.GetVectorArrayFromPayload()
+		return val, nil, 0, err
 	case schemapb.DataType_JSON:
 		val, validData, err := r.GetJSONFromPayload()
 		return val, validData, 0, err
@@ -416,6 +419,22 @@ func (r *PayloadReader) GetArrayFromPayload() ([]*schemapb.ScalarField, []bool, 
 	return value, nil, nil
 }
 
+func (r *PayloadReader) GetVectorArrayFromPayload() ([]*schemapb.VectorField, error) {
+	if r.colType != schemapb.DataType_ArrayOfVector {
+		return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("failed to get vector from datatype %v", r.colType.String()))
+	}
+
+	value, err := readByteAndConvert(r, func(bytes parquet.ByteArray) *schemapb.VectorField {
+		v := &schemapb.VectorField{}
+		proto.Unmarshal(bytes, v)
+		return v
+	})
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
 func (r *PayloadReader) GetJSONFromPayload() ([][]byte, []bool, error) {
 	if r.colType != schemapb.DataType_JSON {
 		return nil, nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("failed to get json from datatype %v", r.colType.String()))
@@ -621,7 +640,7 @@ func (r *PayloadReader) GetSparseFloatVectorFromPayload() (*SparseFloatVectorFie
 
 	for _, value := range values {
 		if len(value)%8 != 0 {
-			return nil, -1, fmt.Errorf("invalid bytesData length")
+			return nil, -1, errors.New("invalid bytesData length")
 		}
 
 		fieldData.Contents = append(fieldData.Contents, value)
@@ -750,7 +769,7 @@ func (s *DataSet[T, E]) HasNext() bool {
 
 func (s *DataSet[T, E]) NextBatch(batch int64) ([]T, error) {
 	if s.groupID > s.reader.NumRowGroups() || (s.groupID == s.reader.NumRowGroups() && s.cnt >= s.numRows) || s.numRows == 0 {
-		return nil, fmt.Errorf("has no more data")
+		return nil, errors.New("has no more data")
 	}
 
 	if s.groupID == 0 || s.cnt >= s.numRows {

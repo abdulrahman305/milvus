@@ -2,7 +2,7 @@ import logging
 import random
 import time
 import pytest
-from pymilvus import DataType, Function, FunctionType
+from pymilvus import DataType, Function, FunctionType, FieldSchema, CollectionSchema
 from pymilvus.bulk_writer import RemoteBulkWriter, BulkFileType
 import numpy as np
 from pathlib import Path
@@ -10,7 +10,6 @@ from base.client_base import TestcaseBase
 from common import common_func as cf
 from common import common_type as ct
 from common.common_params import DefaultVectorIndexParams, DefaultVectorSearchParams
-from common.milvus_sys import MilvusSys
 from common.common_type import CaseLabel, CheckTasks
 from utils.util_log import test_log as log
 from common.bulk_insert_data import (
@@ -60,7 +59,7 @@ class TestcaseBaseBulkInsert(TestcaseBase):
 
 class TestBulkInsert(TestcaseBaseBulkInsert):
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("is_row_based", [True])
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 8, 128
@@ -149,7 +148,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=f"{df.pk_field} in {ids}")
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("is_row_based", [True])
     @pytest.mark.parametrize("dim", [128])  # 8
     @pytest.mark.parametrize("entities", [100])  # 100
@@ -239,7 +238,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=expr)
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("is_row_based", [True])
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])
@@ -334,7 +333,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=f"{df.pk_field} in {ids}")
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("is_row_based", [True])
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])
@@ -419,7 +418,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=f"{df.pk_field} in {ids}")
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("insert_before_bulk_insert", [True, False])
     def test_insert_before_or_after_bulk_insert(self, insert_before_bulk_insert):
         """
@@ -520,7 +519,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=expr)
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("create_index_before_bulk_insert", [True, False])
     @pytest.mark.parametrize("loaded_before_bulk_insert", [True, False])
     def test_load_before_or_after_bulk_insert(self, loaded_before_bulk_insert, create_index_before_bulk_insert):
@@ -609,7 +608,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             results, _ = self.collection_wrap.query(expr=expr)
             assert len(results) == len(ids)
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     def test_index_load_before_bulk_insert(self):
         """
         Steps:
@@ -664,6 +663,19 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_binary_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
 
         t0 = time.time()
@@ -737,16 +749,21 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     if enable_dynamic_field:
                         assert "name" in fields_from_search
                         assert "address" in fields_from_search
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] >= 0", output_fields=[df.json_field])
+        assert len(res) == entities
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        assert len(res) == 1
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [2000])
     @pytest.mark.parametrize("enable_dynamic_field", [True])
     @pytest.mark.parametrize("enable_partition_key", [True, False])
     @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.parametrize("add_field", [True, False])
     def test_bulk_insert_all_field_with_new_json_format(self, auto_id, dim, entities, enable_dynamic_field,
-                                                        enable_partition_key, nullable):
+                                                        enable_partition_key, nullable, add_field):
         """
         collection schema 1: [pk, int64, float64, string float_vector]
         data file: vectors.npy and uid.npy,
@@ -793,7 +810,10 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             schema=schema
         )
         self.collection_wrap.init_collection(c_name, schema=schema)
-
+        if add_field:
+            self._connect(enable_milvus_client_api=True)
+            self.client.add_collection_field(collection_name=c_name, field_name=df.new_field, data_type=DataType.INT64,
+                                             nullable=True)
         # import data
         t0 = time.time()
         task_id, _ = self.utility_wrap.do_bulk_insert(
@@ -821,22 +841,35 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_binary_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
         log.info(f"wait for load finished and be ready for search")
         time.sleep(2)
         # log.info(f"query seg info: {self.utility_wrap.get_query_segment_info(c_name)[0]}")
 
         for f in [df.float_vec_field, df.bf16_vec_field, df.fp16_vec_field]:
-            vector_data_type = "FLOAT_VECTOR"
+            vector_data_type = DataType.FLOAT_VECTOR
             if f == df.float_vec_field:
                 dim = float_vec_field_dim
-                vector_data_type = "FLOAT_VECTOR"
+                vector_data_type = DataType.FLOAT_VECTOR
             elif f == df.bf16_vec_field:
                 dim = bf16_vec_field_dim
-                vector_data_type = "BFLOAT16_VECTOR"
+                vector_data_type = DataType.BFLOAT16_VECTOR
             else:
                 dim = fp16_vec_field_dim
-                vector_data_type = "FLOAT16_VECTOR"
+                vector_data_type = DataType.FLOAT16_VECTOR
 
             search_data = cf.gen_vectors(1, dim, vector_data_type=vector_data_type)
             search_params = ct.default_search_params
@@ -887,6 +920,10 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             assert len(res) == 0
             expr_field = df.pk_field
             expr = f"{expr_field} >= 0"
+        
+        if add_field:
+            res, _ = self.collection_wrap.query(expr=f"{df.new_field} is not null", output_fields=[df.string_field, df.int_field, df.new_field])
+            assert len(res) == 0           
 
         res, _ = self.collection_wrap.query(expr=f"{expr}", output_fields=[expr_field, df.int_field])
         assert len(res) == entities
@@ -901,8 +938,18 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             assert 0 < len(res) < entities
         if enable_partition_key:
             assert len(self.collection_wrap.partitions) > 1
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] >= 0", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == entities
+        else:
+            assert len(res) == 0
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == 1
+        else:
+            assert len(res) == 0
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [2000])
@@ -910,7 +957,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
     @pytest.mark.parametrize("enable_partition_key", [True, False])
     @pytest.mark.parametrize("include_meta", [True, False])
     @pytest.mark.parametrize("nullable", [True, False])
-    def test_bulk_insert_all_field_with_numpy(self, auto_id, dim, entities, enable_dynamic_field, enable_partition_key, include_meta, nullable):
+    @pytest.mark.parametrize("add_field", [True, False])
+    def test_bulk_insert_all_field_with_numpy(self, auto_id, dim, entities, enable_dynamic_field, enable_partition_key,
+                                              include_meta, nullable, add_field):
         """
         collection schema 1: [pk, int64, float64, string float_vector]
         data file: vectors.npy and uid.npy,
@@ -956,7 +1005,10 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             schema=schema
         )
         self.collection_wrap.init_collection(c_name, schema=schema)
-
+        if add_field:
+            self._connect(enable_milvus_client_api=True)
+            self.client.add_collection_field(collection_name=c_name, field_name=df.new_field, data_type=DataType.INT64,
+                                             nullable=True)
         # import data
         t0 = time.time()
         task_id, _ = self.utility_wrap.do_bulk_insert(
@@ -980,6 +1032,19 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=index_params
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         for f in binary_vec_fields:
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_binary_index
@@ -990,16 +1055,16 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
         # log.info(f"query seg info: {self.utility_wrap.get_query_segment_info(c_name)[0]}")
 
         for f in [df.float_vec_field, df.bf16_vec_field, df.fp16_vec_field]:
-            vector_data_type = "FLOAT_VECTOR"
+            vector_data_type = DataType.FLOAT_VECTOR
             if f == df.float_vec_field:
                 dim = float_vec_field_dim
-                vector_data_type = "FLOAT_VECTOR"
+                vector_data_type = DataType.FLOAT_VECTOR
             elif f == df.bf16_vec_field:
                 dim = bf16_vec_field_dim
-                vector_data_type = "BFLOAT16_VECTOR"
+                vector_data_type = DataType.BFLOAT16_VECTOR
             else:
                 dim = fp16_vec_field_dim
-                vector_data_type = "FLOAT16_VECTOR"
+                vector_data_type = DataType.FLOAT16_VECTOR
 
             search_data = cf.gen_vectors(1, dim, vector_data_type=vector_data_type)
             search_params = ct.default_search_params
@@ -1042,6 +1107,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                         assert "name" in fields_from_search
                         assert "address" in fields_from_search
         # query data
+        if add_field:
+            res, _ = self.collection_wrap.query(expr=f"{df.new_field} is not null", output_fields=[df.string_field, df.int_field, df.new_field])
+            assert len(res) == 0
         res, _ = self.collection_wrap.query(expr=f"{df.string_field} >= '0'", output_fields=[df.string_field])
         assert len(res) == entities
         query_data = [r[df.string_field] for r in res][:len(self.collection_wrap.partitions)]
@@ -1054,8 +1122,12 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             assert 0 < len(res) < entities
         if enable_partition_key:
             assert len(self.collection_wrap.partitions) > 1
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] >= 0", output_fields=[df.json_field])
+        assert len(res) == entities
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        assert len(res) == 1
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [2000])
@@ -1063,8 +1135,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
     @pytest.mark.parametrize("enable_partition_key", [True, False])
     @pytest.mark.parametrize("include_meta", [True, False])
     @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.parametrize("add_field", [True, False])
     def test_bulk_insert_all_field_with_parquet(self, auto_id, dim, entities, enable_dynamic_field,
-                                                enable_partition_key, include_meta, nullable):
+                                                enable_partition_key, include_meta, nullable, add_field):
         """
         collection schema 1: [pk, int64, float64, string float_vector]
         data file: vectors.parquet and uid.parquet,
@@ -1113,6 +1186,10 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             schema=schema
         )
         self.collection_wrap.init_collection(c_name, schema=schema)
+        if add_field:
+            self._connect(enable_milvus_client_api=True)
+            self.client.add_collection_field(collection_name=c_name, field_name=df.new_field, data_type=DataType.INT64,
+                                             nullable=True)
 
         # import data
         t0 = time.time()
@@ -1141,22 +1218,35 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_binary_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
         log.info(f"wait for load finished and be ready for search")
         time.sleep(2)
         # log.info(f"query seg info: {self.utility_wrap.get_query_segment_info(c_name)[0]}")
 
         for f in [df.float_vec_field, df.bf16_vec_field, df.fp16_vec_field]:
-            vector_data_type = "FLOAT_VECTOR"
+            vector_data_type = DataType.FLOAT_VECTOR
             if f == df.float_vec_field:
                 dim = float_vec_field_dim
-                vector_data_type = "FLOAT_VECTOR"
+                vector_data_type = DataType.FLOAT_VECTOR
             elif f == df.bf16_vec_field:
                 dim = bf16_vec_field_dim
-                vector_data_type = "BFLOAT16_VECTOR"
+                vector_data_type = DataType.BFLOAT16_VECTOR
             else:
                 dim = fp16_vec_field_dim
-                vector_data_type = "FLOAT16_VECTOR"
+                vector_data_type = DataType.FLOAT16_VECTOR
 
             search_data = cf.gen_vectors(1, dim, vector_data_type=vector_data_type)
             search_params = ct.default_search_params
@@ -1207,7 +1297,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             assert len(res) == 0
             expr_field = df.pk_field
             expr = f"{expr_field} >= 0"
-
+        if add_field:
+            res, _ = self.collection_wrap.query(expr=f"{df.new_field} is not null", output_fields=[df.string_field, df.int_field, df.new_field])
+            assert len(res) == 0   
         res, _ = self.collection_wrap.query(expr=f"{expr}", output_fields=[df.string_field])
         assert len(res) == entities
         query_data = [r[expr_field] for r in res][:len(self.collection_wrap.partitions)]
@@ -1221,8 +1313,18 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
 
         if enable_partition_key:
             assert len(self.collection_wrap.partitions) > 1
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] >= 0", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == entities
+        else:
+            assert len(res) == 0
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == 1
+        else:
+            assert len(res) == 0
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [2000])
@@ -1345,7 +1447,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                         assert "address" in fields_from_search
 
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [2000])
@@ -1466,7 +1568,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                         assert "name" in fields_from_search
                         assert "address" in fields_from_search
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [1000])  # 1000
@@ -1520,6 +1622,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 # ["1", "2", "3"],
                 # [1, 2, "3"],
                 {"key": "value"},
+                {"number": 1},
+                {"name": fake.name()},
+                {"address": fake.address()}
             ]
             for i in range(entities):
                 row = {
@@ -1533,8 +1638,8 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
                     df.array_bool_field: [True, False] if not (nullable and random.random() < 0.5) else None,
                     df.float_vec_field: cf.gen_vectors(1, dim)[0],
-                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type="FLOAT16_VECTOR")[0],
-                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type="BFLOAT16_VECTOR")[0],
+                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.FLOAT_VECTOR)[0],
+                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.BFLOAT16_VECTOR)[0],
                     df.sparse_vec_field: cf.gen_sparse_vectors(1, dim, sparse_format=sparse_format)[0]
                 }
                 if auto_id:
@@ -1573,6 +1678,19 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_sparse_inverted_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
         log.info(f"wait for load finished and be ready for search")
         time.sleep(2)
@@ -1596,9 +1714,13 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 if enable_dynamic_field:
                     assert "name" in fields_from_search
                     assert "address" in fields_from_search
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == int(entities/len(json_value))
+        else:
+            assert 0 < len(res) < int(entities/len(json_value))
 
-
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("auto_id", [True])
     @pytest.mark.parametrize("dim", [128])
     @pytest.mark.parametrize("entities", [1000])
@@ -1663,7 +1785,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 # [1, 2, 3],
                 # ["1", "2", "3"],
                 # [1, 2, "3"],
-                {"key": "value"},
+                {"key": "value"}
             ]
             for i in range(entities):
                 row = {
@@ -1765,7 +1887,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
         )
 
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [1000])  # 1000
@@ -1810,6 +1932,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 # ["1", "2", "3"],
                 # [1, 2, "3"],
                 {"key": "value"},
+                {"number": 1},
+                {"name": fake.name()},
+                {"address": fake.address()}
             ]
             for i in range(entities):
                 row = {
@@ -1819,8 +1944,8 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.string_field: "string",
                     df.json_field: json_value[i%len(json_value)],
                     df.float_vec_field: cf.gen_vectors(1, dim)[0],
-                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type="FLOAT16_VECTOR")[0],
-                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type="BFLOAT16_VECTOR")[0],
+                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.FLOAT16_VECTOR)[0],
+                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.BFLOAT16_VECTOR)[0],
                 }
                 if auto_id:
                     row.pop(df.pk_field)
@@ -1858,6 +1983,19 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_sparse_inverted_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
         log.info(f"wait for load finished and be ready for search")
         time.sleep(2)
@@ -1881,8 +2019,10 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 if enable_dynamic_field:
                     assert "name" in fields_from_search
                     assert "address" in fields_from_search
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        assert len(res) == int(entities / len(json_value))
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [1000])  # 1000
@@ -1930,6 +2070,9 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 # ["1", "2", "3"],
                 # [1, 2, "3"],
                 {"key": "value"},
+                {"number": 1},
+                {"name": fake.name()},
+                {"address": fake.address()}
             ]
             for i in range(entities):
                 row = {
@@ -1943,8 +2086,8 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
                     df.array_bool_field: [True, False] if not (nullable and random.random() < 0.5) else None,
                     df.float_vec_field: cf.gen_vectors(1, dim)[0],
-                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type="FLOAT16_VECTOR")[0],
-                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type="BFLOAT16_VECTOR")[0],
+                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.FLOAT16_VECTOR)[0],
+                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.BFLOAT16_VECTOR)[0],
                     df.sparse_vec_field: cf.gen_sparse_vectors(1, dim, sparse_format=sparse_format)[0]
                 }
                 if auto_id:
@@ -1983,6 +2126,19 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             self.collection_wrap.create_index(
                 field_name=f, index_params=ct.default_sparse_inverted_index
             )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
         self.collection_wrap.load()
         log.info(f"wait for load finished and be ready for search")
         time.sleep(2)
@@ -2006,9 +2162,163 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                 if enable_dynamic_field:
                     assert "name" in fields_from_search
                     assert "address" in fields_from_search
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == int(entities/len(json_value))
+        else:
+            assert 0 < len(res) < int(entities/len(json_value))
 
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("auto_id", [True, False])
+    @pytest.mark.parametrize("dim", [128])  # 128
+    @pytest.mark.parametrize("entities", [1000])  # 1000
+    @pytest.mark.parametrize("enable_dynamic_field", [True, False])
+    @pytest.mark.parametrize("sparse_format", ["doc", "coo"])
+    @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.parametrize("add_field", [True, False])
+    def test_with_all_field_csv_with_bulk_writer(self, auto_id, dim, entities, enable_dynamic_field, sparse_format,
+                                                 nullable, add_field):
+        """
+        """
+        self._connect()
+        fields = [
+            cf.gen_int64_field(name=df.pk_field, is_primary=True, auto_id=auto_id),
+            cf.gen_int64_field(name=df.int_field, nullable=nullable),
+            cf.gen_float_field(name=df.float_field, nullable=nullable),
+            cf.gen_string_field(name=df.string_field, nullable=nullable),
+            cf.gen_json_field(name=df.json_field, nullable=nullable),
+            cf.gen_array_field(name=df.array_int_field, element_type=DataType.INT64, nullable=nullable),
+            cf.gen_array_field(name=df.array_float_field, element_type=DataType.FLOAT, nullable=nullable),
+            cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
+            cf.gen_array_field(name=df.array_bool_field, element_type=DataType.BOOL, nullable=nullable),
+            cf.gen_float_vec_field(name=df.float_vec_field, dim=dim),
+            cf.gen_float16_vec_field(name=df.fp16_vec_field, dim=dim),
+            cf.gen_bfloat16_vec_field(name=df.bf16_vec_field, dim=dim),
+            cf.gen_sparse_vec_field(name=df.sparse_vec_field),
+        ]
+        c_name = cf.gen_unique_str("bulk_insert")
+        schema = cf.gen_collection_schema(fields=fields, auto_id=auto_id, enable_dynamic_field=enable_dynamic_field)
+        self.collection_wrap.init_collection(c_name, schema=schema)
+        with RemoteBulkWriter(
+            schema=schema,
+            remote_path="bulk_data",
+            connect_param=RemoteBulkWriter.ConnectParam(
+                bucket_name=self.bucket_name,
+                endpoint=self.minio_endpoint,
+                access_key="minioadmin",
+                secret_key="minioadmin",
+            ),
+            file_type=BulkFileType.CSV,
+        ) as remote_writer:
+            json_value = [
+                {"key": "value"},
+                {"number": 1},
+                {"name": fake.name()},
+                {"address": fake.address()}
+            ]
+            for i in range(entities):
+                row = {
+                    df.pk_field: i,
+                    df.int_field: 1 if not (nullable and random.random() < 0.5) else None,
+                    df.float_field: 1.0 if not (nullable and random.random() < 0.5) else None,
+                    df.string_field: "string" if not (nullable and random.random() < 0.5) else None,
+                    df.json_field: json_value[i%len(json_value)] if not (nullable and random.random() < 0.5) else None,
+                    df.array_int_field: [1, 2] if not (nullable and random.random() < 0.5) else None,
+                    df.array_float_field: [1.0, 2.0] if not (nullable and random.random() < 0.5) else None,
+                    df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
+                    df.array_bool_field: [True, False] if not (nullable and random.random() < 0.5) else None,
+                    df.float_vec_field: cf.gen_vectors(1, dim)[0],
+                    df.fp16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.FLOAT16_VECTOR)[0],
+                    df.bf16_vec_field: cf.gen_vectors(1, dim, vector_data_type=DataType.BFLOAT16_VECTOR)[0],
+                    df.sparse_vec_field: cf.gen_sparse_vectors(1, dim, sparse_format=sparse_format)[0]
+                }
+                if auto_id:
+                    row.pop(df.pk_field)
+                if enable_dynamic_field:
+                    row["name"] = fake.name()
+                    row["address"] = fake.address()
+                remote_writer.append_row(row)
+            remote_writer.commit()
+            files = remote_writer.batch_files
+        if add_field:
+            self._connect(enable_milvus_client_api=True)
+            self.client.add_collection_field(collection_name=c_name, field_name=df.new_field, data_type=DataType.INT64,
+                                             nullable=True)
+        # import data
+        for f in files:
+            t0 = time.time()
+            task_id, _ = self.utility_wrap.do_bulk_insert(
+                collection_name=c_name, files=f
+            )
+            logging.info(f"bulk insert task ids:{task_id}")
+            success, states = self.utility_wrap.wait_for_bulk_insert_tasks_completed(
+                task_ids=[task_id], timeout=300
+            )
+            tt = time.time() - t0
+            log.info(f"bulk insert state:{success} in {tt} with states:{states}")
+            assert success
+        num_entities = self.collection_wrap.num_entities
+        log.info(f" collection entities: {num_entities}")
+        assert num_entities == entities
+        # verify imported data is available for search
+        index_params = ct.default_index
+        float_vec_fields = [f.name for f in fields if "vec" in f.name and "float" in f.name]
+        sparse_vec_fields = [f.name for f in fields if "vec" in f.name and "sparse" in f.name]
+        for f in float_vec_fields:
+            self.collection_wrap.create_index(
+                field_name=f, index_params=index_params
+            )
+        for f in sparse_vec_fields:
+            self.collection_wrap.create_index(
+                field_name=f, index_params=ct.default_sparse_inverted_index
+            )
+        # add json path index for json field
+        json_path_index_params_double = {"index_type": "INVERTED", "params": {"json_cast_type": "double",
+                                                                              "json_path": f"{df.json_field}['number']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_double)
+        json_path_index_params_varchar = {"index_type": "INVERTED", "params": {"json_cast_type": "VARCHAR",
+                                                                               "json_path": f"{df.json_field}['address']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_varchar)
+        json_path_index_params_bool = {"index_type": "INVERTED", "params": {"json_cast_type": "Bool",
+                                                                            "json_path": f"{df.json_field}['name']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_bool)
+        json_path_index_params_not_exist = {"index_type": "INVERTED", "params": {"json_cast_type": "Double",
+                                                                                 "json_path": f"{df.json_field}['not_exist']"}}
+        self.collection_wrap.create_index(field_name=df.json_field, index_params=json_path_index_params_not_exist)
+        self.collection_wrap.load()
+        log.info(f"wait for load finished and be ready for search")
+        time.sleep(2)
+        # log.info(f"query seg info: {self.utility_wrap.get_query_segment_info(c_name)[0]}")
+        search_data = cf.gen_vectors(1, dim)
+        search_params = ct.default_search_params
+        res, _ = self.collection_wrap.search(
+            search_data,
+            df.float_vec_field,
+            param=search_params,
+            limit=1,
+            output_fields=["*"],
+            check_task=CheckTasks.check_search_results,
+            check_items={"nq": 1, "limit": 1},
+        )
+        for hit in res:
+            for r in hit:
+                fields_from_search = r.fields.keys()
+                for f in fields:
+                    assert f.name in fields_from_search
+                if enable_dynamic_field:
+                    assert "name" in fields_from_search
+                    assert "address" in fields_from_search
+        res, _ = self.collection_wrap.query(expr=f"{df.json_field}['number'] == 1", output_fields=[df.json_field])
+        if not nullable:
+            assert len(res) == int(entities/len(json_value))
+        else:
+            assert 0 < len(res) < int(entities/len(json_value))
+        if add_field:
+            res, _ = self.collection_wrap.query(expr=f"{df.new_field} is not null", output_fields=[df.string_field, df.int_field, df.new_field])
+            assert len(res) == 0
+
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True])
     @pytest.mark.parametrize("dim", [128])  # 128
     @pytest.mark.parametrize("entities", [1000])  # 1000
@@ -2061,7 +2371,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             check_task=CheckTasks.err_res, check_items=error
         )
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [128])
     @pytest.mark.parametrize("entities", [2000])
@@ -2135,7 +2445,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             check_items={"nq": 1, "limit": 1},
         )
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("is_row_based", [True])
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("par_key_field", [df.int_field, df.string_field])
@@ -2246,7 +2556,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             check_items={"err_code": 2100, "err_msg": err_msg},
         )
 
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
     @pytest.mark.parametrize("dim", [13])
     @pytest.mark.parametrize("entities", [150])
@@ -2332,7 +2642,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
         assert num_entities == entities * file_nums
 
     @pytest.mark.parametrize("pk_field", [df.pk_field, df.string_field])
-    @pytest.mark.tags(CaseLabel.L3)
+    @pytest.mark.tags(CaseLabel.L2)
     def test_bulk_import_random_pk_stats_task(self, pk_field):
         # connect -> prepare json data
         self._connect()
@@ -2398,9 +2708,269 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
 
         # verify search
         self.collection_wrap.search(
-            data=cf.gen_vectors(ct.default_nq, ct.default_dim, vector_data_type=DataType.FLOAT_VECTOR.name),
+            data=cf.gen_vectors(ct.default_nq, ct.default_dim, vector_data_type=DataType.FLOAT_VECTOR),
             anns_field=df.float_vec_field, param=DefaultVectorSearchParams.IVF_SQ8(),
             limit=ct.default_limit,
             check_task=CheckTasks.check_search_results,
             check_items={"nq": ct.default_nq,
                          "limit": ct.default_limit})
+
+class TestImportWithTextEmbeddingFunction(TestcaseBase):
+    """
+    ******************************************************************
+      The following cases are used to test import with text embedding
+    ******************************************************************
+    """
+
+    @pytest.mark.parametrize("file_format", ["json", "parquet", "numpy"])
+    @pytest.mark.parametrize("add_field", [True, False])
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_import_without_embedding(self, tei_endpoint, minio_host, file_format, add_field):
+        """
+        target: test import data without embedding
+        method: 1. create collection
+                2. import data without embedding field
+                3. verify embeddings are generated
+        expected: embeddings should be generated after import
+        """
+        dim = 768
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
+            FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="dense", dtype=DataType.FLOAT_VECTOR, dim=dim),
+        ]
+        schema = CollectionSchema(fields=fields, description="test collection")
+
+        text_embedding_function = Function(
+            name="text_embedding",
+            function_type=FunctionType.TEXTEMBEDDING,
+            input_field_names=["document"],
+            output_field_names="dense",
+            params={
+                "provider": "TEI",
+                "endpoint": tei_endpoint,
+            },
+        )
+        schema.add_function(text_embedding_function)
+        c_name = cf.gen_unique_str("import_without_embedding")
+        collection_w = self.init_collection_wrap(name=c_name, schema=schema)
+
+        # prepare import data without embedding
+        nb = 1000
+        if file_format == "json":
+            file_type = BulkFileType.JSON
+        elif file_format == "numpy":
+            file_type = BulkFileType.NUMPY
+        else:
+            file_type = BulkFileType.PARQUET
+        with RemoteBulkWriter(
+            schema=schema,
+            remote_path="bulk_data",
+            connect_param=RemoteBulkWriter.ConnectParam(
+                bucket_name="milvus-bucket",
+                endpoint=f"{minio_host}:9000",
+                access_key="minioadmin",
+                secret_key="minioadmin",
+            ),
+            file_type=file_type,
+        ) as remote_writer:
+            for i in range(nb):
+                row = {"id": i, "document": f"This is test document {i}"}
+                remote_writer.append_row(row)
+            remote_writer.commit()
+            files = remote_writer.batch_files
+        if add_field:
+            self._connect(enable_milvus_client_api=True)
+            self.client.add_collection_field(collection_name=c_name, field_name=df.new_field, data_type=DataType.INT64,
+                                             nullable=True)
+        # import data
+        for f in files:
+            t0 = time.time()
+            task_id, _ = self.utility_wrap.do_bulk_insert(
+                collection_name=c_name, files=f
+            )
+            log.info(f"bulk insert task ids:{task_id}")
+            success, states = self.utility_wrap.wait_for_bulk_insert_tasks_completed(
+                task_ids=[task_id], timeout=300
+            )
+            tt = time.time() - t0
+            log.info(f"bulk insert state:{success} in {tt} with states:{states}")
+            assert success
+        num_entities = collection_w.num_entities
+        log.info(f" collection entities: {num_entities}")
+        assert num_entities == nb
+
+        # create index and load
+        index_params = {
+            "index_type": "AUTOINDEX",
+            "metric_type": "COSINE",
+            "params": {},
+        }
+        collection_w.create_index("dense", index_params)
+        collection_w.load()
+        # verify embeddings are generated
+        res, _ = collection_w.query(expr="id >= 0", output_fields=["dense"])
+        assert len(res) == nb
+        for r in res:
+            assert "dense" in r
+            assert len(r["dense"]) == dim
+        if add_field:
+            res, _ = collection_w.query(expr=f"{df.new_field} is not null", output_fields=[df.new_field])
+            assert len(res) == 0
+
+
+class TestImportWithFunctionNegative(TestcaseBase):
+    """
+    ******************************************************************
+      The following cases are used to test import with text embedding
+    ******************************************************************
+    """
+
+    @pytest.mark.parametrize("file_format", ["json", "parquet"])
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_import_for_bm25_function_with_output_field(self, tei_endpoint, minio_host, file_format):
+        """
+        target: test import data for bm25 with output field
+        method: 1. create collection
+                2. import data with output field
+                3. verify import failed
+        expected: import failed
+        """
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
+            FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True),
+            FieldSchema(name="bm25", dtype=DataType.SPARSE_FLOAT_VECTOR),
+        ]
+        schema = CollectionSchema(fields=fields, description="test collection")
+
+        bm25_function = Function(
+            name="text_embedding",
+            function_type=FunctionType.BM25,
+            input_field_names=["document"],
+            output_field_names=["bm25"],
+            params={
+            },
+        )
+        schema.add_function(bm25_function)
+        c_name = cf.gen_unique_str("import_without_embedding")
+        collection_w = self.init_collection_wrap(name=c_name, schema=schema)
+
+        # prepare import data with function output
+        invalid_schema = CollectionSchema(fields=fields, description="test collection")
+        nb = 1000
+        rng = np.random.default_rng()
+        if file_format == "json":
+            file_type = BulkFileType.JSON
+        elif file_format == "numpy":
+            file_type = BulkFileType.NUMPY
+        else:
+            file_type = BulkFileType.PARQUET
+        with RemoteBulkWriter(
+            schema=invalid_schema,
+            remote_path="bulk_data",
+            connect_param=RemoteBulkWriter.ConnectParam(
+                bucket_name="milvus-bucket",
+                endpoint=f"{minio_host}:9000",
+                access_key="minioadmin",
+                secret_key="minioadmin",
+            ),
+            file_type=file_type,
+        ) as remote_writer:
+            for i in range(nb):
+                row = {"id": i,
+                       "document": f"This is test document {i}",
+                       "bm25": {
+                            d: rng.random() for d in random.sample(range(1000), random.randint(20, 30))
+                        }
+                       }
+                remote_writer.append_row(row)
+            remote_writer.commit()
+            files = remote_writer.batch_files
+        # import data
+        for f in files:
+            t0 = time.time()
+            task_id, _ = self.utility_wrap.do_bulk_insert(
+                collection_name=c_name, files=f
+            )
+            log.info(f"bulk insert task ids:{task_id}")
+            success, states = self.utility_wrap.wait_for_bulk_insert_tasks_completed(
+                task_ids=[task_id], timeout=300
+            )
+            tt = time.time() - t0
+            log.info(f"bulk insert state:{success} in {tt} with states:{states}")
+            assert not success
+
+
+    @pytest.mark.parametrize("file_format", ["json", "parquet"])
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_import_for_text_embedding_function_with_output_field(self, tei_endpoint, minio_host, file_format):
+        """
+        target: test import data for text embedding function with output field
+        method: 1. create collection
+                2. import data for text embedding function with output field
+                3. import failed
+        expected: import failed
+        """
+        dim = 768
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
+            FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="dense", dtype=DataType.FLOAT_VECTOR, dim=dim),
+        ]
+        schema = CollectionSchema(fields=fields, description="test collection")
+
+        text_embedding_function = Function(
+            name="text_embedding",
+            function_type=FunctionType.TEXTEMBEDDING,
+            input_field_names=["document"],
+            output_field_names="dense",
+            params={
+                "provider": "TEI",
+                "endpoint": tei_endpoint,
+            },
+        )
+        schema.add_function(text_embedding_function)
+        c_name = cf.gen_unique_str("import_without_embedding")
+        collection_w = self.init_collection_wrap(name=c_name, schema=schema)
+
+        # prepare import data embedding
+        invalid_schema = CollectionSchema(fields=fields, description="test collection")
+        nb = 1000
+        if file_format == "json":
+            file_type = BulkFileType.JSON
+        elif file_format == "numpy":
+            file_type = BulkFileType.NUMPY
+        else:
+            file_type = BulkFileType.PARQUET
+        with RemoteBulkWriter(
+            schema=invalid_schema,
+            remote_path="bulk_data",
+            connect_param=RemoteBulkWriter.ConnectParam(
+                bucket_name="milvus-bucket",
+                endpoint=f"{minio_host}:9000",
+                access_key="minioadmin",
+                secret_key="minioadmin",
+            ),
+            file_type=file_type,
+        ) as remote_writer:
+            for i in range(nb):
+                row = {"id": i,
+                       "document": f"This is test document {i}",
+                       "dense": [random.random() for _ in range(dim)]
+                       }
+                remote_writer.append_row(row)
+            remote_writer.commit()
+            files = remote_writer.batch_files
+        # import data
+        for f in files:
+            t0 = time.time()
+            task_id, _ = self.utility_wrap.do_bulk_insert(
+                collection_name=c_name, files=f
+            )
+            log.info(f"bulk insert task ids:{task_id}")
+            success, states = self.utility_wrap.wait_for_bulk_insert_tasks_completed(
+                task_ids=[task_id], timeout=300
+            )
+            tt = time.time() - t0
+            log.info(f"bulk insert state:{success} in {tt} with states:{states}")
+            assert not success

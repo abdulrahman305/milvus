@@ -3,7 +3,6 @@ package compactor
 import (
 	"context"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -31,6 +30,7 @@ func mergeSortMultipleSegments(ctx context.Context,
 	tr *timerecord.TimeRecorder,
 	currentTime time.Time,
 	collectionTtl int64,
+	compactionParams compaction.Params,
 ) ([]*datapb.CompactionSegment, error) {
 	_ = tr.RecordSpan()
 
@@ -40,9 +40,13 @@ func mergeSortMultipleSegments(ctx context.Context,
 	log := log.With(zap.Int64("planID", plan.GetPlanID()))
 
 	segIDAlloc := allocator.NewLocalAllocator(plan.GetPreAllocatedSegmentIDs().GetBegin(), plan.GetPreAllocatedSegmentIDs().GetEnd())
-	logIDAlloc := allocator.NewLocalAllocator(plan.GetBeginLogID(), math.MaxInt64)
+	logIDAlloc := allocator.NewLocalAllocator(plan.GetPreAllocatedLogIDs().GetBegin(), plan.GetPreAllocatedLogIDs().GetEnd())
 	compAlloc := NewCompactionAllocator(segIDAlloc, logIDAlloc)
-	writer := NewMultiSegmentWriter(ctx, binlogIO, compAlloc, plan.GetMaxSize(), plan.GetSchema(), maxRows, partitionID, collectionID, plan.GetChannel(), 4096)
+	writer, err := NewMultiSegmentWriter(ctx, binlogIO, compAlloc, plan.GetMaxSize(), plan.GetSchema(), compactionParams, maxRows, partitionID, collectionID, plan.GetChannel(), 4096,
+		storage.WithStorageConfig(compactionParams.StorageConfig))
+	if err != nil {
+		return nil, err
+	}
 
 	pkField, err := typeutil.GetPrimaryFieldSchema(plan.GetSchema())
 	if err != nil {
@@ -53,7 +57,13 @@ func mergeSortMultipleSegments(ctx context.Context,
 	segmentReaders := make([]storage.RecordReader, len(binlogs))
 	segmentFilters := make([]compaction.EntityFilter, len(binlogs))
 	for i, s := range binlogs {
-		reader, err := storage.NewBinlogRecordReader(ctx, s.GetFieldBinlogs(), plan.GetSchema(), storage.WithDownloader(binlogIO.Download))
+		reader, err := storage.NewBinlogRecordReader(ctx,
+			s.GetFieldBinlogs(),
+			plan.GetSchema(),
+			storage.WithDownloader(binlogIO.Download),
+			storage.WithVersion(s.StorageVersion),
+			storage.WithStorageConfig(compactionParams.StorageConfig),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -70,6 +80,12 @@ func mergeSortMultipleSegments(ctx context.Context,
 		}
 		segmentFilters[i] = compaction.NewEntityFilter(delta, collectionTtl, currentTime)
 	}
+
+	defer func() {
+		for _, r := range segmentReaders {
+			r.Close()
+		}
+	}()
 
 	var predicate func(r storage.Record, ri, i int) bool
 	switch pkField.DataType {
@@ -89,7 +105,8 @@ func mergeSortMultipleSegments(ctx context.Context,
 		log.Warn("compaction only support int64 and varchar pk field")
 	}
 
-	if _, err = storage.MergeSort(plan.GetSchema(), segmentReaders, writer, predicate); err != nil {
+	if _, err = storage.MergeSort(compactionParams.BinLogMaxSize, plan.GetSchema(), segmentReaders, writer, predicate); err != nil {
+		writer.Close()
 		return nil, err
 	}
 

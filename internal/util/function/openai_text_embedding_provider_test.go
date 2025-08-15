@@ -20,16 +20,17 @@ package function
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 	"github.com/milvus-io/milvus/internal/util/function/models/openai"
 )
 
@@ -70,18 +71,17 @@ func createOpenAIProvider(url string, schema *schemapb.FieldSchema, providerName
 		OutputFieldIds:   []int64{102},
 		Params: []*commonpb.KeyValuePair{
 			{Key: modelNameParamKey, Value: "text-embedding-ada-002"},
-			{Key: apiKeyParamKey, Value: "mock"},
+			{Key: credentialParamKey, Value: "mock"},
 			{Key: dimParamKey, Value: "4"},
-			{Key: embeddingURLParamKey, Value: url},
 		},
 	}
 	switch providerName {
 	case openAIProvider:
-		return NewOpenAIEmbeddingProvider(schema, functionSchema)
+		return NewOpenAIEmbeddingProvider(schema, functionSchema, map[string]string{embeddingURLParamKey: url}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	case azureOpenAIProvider:
-		return NewAzureOpenAIEmbeddingProvider(schema, functionSchema)
+		return NewAzureOpenAIEmbeddingProvider(schema, functionSchema, map[string]string{embeddingURLParamKey: url}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	default:
-		return nil, fmt.Errorf("Unknow provider")
+		return nil, errors.New("Unknow provider")
 	}
 }
 
@@ -181,27 +181,15 @@ func (s *OpenAITextEmbeddingProviderSuite) TestEmbeddingNubmerNotMatch() {
 func (s *OpenAITextEmbeddingProviderSuite) TestCreateOpenAIEmbeddingClient() {
 	_, err := createOpenAIEmbeddingClient("", "")
 	s.Error(err)
-
-	os.Setenv(openaiAKEnvStr, "mockKey")
-	defer os.Unsetenv(openaiAKEnvStr)
-
-	_, err = createOpenAIEmbeddingClient("", "")
-	s.NoError(err)
 }
 
 func (s *OpenAITextEmbeddingProviderSuite) TestCreateAzureOpenAIEmbeddingClient() {
-	_, err := createAzureOpenAIEmbeddingClient("", "")
-	s.Error(err)
-
-	os.Setenv(azureOpenaiAKEnvStr, "mockKey")
-	defer os.Unsetenv(azureOpenaiAKEnvStr)
-
-	_, err = createAzureOpenAIEmbeddingClient("", "")
+	_, err := createAzureOpenAIEmbeddingClient("", "", "")
 	s.Error(err)
 
 	os.Setenv(azureOpenaiResourceName, "mockResource")
 	defer os.Unsetenv(azureOpenaiResourceName)
 
-	_, err = createAzureOpenAIEmbeddingClient("", "")
+	_, err = createAzureOpenAIEmbeddingClient("mock", "", "")
 	s.NoError(err)
 }

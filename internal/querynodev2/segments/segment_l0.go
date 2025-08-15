@@ -174,6 +174,10 @@ func (s *L0Segment) DeleteRecords() ([]storage.PrimaryKey, []uint64) {
 	return s.pks, s.tss
 }
 
+func (s *L0Segment) FinishLoad() error {
+	return nil
+}
+
 func (s *L0Segment) Release(ctx context.Context, opts ...releaseOption) {
 	s.dataGuard.Lock()
 	defer s.dataGuard.Unlock()
@@ -191,4 +195,8 @@ func (s *L0Segment) Release(ctx context.Context, opts ...releaseOption) {
 
 func (s *L0Segment) RemoveUnusedFieldFiles() error {
 	panic("not implemented")
+}
+
+func (s *L0Segment) GetFieldJSONIndexStats() []int64 {
+	return nil
 }

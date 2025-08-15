@@ -17,11 +17,16 @@
 #include "common/EasyAssert.h"
 #include "common/LoadInfo.h"
 #include "segcore/load_field_data_c.h"
+#include "monitor/scope_metric.h"
 
 CStatus
-NewLoadFieldDataInfo(CLoadFieldDataInfo* c_load_field_data_info) {
+NewLoadFieldDataInfo(CLoadFieldDataInfo* c_load_field_data_info,
+                     int64_t storage_version) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto load_field_data_info = std::make_unique<LoadFieldDataInfo>();
+        load_field_data_info->storage_version = storage_version;
         *c_load_field_data_info = load_field_data_info.release();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
@@ -31,6 +36,8 @@ NewLoadFieldDataInfo(CLoadFieldDataInfo* c_load_field_data_info) {
 
 void
 DeleteLoadFieldDataInfo(CLoadFieldDataInfo c_load_field_data_info) {
+    SCOPE_CGO_CALL_METRIC();
+
     auto info = static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
     delete info;
 }
@@ -39,12 +46,14 @@ CStatus
 AppendLoadFieldInfo(CLoadFieldDataInfo c_load_field_data_info,
                     int64_t field_id,
                     int64_t row_count) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto load_field_data_info =
             static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
         auto iter = load_field_data_info->field_infos.find(field_id);
         if (iter != load_field_data_info->field_infos.end()) {
-            PanicInfo(milvus::ErrorCode::FieldAlreadyExist,
+            ThrowInfo(milvus::ErrorCode::FieldAlreadyExist,
                       "append same field info multi times");
         }
         FieldBinlogInfo binlog_info;
@@ -61,13 +70,16 @@ CStatus
 AppendLoadFieldDataPath(CLoadFieldDataInfo c_load_field_data_info,
                         int64_t field_id,
                         int64_t entries_num,
+                        int64_t memory_size,
                         const char* c_file_path) {
+    SCOPE_CGO_CALL_METRIC();
+
     try {
         auto load_field_data_info =
             static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
         auto iter = load_field_data_info->field_infos.find(field_id);
         if (iter == load_field_data_info->field_infos.end()) {
-            PanicInfo(milvus::ErrorCode::FieldIDInvalid,
+            ThrowInfo(milvus::ErrorCode::FieldIDInvalid,
                       "please append field info first");
         }
         std::string file_path(c_file_path);
@@ -75,6 +87,8 @@ AppendLoadFieldDataPath(CLoadFieldDataInfo c_load_field_data_info,
             file_path);
         load_field_data_info->field_infos[field_id].entries_nums.emplace_back(
             entries_num);
+        load_field_data_info->field_infos[field_id].memory_sizes.emplace_back(
+            memory_size);
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         return milvus::FailureCStatus(&e);
@@ -84,20 +98,18 @@ AppendLoadFieldDataPath(CLoadFieldDataInfo c_load_field_data_info,
 void
 AppendMMapDirPath(CLoadFieldDataInfo c_load_field_data_info,
                   const char* c_dir_path) {
+    SCOPE_CGO_CALL_METRIC();
+
     auto load_field_data_info =
         static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
     load_field_data_info->mmap_dir_path = std::string(c_dir_path);
 }
 
 void
-SetUri(CLoadFieldDataInfo c_load_field_data_info, const char* uri) {
-    auto load_field_data_info = (LoadFieldDataInfo*)c_load_field_data_info;
-    load_field_data_info->url = std::string(uri);
-}
-
-void
 SetStorageVersion(CLoadFieldDataInfo c_load_field_data_info,
                   int64_t storage_version) {
+    SCOPE_CGO_CALL_METRIC();
+
     auto load_field_data_info = (LoadFieldDataInfo*)c_load_field_data_info;
     load_field_data_info->storage_version = storage_version;
 }
@@ -106,6 +118,16 @@ void
 EnableMmap(CLoadFieldDataInfo c_load_field_data_info,
            int64_t field_id,
            bool enabled) {
+    SCOPE_CGO_CALL_METRIC();
+
     auto info = static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
     info->field_infos[field_id].enable_mmap = enabled;
+}
+
+void
+SetLoadPriority(CLoadFieldDataInfo c_load_field_data_info, int32_t priority) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto info = static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
+    info->load_priority = milvus::proto::common::LoadPriority(priority);
 }

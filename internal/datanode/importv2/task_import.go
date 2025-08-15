@@ -18,8 +18,9 @@ package importv2
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"math"
+	"runtime/debug"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -36,7 +37,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -66,8 +67,8 @@ func NewImportTask(req *datapb.ImportRequest,
 	if importutilv2.IsBackup(req.GetOptions()) {
 		UnsetAutoID(req.GetSchema())
 	}
-	// Setting end as math.MaxInt64 to incrementally allocate logID.
-	alloc := allocator.NewLocalAllocator(req.GetIDRange().GetBegin(), math.MaxInt64)
+	// Allocator for autoIDs and logIDs.
+	alloc := allocator.NewLocalAllocator(req.GetIDRange().GetBegin(), req.GetIDRange().GetEnd())
 	task := &ImportTask{
 		ImportTaskV2: &datapb.ImportTaskV2{
 			JobID:        req.GetJobID(),
@@ -105,14 +106,31 @@ func (t *ImportTask) GetSchema() *schemapb.CollectionSchema {
 }
 
 func (t *ImportTask) GetSlots() int64 {
-	// Consider the following two scenarios:
-	// 1. Importing a large number of small files results in
-	//    a small total data size, making file count unsuitable as a slot number.
-	// 2. Importing a file with many shards number results in many segments and a small total data size,
-	//    making segment count unsuitable as a slot number.
-	// Taking these factors into account, we've decided to use the
-	// minimum value between segment count and file count as the slot number.
-	return int64(funcutil.Min(len(t.GetFileStats()), len(t.GetSegmentIDs()), paramtable.Get().DataNodeCfg.MaxTaskSlotNum.GetAsInt()))
+	return t.req.GetTaskSlot()
+}
+
+func (t *ImportTask) GetBufferSize() int64 {
+	// Calculate the task buffer size based on the number of vchannels and partitions
+	baseBufferSize := paramtable.Get().DataNodeCfg.ImportBaseBufferSize.GetAsInt()
+	vchannelNum := len(t.GetVchannels())
+	partitionNum := len(t.GetPartitionIDs())
+	taskBufferSize := int64(baseBufferSize * vchannelNum * partitionNum)
+
+	// If the file size is smaller than the task buffer size, use the file size
+	fileSize := lo.MaxBy(t.GetFileStats(), func(a, b *datapb.ImportFileStats) bool {
+		return a.GetTotalMemorySize() > b.GetTotalMemorySize()
+	}).GetTotalMemorySize()
+	if fileSize != 0 && fileSize < taskBufferSize {
+		taskBufferSize = fileSize
+	}
+
+	// Task buffer size should not exceed the memory limit
+	percentage := paramtable.Get().DataNodeCfg.ImportMemoryLimitPercentage.GetAsFloat()
+	memoryLimit := int64(float64(hardware.GetMemoryCount()) * percentage / 100.0)
+	if taskBufferSize > memoryLimit {
+		return memoryLimit
+	}
+	return taskBufferSize
 }
 
 func (t *ImportTask) Cancel() {
@@ -135,24 +153,32 @@ func (t *ImportTask) Clone() Task {
 		cancel:       cancel,
 		segmentsInfo: infos,
 		req:          t.req,
+		allocator:    t.allocator,
+		manager:      t.manager,
+		syncMgr:      t.syncMgr,
+		cm:           t.cm,
 		metaCaches:   t.metaCaches,
 	}
 }
 
 func (t *ImportTask) Execute() []*conc.Future[any] {
-	bufferSize := paramtable.Get().DataNodeCfg.ReadBufferSizeInMB.GetAsInt() * 1024 * 1024
+	bufferSize := t.GetBufferSize()
 	log.Info("start to import", WrapLogFields(t,
-		zap.Int("bufferSize", bufferSize),
-		zap.Any("schema", t.GetSchema()))...)
+		zap.Int64("bufferSize", bufferSize),
+		zap.Int64("taskSlot", t.GetSlots()),
+		zap.Any("files", t.req.GetFiles()),
+		zap.Any("schema", t.GetSchema()),
+	)...)
 	t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
 
 	req := t.req
 
 	fn := func(file *internalpb.ImportFile) error {
-		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, req.GetOptions(), bufferSize)
+		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, req.GetOptions(), int(bufferSize), t.req.GetStorageConfig())
 		if err != nil {
 			log.Warn("new reader failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		defer reader.Close()
@@ -160,7 +186,8 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 		err = t.importFile(reader)
 		if err != nil {
 			log.Warn("do import failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		log.Info("import file done", WrapLogFields(t, zap.Strings("files", file.GetPaths()),
@@ -172,6 +199,12 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 	for _, file := range req.GetFiles() {
 		file := file
 		f := GetExecPool().Submit(func() (any, error) {
+			// Use blocking allocation - this will wait until memory is available
+			GetMemoryAllocator().BlockingAllocate(t.GetTaskID(), bufferSize)
+			defer func() {
+				GetMemoryAllocator().Release(t.GetTaskID(), bufferSize)
+				debug.FreeOSMemory()
+			}()
 			err := fn(file)
 			return err, err
 		})
@@ -191,12 +224,20 @@ func (t *ImportTask) importFile(reader importutilv2.Reader) error {
 			}
 			return err
 		}
-		rowNum := GetInsertDataRowCount(data, t.GetSchema())
+		rowNum, _ := GetInsertDataRowCount(data, t.GetSchema())
 		if rowNum == 0 {
 			log.Info("0 row was imported, the data may have been deleted", WrapLogFields(t)...)
 			continue
 		}
 		err = AppendSystemFieldsData(t, data, rowNum)
+		if err != nil {
+			return err
+		}
+		err = AppendNullableDefaultFieldsData(t.GetSchema(), data, rowNum)
+		if err != nil {
+			return err
+		}
+		err = FillDynamicData(t.GetSchema(), data, rowNum)
 		if err != nil {
 			return err
 		}
@@ -257,11 +298,12 @@ func (t *ImportTask) sync(hashedData HashedData) ([]*conc.Future[struct{}], []sy
 				}
 			}
 			syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
-				segmentID, partitionID, t.GetCollectionID(), channel, data, nil, bm25Stats)
+				segmentID, partitionID, t.GetCollectionID(), channel, data, nil,
+				bm25Stats, t.req.GetStorageVersion(), t.req.GetStorageConfig())
 			if err != nil {
 				return nil, nil, err
 			}
-			future, err := t.syncMgr.SyncData(t.ctx, syncTask)
+			future, err := t.syncMgr.SyncDataWithChunkManager(t.ctx, syncTask, t.cm)
 			if err != nil {
 				log.Ctx(context.TODO()).Error("sync data failed", WrapLogFields(t, zap.Error(err))...)
 				return nil, nil, err

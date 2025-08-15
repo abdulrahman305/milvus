@@ -33,12 +33,14 @@ const (
 	ActionTypeGrow ActionType = iota + 1
 	ActionTypeReduce
 	ActionTypeUpdate
+	ActionTypeStatsUpdate
 )
 
 var ActionTypeName = map[ActionType]string{
-	ActionTypeGrow:   "Grow",
-	ActionTypeReduce: "Reduce",
-	ActionTypeUpdate: "Update",
+	ActionTypeGrow:        "Grow",
+	ActionTypeReduce:      "Reduce",
+	ActionTypeUpdate:      "Update",
+	ActionTypeStatsUpdate: "StatsUpdate",
 }
 
 func (t ActionType) String() string {
@@ -174,9 +176,9 @@ func (action *ChannelAction) Desc() string {
 }
 
 func (action *ChannelAction) IsFinished(distMgr *meta.DistributionManager) bool {
-	views := distMgr.LeaderViewManager.GetByFilter(meta.WithChannelName2LeaderView(action.ChannelName()))
-	_, hasNode := lo.Find(views, func(v *meta.LeaderView) bool {
-		return v.ID == action.Node()
+	delegator := distMgr.ChannelDistManager.GetByFilter(meta.WithChannelName2Channel(action.ChannelName()))
+	_, hasNode := lo.Find(delegator, func(v *meta.DmChannel) bool {
+		return v.Node == action.Node()
 	})
 	isGrow := action.Type() == ActionTypeGrow
 

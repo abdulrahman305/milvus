@@ -59,7 +59,20 @@ func (hc *handlerClientImpl) GetLatestMVCCTimestampIfLocal(ctx context.Context, 
 	if err != nil {
 		return 0, err
 	}
+	if w.Channel().AccessMode != types.AccessModeRW {
+		return 0, ErrReadOnlyWAL
+	}
 	return w.GetLatestMVCCTimestamp(ctx, vchannel)
+}
+
+// GetWALMetricsIfLocal gets the metrics of the local wal.
+func (hc *handlerClientImpl) GetWALMetricsIfLocal(ctx context.Context) (*types.StreamingNodeMetrics, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	return registry.GetLocalWALMetrics()
 }
 
 // CreateProducer creates a producer.
@@ -71,6 +84,9 @@ func (hc *handlerClientImpl) CreateProducer(ctx context.Context, opts *ProducerO
 
 	logger := log.With(zap.String("pchannel", opts.PChannel), zap.String("handler", "producer"))
 	p, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		if assign.Channel.AccessMode != types.AccessModeRW {
+			return nil, errors.New("producer can only be created for RW channel")
+		}
 		// Check if the localWAL is assigned at local
 		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
 		if err == nil {
@@ -158,6 +174,8 @@ func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Co
 	backoff.InitialInterval = 100 * time.Millisecond
 	backoff.MaxInterval = 10 * time.Second
 	backoff.MaxElapsedTime = 0
+	backoff.Reset()
+
 	for {
 		assign := hc.watcher.Get(ctx, pchannel)
 		if assign != nil {

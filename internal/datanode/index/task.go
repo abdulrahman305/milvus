@@ -18,14 +18,15 @@ package index
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var (
-	errCancel      = fmt.Errorf("canceled")
+	errCancel      = errors.New("canceled")
 	DiskUsageRatio = 4.0
 )
 
@@ -44,4 +45,5 @@ type Task interface {
 	Execute(context.Context) error
 	PostExecute(context.Context) error
 	Reset()
+	GetSlot() int64
 }

@@ -13,6 +13,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "common/type_c.h"
+
+#include "common/type_c.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,13 +28,31 @@ void
 SegcoreSetChunkRows(const int64_t);
 
 void
-SegcoreSetEnableTempSegmentIndex(const bool);
+SegcoreSetEnableInterminSegmentIndex(const bool);
 
 void
 SegcoreSetNlist(const int64_t);
 
 void
 SegcoreSetNprobe(const int64_t);
+
+CStatus
+SegcoreSetDenseVectorInterminIndexType(const char*);
+
+void
+SegcoreSetSubDim(const int64_t);
+
+void
+SegcoreSetRefineRatio(const float);
+
+void
+SegcoreInterminDenseIndexType(const char*);
+
+CStatus
+SegcoreSetDenseVectorInterminIndexRefineQuantType(const char*);
+
+void
+SegcoreSetDenseVectorInterminIndexRefineWithQuantFlag(const bool);
 
 // return value must be freed by the caller
 char*
@@ -59,8 +80,36 @@ GetCurrentIndexVersion();
 int32_t
 GetMinimalIndexVersion();
 
+int32_t
+GetMaximumIndexVersion();
+
 void
 SetThreadName(const char*);
+
+void
+ConfigureTieredStorage(
+    // Cache warmup policies
+    const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
+    const CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+    const CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
+    const CacheWarmupPolicy vectorIndexCacheWarmupPolicy,
+    // watermarks
+    const int64_t memory_low_watermark_bytes,
+    const int64_t memory_high_watermark_bytes,
+    const int64_t memory_max_bytes,
+    const int64_t disk_low_watermark_bytes,
+    const int64_t disk_high_watermark_bytes,
+    const int64_t disk_max_bytes,
+    // eviction enabled
+    const bool evictionEnabled,
+    // eviction configs
+    const int64_t cache_touch_window_ms,
+    const int64_t eviction_interval_ms,
+    const int64_t cache_cell_unaccessed_survival_time,
+    const float overloaded_memory_threshold_percentage,
+    const float loading_memory_factor,
+    const float max_disk_usage_percentage,
+    const char* disk_path);
 
 #ifdef __cplusplus
 }

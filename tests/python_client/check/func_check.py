@@ -1,3 +1,4 @@
+import pandas.core.frame
 from pymilvus.client.types import CompactionPlans
 from pymilvus import Role
 
@@ -6,9 +7,10 @@ from common import common_type as ct
 from common import common_func as cf
 from common.common_type import CheckTasks, Connect_Object_Name
 # from common.code_mapping import ErrorCode, ErrorMessage
-from pymilvus import Collection, Partition, ResourceGroupInfo
+from pymilvus import Collection, Partition, ResourceGroupInfo, DataType
 import check.param_check as pc
-
+import numpy as np
+from ml_dtypes import bfloat16
 
 class Error:
     def __init__(self, error):
@@ -209,7 +211,6 @@ class ResponseChecker:
             collection = res
         elif isinstance(res, tuple):
             collection = res[0]
-            log.debug(collection.schema)
         else:
             raise Exception("The result to check isn't collection type object")
         if len(check_items) == 0:
@@ -246,22 +247,35 @@ class ResponseChecker:
             raise Exception("No expect values found in the check task")
         if check_items.get("collection_name", None) is not None:
             assert res["collection_name"] == check_items.get("collection_name")
-        if check_items.get("auto_id", False):
-            assert res["auto_id"] == check_items.get("auto_id")
-        if check_items.get("num_shards", 1):
-            assert res["num_shards"] == check_items.get("num_shards", 1)
-        if check_items.get("consistency_level", 2):
-            assert res["consistency_level"] == check_items.get("consistency_level", 2)
-        if check_items.get("enable_dynamic_field", True):
-            assert res["enable_dynamic_field"] == check_items.get("enable_dynamic_field", True)
-        if check_items.get("num_partitions", 1):
-            assert res["num_partitions"] == check_items.get("num_partitions", 1)
-        if check_items.get("id_name", "id"):
+        assert res["auto_id"] == check_items.get("auto_id", False)
+        assert res["num_shards"] == check_items.get("num_shards", 1)
+        assert res["consistency_level"] == check_items.get("consistency_level", 0)
+        assert res["enable_dynamic_field"] == check_items.get("enable_dynamic_field", True)
+        assert res["num_partitions"] == check_items.get("num_partitions", 1)
+        if check_items.get("id_name", None):
             assert res["fields"][0]["name"] == check_items.get("id_name", "id")
         if check_items.get("vector_name", "vector"):
-            assert res["fields"][1]["name"] == check_items.get("vector_name", "vector")
+            vector_name_list = []
+            vector_name_list_expected = check_items.get("vector_name", "vector")
+            for field in res["fields"]:
+                if field["type"] in [101, 102, 103, 105]:
+                    vector_name_list.append(field["name"])
+            if isinstance(vector_name_list_expected, str):
+                assert vector_name_list[0] == check_items.get("vector_name", "vector")
+            else:
+                assert vector_name_list == vector_name_list_expected
         if check_items.get("dim", None) is not None:
-            assert res["fields"][1]["params"]["dim"] == check_items.get("dim")
+            dim_list = []
+            # here dim support int for only one vector field and list for multiple vector fields, and the order
+            # should be the same of the order adding schema
+            dim_list_expected = check_items.get("dim")
+            for field in res["fields"]:
+                if field["type"] in [101, 102, 103, 105]:
+                    dim_list.append(field["params"]["dim"])
+            if isinstance(dim_list_expected, int):
+                assert dim_list[0] == dim_list_expected
+            else:
+                assert dim_list == dim_list_expected
         if check_items.get("nullable_fields", None) is not None:
             nullable_fields = check_items.get("nullable_fields")
             if not isinstance(nullable_fields, list):
@@ -270,9 +284,17 @@ class ResponseChecker:
             for field in res["fields"]:
                 if field["name"] in nullable_fields:
                     assert field["nullable"] is True
+        if check_items.get("add_fields", None) is not None:
+            add_fields = check_items.get("add_fields")
+            if not isinstance(add_fields, list):
+                log.error("add_fields should be a list including all the added fields name")
+                assert False
+            for field in res["fields"]:
+                if field["name"] in add_fields:
+                    assert field["nullable"] is True
         assert res["fields"][0]["is_primary"] is True
         assert res["fields"][0]["field_id"] == 100 and (res["fields"][0]["type"] == 5 or 21)
-        assert res["fields"][1]["field_id"] == 101 and res["fields"][1]["type"] == 101
+        assert res["fields"][1]["field_id"] == 101 and (res["fields"][1]["type"] == 101 or 105)
 
         return True
 
@@ -394,6 +416,10 @@ class ResponseChecker:
         expected: check the search is ok
         """
         log.info("search_results_check: checking the searching results")
+        enable_milvus_client_api = check_items.get("enable_milvus_client_api", False)
+        pk_name = check_items.get("pk_name", ct.default_primary_field_name) if enable_milvus_client_api is False \
+            else check_items.get("pk_name", 'id')
+
         if func_name != 'search' and func_name != 'hybrid_search':
             log.warning("The function name is {} rather than {} or {}".format(func_name, "search", "hybrid_search"))
         if len(check_items) == 0:
@@ -403,11 +429,12 @@ class ResponseChecker:
                 search_res.done()
                 search_res = search_res.result()
         if check_items.get("output_fields", None):
-            assert set(search_res[0][0].entity.fields) == set(check_items["output_fields"])
-            log.info('search_results_check: Output fields of query searched is correct')
-            if check_items.get("original_entities", None):
-                original_entities = check_items["original_entities"][0]
-                pc.output_field_value_check(search_res, original_entities)
+            assert set(search_res[0][0].entity.fields.keys()) == set(check_items["output_fields"])
+            original_entities = check_items.get("original_entities", None)
+            if original_entities is not None:
+                if not isinstance(original_entities, pandas.core.frame.DataFrame):
+                    original_entities = pandas.DataFrame(original_entities)
+                pc.output_field_value_check(search_res, original_entities, pk_name=pk_name)
         if len(search_res) != check_items["nq"]:
             log.error("search_results_check: Numbers of query searched (%d) "
                       "is not equal with expected (%d)"
@@ -415,17 +442,18 @@ class ResponseChecker:
             assert len(search_res) == check_items["nq"]
         else:
             log.info("search_results_check: Numbers of query searched is correct")
-        enable_milvus_client_api = check_items.get("enable_milvus_client_api", False)
         # log.debug(search_res)
+        nq_i = 0
         for hits in search_res:
-            searched_original_vectors = []
             ids = []
-            vector_id = 0
+            distances = []
             if enable_milvus_client_api:
                 for hit in hits:
-                    ids.append(hit['id'])
+                    ids.append(hit[pk_name])
+                    distances.append(hit['distance'])
             else:
                 ids = list(hits.ids)
+                distances = list(hits.distances)
             if (len(hits) != check_items["limit"]) \
                     or (len(ids) != check_items["limit"]):
                 log.error("search_results_check: limit(topK) searched (%d) "
@@ -435,28 +463,26 @@ class ResponseChecker:
                 assert len(ids) == check_items["limit"]
             else:
                 if check_items.get("ids", None) is not None:
-                    ids_match = pc.list_contain_check(ids,
-                                                      list(check_items["ids"]))
+                    ids_match = pc.list_contain_check(ids, list(check_items["ids"]))
                     if not ids_match:
                         log.error("search_results_check: ids searched not match")
                         assert ids_match
                 elif check_items.get("metric", None) is not None:
-                    if check_items.get("vector_nq") is None:
-                        raise Exception("vector for searched (nq) is needed for distance check")
-                    if check_items.get("original_vectors") is None:
-                        raise Exception("inserted vectors are needed for distance check")
-                    for id in hits.ids:
-                        searched_original_vectors.append(check_items["original_vectors"][id])
-                    cf.compare_distance_vector_and_vector_list(check_items["vector_nq"][vector_id],
-                                                               searched_original_vectors,
-                                                               check_items["metric"], hits.distances)
-                    log.info("search_results_check: Checked the distances for one nq: OK")
+                    # verify the distances are already sorted
+                    if check_items.get("metric").upper() in ["IP", "COSINE", "BM25"]:
+                        assert pc.compare_lists_with_epsilon_ignore_dict_order(distances, sorted(distances, reverse=True))
+                    else:
+                        assert pc.compare_lists_with_epsilon_ignore_dict_order(distances, sorted(distances, reverse=False))
+                    if check_items.get("vector_nq") is None or check_items.get("original_vectors") is None:
+                        log.debug("skip distance check for knowhere does not return the precise distances")
+                    else:
+                        pass
                 else:
                     pass  # just check nq and topk, not specific ids need check
-            vector_id +=  1
+            nq_i += 1
+
         log.info("search_results_check: limit (topK) and "
                  "ids searched for %d queries are correct" % len(search_res))
-
         return True
 
     @staticmethod
@@ -536,15 +562,40 @@ class ResponseChecker:
             raise Exception("No expect values found in the check task")
         exp_res = check_items.get("exp_res", None)
         with_vec = check_items.get("with_vec", False)
-        primary_field = check_items.get("primary_field", None)
+        exp_limit = check_items.get("exp_limit", None)
+        count = check_items.get("count(*)", None)
+        if count is not None:
+            assert count == query_res[0].get("count(*)", None)
+            return True
+        if exp_limit is None and exp_res is None:
+            raise Exception(f"No expected values would be checked in the check task")
+        if exp_limit is not None:
+            assert len(query_res) == exp_limit
+        # pk_name = check_items.get("pk_name", ct.default_primary_field_name)
         if exp_res is not None:
+            if with_vec is True:
+                vector_type = check_items.get('vector_type', 'FLOAT_VECTOR')
+                vector_field = check_items.get('vector_field', 'vector')
+                if vector_type == DataType.FLOAT16_VECTOR:
+                    for single_query_result in query_res:
+                        single_query_result[vector_field] = np.frombuffer(single_query_result[vector_field][0], dtype=np.float16).tolist()
+                if vector_type == DataType.BFLOAT16_VECTOR:
+                    for single_query_result in query_res:
+                        single_query_result[vector_field] = np.frombuffer(single_query_result[vector_field][0], dtype=bfloat16).tolist()
+                if vector_type == DataType.INT8_VECTOR:
+                    for single_query_result in query_res:
+                        single_query_result[vector_field] = np.frombuffer(single_query_result[vector_field][0], dtype=np.int8).tolist()
             if isinstance(query_res, list):
-                assert pc.equal_entities_list(exp=exp_res, actual=query_res, primary_field=primary_field,
-                                              with_vec=with_vec)
-                return True
+                result = pc.compare_lists_with_epsilon_ignore_dict_order(a=query_res, b=exp_res)
+                if result is False:
+                    log.debug(f"query expected: {exp_res}")
+                    log.debug(f"query actual: {query_res}")
+                assert result
+                return result
             else:
                 log.error(f"Query result {query_res} is not list")
                 return False
+
         log.warning(f'Expected query result is {exp_res}')
 
     @staticmethod
@@ -567,8 +618,7 @@ class ResponseChecker:
                 log.info("search iteration finished, close")
                 query_iterator.close()
                 break
-            pk_name = ct.default_int64_field_name if res[0].get(ct.default_int64_field_name, None) is not None \
-                else ct.default_string_field_name
+            pk_name = check_items.get("pk_name", ct.default_primary_field_name)
             for i in range(len(res)):
                 pk_list.append(res[i][pk_name])
             if check_items.get("limit", None):

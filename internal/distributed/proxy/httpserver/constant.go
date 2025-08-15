@@ -17,8 +17,7 @@
 package httpserver
 
 import (
-	"time"
-
+	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 )
 
@@ -38,6 +37,7 @@ const (
 	CollectionFieldCategory = "/collections/fields/"
 	ResourceGroupCategory   = "/resource_groups/"
 	SegmentCategory         = "/segments/"
+	QuotaCenterCategory     = "/quotacenter/"
 
 	ListAction           = "list"
 	HasAction            = "has"
@@ -68,6 +68,7 @@ const (
 	RevokePrivilegeActionV2         = "revoke_privilege_v2"
 	AlterAction                     = "alter"
 	AlterPropertiesAction           = "alter_properties"
+	AddAction                       = `add`
 	DropPropertiesAction            = "drop_properties"
 	CompactAction                   = "compact"
 	CompactionStateAction           = "get_compaction_state"
@@ -120,7 +121,6 @@ const (
 	HTTPHeaderAllowInt64     = "Accept-Type-Allow-Int64"
 	HTTPHeaderDBName         = "DB-Name"
 	HTTPHeaderRequestTimeout = "Request-Timeout"
-	HTTPDefaultTimeout       = 30 * time.Second
 	HTTPReturnCode           = "code"
 	HTTPReturnMessage        = "message"
 	HTTPReturnData           = "data"
@@ -162,6 +162,10 @@ const (
 	HTTPReturnIndexState           = "indexState"
 	HTTPReturnIndexFailReason      = "failReason"
 
+	HTTPReturnMinIndexVersion = "minIndexVersion"
+	HTTPReturnMaxIndexVersion = "maxIndexVersion"
+	HTTPReturnIndexParams     = "indexParams"
+
 	HTTPReturnDistance = "distance"
 
 	HTTPReturnRowCount = "rowCount"
@@ -183,11 +187,8 @@ const (
 )
 
 const (
-	ParamAnnsField       = "anns_field"
-	Params               = "params"
-	ParamRoundDecimal    = "round_decimal"
-	ParamOffset          = "offset"
-	ParamLimit           = "limit"
+	Params               = proxy.ParamsKey
+	ParamRoundDecimal    = proxy.RoundDecimalKey
 	ParamRadius          = "radius"
 	ParamRangeFilter     = "range_filter"
 	ParamGroupByField    = "group_by_field"

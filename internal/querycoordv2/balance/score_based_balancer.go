@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -69,7 +70,7 @@ func (b *ScoreBasedBalancer) assignSegment(br *balanceReport, collectionID int64
 			}
 			return normalNode
 		})
-		balanceBatchSize = paramtable.Get().QueryCoordCfg.CollectionBalanceSegmentBatchSize.GetAsInt()
+		balanceBatchSize = paramtable.Get().QueryCoordCfg.BalanceSegmentBatchSize.GetAsInt()
 	}
 
 	// calculate each node's score
@@ -163,7 +164,7 @@ func (b *ScoreBasedBalancer) assignChannel(br *balanceReport, collectionID int64
 			}
 			return normalNode
 		})
-		balanceBatchSize = paramtable.Get().QueryCoordCfg.CollectionBalanceChannelBatchSize.GetAsInt()
+		balanceBatchSize = paramtable.Get().QueryCoordCfg.BalanceChannelBatchSize.GetAsInt()
 	}
 
 	// calculate each node's score
@@ -311,11 +312,11 @@ func (b *ScoreBasedBalancer) convertToNodeItemsBySegment(br *balanceReport, coll
 			nodeScoreMap[node].setAssignedScore(average)
 		}
 		// use assignedScore * delegatorOverloadFactor * delegator_num, to preserve fixed memory size for delegator
-		collectionViews := b.dist.LeaderViewManager.GetByFilter(meta.WithCollectionID2LeaderView(collectionID), meta.WithNodeID2LeaderView(node))
-		if len(collectionViews) > 0 {
-			delegatorDelta := nodeScoreMap[node].getAssignedScore() * delegatorOverloadFactor * float64(len(collectionViews))
+		collDelegator := b.dist.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID), meta.WithNodeID2Channel(node))
+		if len(collDelegator) > 0 {
+			delegatorDelta := nodeScoreMap[node].getAssignedScore() * delegatorOverloadFactor * float64(len(collDelegator))
 			nodeScoreMap[node].AddCurrentScoreDelta(delegatorDelta)
-			br.SetDeletagorScore(node, delegatorDelta)
+			br.SetDelegatorScore(node, delegatorDelta)
 		}
 	}
 	return nodeScoreMap
@@ -376,9 +377,9 @@ func (b *ScoreBasedBalancer) calculateScoreBySegment(br *balanceReport, collecti
 	}
 
 	// calculate global growing segment row count
-	views := b.dist.LeaderViewManager.GetByFilter(meta.WithNodeID2LeaderView(nodeID))
-	for _, view := range views {
-		nodeRowCount += int(float64(view.NumOfGrowingRows))
+	delegatorList := b.dist.ChannelDistManager.GetByFilter(meta.WithNodeID2Channel(nodeID))
+	for _, d := range delegatorList {
+		nodeRowCount += int(float64(d.View.NumOfGrowingRows))
 	}
 
 	// calculate executing task cost in scheduler
@@ -392,9 +393,9 @@ func (b *ScoreBasedBalancer) calculateScoreBySegment(br *balanceReport, collecti
 	}
 
 	// calculate collection growing segment row count
-	collectionViews := b.dist.LeaderViewManager.GetByFilter(meta.WithCollectionID2LeaderView(collectionID), meta.WithNodeID2LeaderView(nodeID))
-	for _, view := range collectionViews {
-		collectionRowCount += int(float64(view.NumOfGrowingRows))
+	collDelegatorList := b.dist.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID), meta.WithNodeID2Channel(nodeID))
+	for _, d := range collDelegatorList {
+		collectionRowCount += int(float64(d.View.NumOfGrowingRows))
 	}
 
 	// calculate executing task cost in scheduler
@@ -480,12 +481,12 @@ func (b *ScoreBasedBalancer) balanceChannels(ctx context.Context, br *balanceRep
 	var rwNodes []int64
 	var roNodes []int64
 	if streamingutil.IsStreamingServiceEnabled() {
-		rwNodes, roNodes = replica.GetRWSQNodes(), replica.GetROSQNodes()
+		rwNodes, roNodes = utils.GetChannelRWAndRONodesFor260(replica, b.nodeManager)
 	} else {
 		rwNodes, roNodes = replica.GetRWNodes(), replica.GetRONodes()
 	}
 
-	if len(rwNodes) == 0 || !b.permitBalanceChannel(replica.GetCollectionID()) {
+	if len(rwNodes) == 0 {
 		return nil
 	}
 
@@ -513,9 +514,6 @@ func (b *ScoreBasedBalancer) balanceSegments(ctx context.Context, br *balanceRep
 	if len(rwNodes) == 0 {
 		// no available nodes to balance
 		br.AddRecord(StrRecord("no rwNodes to balance"))
-		return nil
-	}
-	if !b.permitBalanceSegment(replica.GetCollectionID()) {
 		return nil
 	}
 	// print current distribution before generating plans
@@ -653,7 +651,7 @@ func (b *ScoreBasedBalancer) genChannelPlan(ctx context.Context, br *balanceRepo
 		channelDist[node] = b.dist.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(replica.GetCollectionID()), meta.WithNodeID2Channel(node))
 	}
 
-	balanceBatchSize := paramtable.Get().QueryCoordCfg.CollectionBalanceSegmentBatchSize.GetAsInt()
+	balanceBatchSize := paramtable.Get().QueryCoordCfg.BalanceSegmentBatchSize.GetAsInt()
 	// find the segment from the node which has more score than the average
 	channelsToMove := make([]*meta.DmChannel, 0)
 	for node, channels := range channelDist {
@@ -663,6 +661,7 @@ func (b *ScoreBasedBalancer) genChannelPlan(ctx context.Context, br *balanceRepo
 			br.AddRecord(StrRecordf("node %d skip balance since current score(%f) lower than assigned one (%f)", node, currentScore, assignedScore))
 			continue
 		}
+		channels = sortIfChannelAtWALLocated(channels)
 
 		for _, ch := range channels {
 			channelScore := b.calculateChannelScore(ch, replica.GetCollectionID())

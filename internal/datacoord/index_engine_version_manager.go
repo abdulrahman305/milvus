@@ -3,6 +3,7 @@ package datacoord
 import (
 	"math"
 
+	"github.com/samber/lo"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
@@ -21,18 +22,21 @@ type IndexEngineVersionManager interface {
 
 	GetCurrentScalarIndexEngineVersion() int32
 	GetMinimalScalarIndexEngineVersion() int32
+	GetIndexNonEncoding() bool
 }
 
 type versionManagerImpl struct {
 	mu                  lock.Mutex
 	versions            map[int64]sessionutil.IndexEngineVersion
 	scalarIndexVersions map[int64]sessionutil.IndexEngineVersion
+	indexNonEncoding    map[int64]bool
 }
 
 func newIndexEngineVersionManager() IndexEngineVersionManager {
 	return &versionManagerImpl{
 		versions:            map[int64]sessionutil.IndexEngineVersion{},
 		scalarIndexVersions: map[int64]sessionutil.IndexEngineVersion{},
+		indexNonEncoding:    map[int64]bool{},
 	}
 }
 
@@ -40,6 +44,18 @@ func (m *versionManagerImpl) Startup(sessions map[string]*sessionutil.Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	sessionMap := lo.MapKeys(sessions, func(session *sessionutil.Session, _ string) int64 {
+		return session.ServerID
+	})
+
+	// clean offline nodes
+	for sessionID := range m.versions {
+		if _, ok := sessionMap[sessionID]; !ok {
+			m.removeNodeByID(sessionID)
+		}
+	}
+
+	// deal with new online nodes
 	for _, session := range sessions {
 		m.addOrUpdate(session)
 	}
@@ -56,8 +72,13 @@ func (m *versionManagerImpl) RemoveNode(session *sessionutil.Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.versions, session.ServerID)
-	delete(m.scalarIndexVersions, session.ServerID)
+	m.removeNodeByID(session.ServerID)
+}
+
+func (m *versionManagerImpl) removeNodeByID(sessionID int64) {
+	delete(m.versions, sessionID)
+	delete(m.scalarIndexVersions, sessionID)
+	delete(m.indexNonEncoding, sessionID)
 }
 
 func (m *versionManagerImpl) Update(session *sessionutil.Session) {
@@ -71,6 +92,7 @@ func (m *versionManagerImpl) addOrUpdate(session *sessionutil.Session) {
 	log.Info("addOrUpdate version", zap.Int64("nodeId", session.ServerID), zap.Int32("minimal", session.IndexEngineVersion.MinimalIndexVersion), zap.Int32("current", session.IndexEngineVersion.CurrentIndexVersion))
 	m.versions[session.ServerID] = session.IndexEngineVersion
 	m.scalarIndexVersions[session.ServerID] = session.ScalarIndexEngineVersion
+	m.indexNonEncoding[session.ServerID] = session.IndexNonEncoding
 }
 
 func (m *versionManagerImpl) GetCurrentIndexEngineVersion() int32 {
@@ -147,4 +169,19 @@ func (m *versionManagerImpl) GetMinimalScalarIndexEngineVersion() int32 {
 	}
 	log.Info("Merged minimal scalar index version", zap.Int32("minimal", minimal))
 	return minimal
+}
+
+func (m *versionManagerImpl) GetIndexNonEncoding() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.indexNonEncoding) == 0 {
+		log.Info("indexNonEncoding map is empty")
+		// by default, we fall back to old index format for safety
+		return false
+	}
+	noneEncoding := true
+	for _, encoding := range m.indexNonEncoding {
+		noneEncoding = noneEncoding && encoding
+	}
+	return noneEncoding
 }

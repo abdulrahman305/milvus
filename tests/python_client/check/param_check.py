@@ -5,6 +5,111 @@ from common import common_type as ct
 sys.path.append("..")
 from utils.util_log import test_log as log
 
+import numpy as np
+from collections.abc import Iterable
+
+epsilon = ct.epsilon
+
+def deep_approx_compare(x, y, epsilon=epsilon):
+    """
+    Recursively compares two objects for approximate equality, handling floating-point precision.
+    
+    Args:
+        x: First object to compare
+        y: Second object to compare
+        epsilon: Tolerance for floating-point comparisons (default: 1e-6)
+    
+    Returns:
+        bool: True if objects are approximately equal, False otherwise
+    
+    Handles:
+        - Numeric types (int, float, numpy scalars)
+        - Sequences (list, tuple, numpy arrays)
+        - Dictionaries
+        - Other iterables (except strings)
+        - Numpy arrays (shape and value comparison)
+        - Falls back to strict equality for other types
+    """
+    # Handle basic numeric types (including numpy scalars)
+    if isinstance(x, (int, float, np.integer, np.floating)) and isinstance(y, (int, float, np.integer, np.floating)):
+        return abs(float(x) - float(y)) < epsilon
+
+    # Handle lists/tuples/arrays
+    if isinstance(x, (list, tuple, np.ndarray)) and isinstance(y, (list, tuple, np.ndarray)):
+        if len(x) != len(y):
+            return False
+        for a, b in zip(x, y):
+            if not deep_approx_compare(a, b, epsilon):
+                return False
+        return True
+
+    # Handle dictionaries
+    if isinstance(x, dict) and isinstance(y, dict):
+        if set(x.keys()) != set(y.keys()):
+            return False
+        for key in x:
+            if not deep_approx_compare(x[key], y[key], epsilon):
+                return False
+        return True
+
+    # Handle other iterables (e.g., Protobuf containers)
+    if isinstance(x, Iterable) and isinstance(y, Iterable) and not isinstance(x, str):
+        try:
+            return deep_approx_compare(list(x), list(y), epsilon)
+        except:
+            pass
+
+    # Handle numpy arrays
+    if isinstance(x, np.ndarray) and isinstance(y, np.ndarray):
+        if x.shape != y.shape:
+            return False
+        return np.allclose(x, y, atol=epsilon)
+
+    # Fall back to strict equality for other types
+    return x == y
+
+
+def compare_lists_with_epsilon_ignore_dict_order(a, b, epsilon=epsilon):
+    """
+    Compares two lists of dictionaries for equality (order-insensitive) with floating-point tolerance.
+    
+    Args:
+        a (list): First list of dictionaries to compare
+        b (list): Second list of dictionaries to compare
+        epsilon (float, optional): Tolerance for floating-point comparisons. Defaults to 1e-6.
+    
+    Returns:
+        bool: True if lists contain equivalent dictionaries (order doesn't matter), False otherwise
+    
+    Note:
+        Uses deep_approx_compare() for dictionary comparison with floating-point tolerance.
+        Maintains O(n²) complexity due to nested comparisons.
+    """
+    if len(a) != len(b):
+        return False
+
+    # Create a set of available indices for b
+    available_indices = set(range(len(b)))
+
+    for item_a in a:
+        matched = False
+        # Create a list of indices to remove (avoid modifying the set during iteration)
+        to_remove = []
+
+        for idx in available_indices:
+            if deep_approx_compare(item_a, b[idx], epsilon):
+                to_remove.append(idx)
+                matched = True
+                break
+
+        if not matched:
+            return False
+
+        # Remove matched indices
+        available_indices -= set(to_remove)
+
+    return True
+
 
 def ip_check(ip):
     if ip == "localhost":
@@ -158,7 +263,7 @@ def entity_in(entity, entities, primary_field):
     :param primary_field: collection primary field
     :return: True or False
     """
-    primary_default = ct.default_int64_field_name
+    primary_default = ct.default_primary_field_name
     primary_field = primary_default if primary_field is None else primary_field
     primary_key = entity.get(primary_field, None)
     primary_keys = []
@@ -180,7 +285,7 @@ def remove_entity(entity, entities, primary_field):
     :param primary_field: collection primary field
     :return: entities of removed entity
     """
-    primary_default = ct.default_int64_field_name
+    primary_default = ct.default_primary_field_name
     primary_field = primary_default if primary_field is None else primary_field
     primary_key = entity.get(primary_field, None)
     primary_keys = []
@@ -226,16 +331,17 @@ def equal_entities_list(exp, actual, primary_field, with_vec=False):
     return True if len(exp) == 0 else False
 
 
-def output_field_value_check(search_res, original):
+def output_field_value_check(search_res, original, pk_name):
     """
     check if the value of output fields is correct, it only works on auto_id = False
     :param search_res: the search result of specific output fields
     :param original: the data in the collection
     :return: True or False
     """
+    pk_name = ct.default_primary_field_name if pk_name is None else pk_name
     limit = len(search_res[0])
     for i in range(limit):
-        entity = eval(str(search_res[0][i]).split('entity: ', 1)[1])
+        entity = search_res[0][i].fields
         _id = search_res[0][i].id
         for field in entity.keys():
             if isinstance(entity[field], list):
@@ -246,7 +352,7 @@ def output_field_value_check(search_res, original):
                 # but sparse only supports list data type insertion for now
                 assert entity[field].keys() == original[-1][_id].keys()
             else:
-                num = original[original[ct.default_int64_field_name] == _id].index.to_list()[0]
+                num = original[original[pk_name] == _id].index.to_list()[0]
                 assert original[field][num] == entity[field]
 
     return True

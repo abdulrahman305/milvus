@@ -18,7 +18,6 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
@@ -39,7 +38,7 @@ type WriteBuffer interface {
 	// HasSegment checks whether certain segment exists in this buffer.
 	HasSegment(segmentID int64) bool
 	// CreateNewGrowingSegment creates a new growing segment in the buffer.
-	CreateNewGrowingSegment(partitionID int64, segmentID int64, startPos *msgpb.MsgPosition, storageVersion int64)
+	CreateNewGrowingSegment(partitionID int64, segmentID int64, startPos *msgpb.MsgPosition)
 	// BufferData is the method to buffer dml data msgs.
 	BufferData(insertMsgs []*InsertData, deleteMsgs []*msgstream.DeleteMsg, startPos, endPos *msgpb.MsgPosition) error
 	// FlushTimestamp set flush timestamp for write buffer
@@ -117,7 +116,6 @@ type writeBufferBase struct {
 
 	metaWriter       syncmgr.MetaWriter
 	allocator        allocator.Interface
-	collSchema       *schemapb.CollectionSchema
 	estSizePerRecord int
 	metaCache        metacache.MetaCache
 
@@ -144,7 +142,7 @@ func newWriteBufferBase(channel string, metacache metacache.MetaCache, syncMgr s
 	flushTsPolicy := GetFlushTsPolicy(flushTs, metacache)
 	option.syncPolicies = append(option.syncPolicies, flushTsPolicy)
 
-	schema := metacache.Schema()
+	schema := metacache.GetSchema(0)
 	estSize, err := typeutil.EstimateSizePerRecord(schema)
 	if err != nil {
 		return nil, err
@@ -153,7 +151,6 @@ func newWriteBufferBase(channel string, metacache metacache.MetaCache, syncMgr s
 	wb := &writeBufferBase{
 		channelName:          channel,
 		collectionID:         metacache.Collection(),
-		collSchema:           schema,
 		estSizePerRecord:     estSize,
 		syncMgr:              syncMgr,
 		metaWriter:           option.metaWriter,
@@ -326,10 +323,8 @@ func (wb *writeBufferBase) syncSegments(ctx context.Context, segmentIDs []int64)
 			}
 
 			if syncTask.IsFlush() {
-				if paramtable.Get().DataNodeCfg.SkipBFStatsLoad.GetAsBool() || streamingutil.IsStreamingServiceEnabled() {
-					wb.metaCache.RemoveSegments(metacache.WithSegmentIDs(syncTask.SegmentID()))
-					log.Info("flushed segment removed", zap.Int64("segmentID", syncTask.SegmentID()), zap.String("channel", syncTask.ChannelName()))
-				}
+				wb.metaCache.RemoveSegments(metacache.WithSegmentIDs(syncTask.SegmentID()))
+				log.Info("flushed segment removed", zap.Int64("segmentID", syncTask.SegmentID()), zap.String("channel", syncTask.ChannelName()))
 			}
 			return nil
 		})
@@ -357,11 +352,11 @@ func (wb *writeBufferBase) getSegmentsToSync(ts typeutil.Timestamp, policies ...
 	return segments.Collect()
 }
 
-func (wb *writeBufferBase) getOrCreateBuffer(segmentID int64) *segmentBuffer {
+func (wb *writeBufferBase) getOrCreateBuffer(segmentID int64, timetick uint64) *segmentBuffer {
 	buffer, ok := wb.buffers[segmentID]
 	if !ok {
 		var err error
-		buffer, err = newSegmentBuffer(segmentID, wb.collSchema)
+		buffer, err = newSegmentBuffer(segmentID, wb.metaCache.GetSchema(timetick))
 		if err != nil {
 			// TODO avoid panic here
 			panic(err)
@@ -372,19 +367,19 @@ func (wb *writeBufferBase) getOrCreateBuffer(segmentID int64) *segmentBuffer {
 	return buffer
 }
 
-func (wb *writeBufferBase) yieldBuffer(segmentID int64) ([]*storage.InsertData, map[int64]*storage.BM25Stats, *storage.DeleteData, *TimeRange, *msgpb.MsgPosition) {
+func (wb *writeBufferBase) yieldBuffer(segmentID int64) ([]*storage.InsertData, map[int64]*storage.BM25Stats, *storage.DeleteData, *schemapb.CollectionSchema, *TimeRange, *msgpb.MsgPosition) {
 	buffer, ok := wb.buffers[segmentID]
 	if !ok {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 
 	// remove buffer and move it to sync manager
 	delete(wb.buffers, segmentID)
 	start := buffer.EarliestPosition()
 	timeRange := buffer.GetTimeRange()
-	insert, bm25, delta := buffer.Yield()
+	insert, bm25, delta, schema := buffer.Yield()
 
-	return insert, bm25, delta, timeRange, start
+	return insert, bm25, delta, schema, timeRange, start
 }
 
 type InsertData struct {
@@ -500,10 +495,14 @@ func (id *InsertData) batchPkExists(pks []storage.PrimaryKey, tss []uint64, hits
 	return hits
 }
 
-func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID int64, startPos *msgpb.MsgPosition, storageVersion int64) {
+func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID int64, startPos *msgpb.MsgPosition) {
 	_, ok := wb.metaCache.GetSegmentByID(segmentID)
 	// new segment
 	if !ok {
+		storageVersion := storage.StorageV1
+		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
+			storageVersion = storage.StorageV2
+		}
 		segmentInfo := &datapb.SegmentInfo{
 			ID:             segmentID,
 			PartitionID:    partitionID,
@@ -516,13 +515,13 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID 
 		wb.metaCache.AddSegment(segmentInfo, func(_ *datapb.SegmentInfo) pkoracle.PkStat {
 			return pkoracle.NewBloomFilterSetWithBatchSize(wb.getEstBatchSize())
 		}, metacache.NewBM25StatsFactory, metacache.SetStartPosRecorded(false))
-		log.Info("add growing segment", zap.Int64("segmentID", segmentID), zap.String("channel", wb.channelName))
+		log.Info("add growing segment", zap.Int64("segmentID", segmentID), zap.String("channel", wb.channelName), zap.Int64("storage version", storageVersion))
 	}
 }
 
 // bufferDelete buffers DeleteMsg into DeleteData.
 func (wb *writeBufferBase) bufferDelete(segmentID int64, pks []storage.PrimaryKey, tss []typeutil.Timestamp, startPos, endPos *msgpb.MsgPosition) {
-	segBuf := wb.getOrCreateBuffer(segmentID)
+	segBuf := wb.getOrCreateBuffer(segmentID, tss[0])
 	bufSize := segBuf.deltaBuffer.Buffer(pks, tss, startPos, endPos)
 	metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), fmt.Sprint(wb.collectionID)).Add(float64(bufSize))
 }
@@ -540,7 +539,7 @@ func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (sy
 	var totalMemSize float64 = 0
 	var tsFrom, tsTo uint64
 
-	insert, bm25, delta, timeRange, startPos := wb.yieldBuffer(segmentID)
+	insert, bm25, delta, schema, timeRange, startPos := wb.yieldBuffer(segmentID)
 	if timeRange != nil {
 		tsFrom, tsTo = timeRange.timestampMin, timeRange.timestampMax
 	}
@@ -597,6 +596,7 @@ func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (sy
 		WithAllocator(wb.allocator).
 		WithMetaWriter(wb.metaWriter).
 		WithMetaCache(wb.metaCache).
+		WithSchema(schema).
 		WithSyncPack(pack)
 	return task, nil
 }

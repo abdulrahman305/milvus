@@ -1,6 +1,8 @@
 package model
 
 import (
+	"google.golang.org/protobuf/proto"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
@@ -75,7 +77,7 @@ func (f *Field) Equal(other Field) bool {
 		f.IsPartitionKey == other.IsPartitionKey &&
 		f.IsDynamic == other.IsDynamic &&
 		f.IsClusteringKey == other.IsClusteringKey &&
-		f.DefaultValue == other.DefaultValue &&
+		proto.Equal(f.DefaultValue, other.DefaultValue) &&
 		f.ElementType == other.ElementType &&
 		f.IsFunctionOutput == other.IsFunctionOutput &&
 		f.Nullable == other.Nullable
@@ -85,9 +87,13 @@ func CheckFieldsEqual(fieldsA, fieldsB []*Field) bool {
 	if len(fieldsA) != len(fieldsB) {
 		return false
 	}
-	l := len(fieldsA)
-	for i := 0; i < l; i++ {
-		if !fieldsA[i].Equal(*fieldsB[i]) {
+	mapA := make(map[int64]*Field)
+	for _, f := range fieldsA {
+		mapA[f.FieldID] = f
+	}
+
+	for _, f := range fieldsB {
+		if other, exists := mapA[f.FieldID]; !exists || !f.Equal(*other) {
 			return false
 		}
 	}

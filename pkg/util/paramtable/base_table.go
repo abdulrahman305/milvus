@@ -78,7 +78,7 @@ type BaseTable struct {
 
 type baseTableConfig struct {
 	configDir       string
-	refreshInterval int
+	refreshInterval time.Duration
 	skipRemote      bool
 	skipEnv         bool
 	yamlFiles       []string
@@ -92,7 +92,7 @@ func Files(files []string) Option {
 	}
 }
 
-func Interval(interval int) Option {
+func Interval(interval time.Duration) Option {
 	return func(bt *baseTableConfig) {
 		bt.refreshInterval = interval
 	}
@@ -120,7 +120,7 @@ func NewBaseTable(opts ...Option) *BaseTable {
 	defaultConfig := &baseTableConfig{
 		configDir:       initConfPath(),
 		yamlFiles:       defaultYaml,
-		refreshInterval: 5,
+		refreshInterval: 5 * time.Second,
 		skipRemote:      false,
 		skipEnv:         false,
 	}
@@ -143,7 +143,14 @@ func (bt *BaseTable) init() {
 		ret = strings.ReplaceAll(ret, ".", "")
 		return ret
 	}
-	bt.mgr, _ = config.Init()
+
+	var err error
+	bt.mgr, err = config.Init()
+	if err != nil {
+		log.Error("failed to initialize config manager", zap.Error(err))
+		panic(err)
+	}
+
 	if !bt.config.skipEnv {
 		err := bt.mgr.AddSource(config.NewEnvSource(formatter))
 		if err != nil {
@@ -175,7 +182,7 @@ func (bt *BaseTable) initConfigsFromLocal() {
 
 	err := bt.mgr.AddSource(config.NewFileSource(&config.FileInfo{
 		Files:           files,
-		RefreshInterval: time.Duration(refreshInterval) * time.Second,
+		RefreshInterval: refreshInterval,
 	}))
 	if err != nil {
 		log.Warn("init baseTable with file failed", zap.Strings("configFile", bt.config.yamlFiles), zap.Error(err))
@@ -207,7 +214,7 @@ func (bt *BaseTable) initConfigsFromRemote() {
 		CaCertFile:      etcdConfig.EtcdTLSCACert.GetValue(),
 		MinVersion:      etcdConfig.EtcdTLSMinVersion.GetValue(),
 		KeyPrefix:       etcdConfig.RootPath.GetValue(),
-		RefreshInterval: time.Duration(refreshInterval) * time.Second,
+		RefreshInterval: refreshInterval,
 	}
 
 	s, err := config.NewEtcdSource(info)
@@ -299,4 +306,8 @@ func (bt *BaseTable) Reset(key string) error {
 	bt.mgr.ResetConfig(key)
 	bt.mgr.EvictCachedValue(key)
 	return nil
+}
+
+func (bt *BaseTable) Manager() *config.Manager {
+	return bt.mgr
 }

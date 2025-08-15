@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/samber/lo"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
@@ -219,20 +221,10 @@ func (s *deleteCollectionDataStep) Execute(ctx context.Context) ([]nestedStep, e
 	if s.isSkip {
 		return nil, nil
 	}
-	ddlTs, err := s.core.garbageCollector.GcCollectionData(ctx, s.coll)
-	if err != nil {
+	if _, err := s.core.garbageCollector.GcCollectionData(ctx, s.coll); err != nil {
 		return nil, err
 	}
-	// wait for ts synced.
-	children := make([]nestedStep, 0, len(s.coll.PhysicalChannelNames))
-	for _, channel := range s.coll.PhysicalChannelNames {
-		children = append(children, &waitForTsSyncedStep{
-			baseStep: baseStep{core: s.core},
-			ts:       ddlTs,
-			channel:  channel,
-		})
-	}
-	return children, nil
+	return nil, nil
 }
 
 func (s *deleteCollectionDataStep) Desc() string {
@@ -241,31 +233,6 @@ func (s *deleteCollectionDataStep) Desc() string {
 
 func (s *deleteCollectionDataStep) Weight() stepPriority {
 	return stepPriorityImportant
-}
-
-// waitForTsSyncedStep child step of deleteCollectionDataStep.
-type waitForTsSyncedStep struct {
-	baseStep
-	ts      Timestamp
-	channel string
-}
-
-func (s *waitForTsSyncedStep) Execute(ctx context.Context) ([]nestedStep, error) {
-	syncedTs := s.core.chanTimeTick.getSyncedTimeTick(s.channel)
-	if syncedTs < s.ts {
-		// TODO: there may be frequent log here.
-		// time.Sleep(Params.ProxyCfg.TimeTickInterval)
-		return nil, fmt.Errorf("ts not synced yet, channel: %s, synced: %d, want: %d", s.channel, syncedTs, s.ts)
-	}
-	return nil, nil
-}
-
-func (s *waitForTsSyncedStep) Desc() string {
-	return fmt.Sprintf("wait for ts synced, channel: %s, want: %d", s.channel, s.ts)
-}
-
-func (s *waitForTsSyncedStep) Weight() stepPriority {
-	return stepPriorityNormal
 }
 
 type deletePartitionDataStep struct {
@@ -464,13 +431,14 @@ func (s *nullStep) Weight() stepPriority {
 
 type AlterCollectionStep struct {
 	baseStep
-	oldColl *model.Collection
-	newColl *model.Collection
-	ts      Timestamp
+	oldColl     *model.Collection
+	newColl     *model.Collection
+	ts          Timestamp
+	fieldModify bool
 }
 
 func (a *AlterCollectionStep) Execute(ctx context.Context) ([]nestedStep, error) {
-	err := a.core.meta.AlterCollection(ctx, a.oldColl, a.newColl, a.ts)
+	err := a.core.meta.AlterCollection(ctx, a.oldColl, a.newColl, a.ts, a.fieldModify)
 	return nil, err
 }
 
@@ -493,6 +461,79 @@ func (b *BroadcastAlteredCollectionStep) Execute(ctx context.Context) ([]nestedS
 
 func (b *BroadcastAlteredCollectionStep) Desc() string {
 	return fmt.Sprintf("broadcast altered collection, collectionID: %d", b.req.CollectionID)
+}
+
+type AddCollectionFieldStep struct {
+	baseStep
+	oldColl           *model.Collection
+	updatedCollection *model.Collection
+	newField          *model.Field
+	ts                Timestamp
+}
+
+func (a *AddCollectionFieldStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	// newColl := a.oldColl.Clone()
+	// newColl.Fields = append(newColl.Fields, a.newField)
+	err := a.core.meta.AlterCollection(ctx, a.oldColl, a.updatedCollection, a.updatedCollection.UpdateTimestamp, true)
+	log.Ctx(ctx).Info("add field done", zap.Int64("collectionID", a.oldColl.CollectionID), zap.Any("new field", a.newField))
+	return nil, err
+}
+
+func (a *AddCollectionFieldStep) Desc() string {
+	return fmt.Sprintf("add field, collectionID: %d, fieldID: %d, ts: %d", a.oldColl.CollectionID, a.newField.FieldID, a.ts)
+}
+
+type WriteSchemaChangeWALStep struct {
+	baseStep
+	collection *model.Collection
+	ts         Timestamp
+}
+
+func (s *WriteSchemaChangeWALStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	vchannels := s.collection.VirtualChannelNames
+	schema := &schemapb.CollectionSchema{
+		Name:               s.collection.Name,
+		Description:        s.collection.Description,
+		AutoID:             s.collection.AutoID,
+		Fields:             model.MarshalFieldModels(s.collection.Fields),
+		StructArrayFields:  model.MarshalStructArrayFieldModels(s.collection.StructArrayFields),
+		Functions:          model.MarshalFunctionModels(s.collection.Functions),
+		EnableDynamicField: s.collection.EnableDynamicField,
+		Properties:         s.collection.Properties,
+	}
+
+	schemaMsg, err := message.NewSchemaChangeMessageBuilderV2().
+		WithBroadcast(vchannels).
+		WithHeader(&message.SchemaChangeMessageHeader{
+			CollectionId: s.collection.CollectionID,
+		}).
+		WithBody(&message.SchemaChangeMessageBody{
+			Schema: schema,
+		}).BuildBroadcast()
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := streaming.WAL().Broadcast().Append(ctx, schemaMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	// use broadcast max msg timestamp as update timestamp here
+	s.collection.UpdateTimestamp = lo.Max(lo.Map(vchannels, func(channelName string, _ int) uint64 {
+		return resp.GetAppendResult(channelName).TimeTick
+	}))
+	log.Ctx(ctx).Info(
+		"broadcast schema change success",
+		zap.Uint64("broadcastID", resp.BroadcastID),
+		zap.Uint64("WALUpdateTimestamp", s.collection.UpdateTimestamp),
+		zap.Any("appendResults", resp.AppendResults),
+	)
+	return nil, nil
+}
+
+func (s *WriteSchemaChangeWALStep) Desc() string {
+	return fmt.Sprintf("write schema change WALcollectionID: %d, ts: %d", s.collection.CollectionID, s.ts)
 }
 
 type AlterDatabaseStep struct {

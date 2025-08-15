@@ -24,19 +24,19 @@ import (
 	"os/signal"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/blang/semver/v4"
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -47,16 +47,20 @@ import (
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
 	"github.com/milvus-io/milvus/internal/datacoord/session"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	mocks2 "github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
@@ -67,18 +71,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// init embed etcd
-	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
-	if err != nil {
-		log.Fatal("failed to start embed etcd server", zap.Error(err))
-	}
-	defer os.RemoveAll(tempDir)
-	defer embedetcdServer.Close()
-
-	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
-
 	paramtable.Init()
-	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
 
 	rand.Seed(time.Now().UnixNano())
 	parameters := []string{"tikv", "etcd"}
@@ -88,23 +81,6 @@ func TestMain(m *testing.M) {
 		code = m.Run()
 	}
 	os.Exit(code)
-}
-
-type mockRootCoord struct {
-	types.RootCoordClient
-	collID UniqueID
-}
-
-func (r *mockRootCoord) DescribeCollectionInternal(ctx context.Context, req *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
-	if req.CollectionID != r.collID {
-		return &milvuspb.DescribeCollectionResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    "Collection not found",
-			},
-		}, nil
-	}
-	return r.RootCoordClient.DescribeCollection(ctx, req)
 }
 
 func TestGetTimeTickChannel(t *testing.T) {
@@ -1166,11 +1142,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("test get recovery info with no segments", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		mockHandler := NewNMockHandler(t)
 		mockHandler.EXPECT().GetQueryVChanPositions(mock.Anything, mock.Anything).Return(&datapb.VchannelInfo{})
 		svr.handler = mockHandler
@@ -1214,11 +1188,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("test get earliest position of flushed segments as seek position", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			Schema: newTestSchema(),
 		})
@@ -1230,13 +1202,12 @@ func TestGetRecoveryInfo(t *testing.T) {
 		})
 		assert.NoError(t, err)
 
-		err = svr.meta.indexMeta.CreateIndex(context.TODO(), &model.Index{
-			TenantID:     "",
+		indexReq := &indexpb.CreateIndexRequest{
 			CollectionID: 0,
 			FieldID:      2,
-			IndexID:      0,
-			IndexName:    "",
-		})
+		}
+
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
 
 		seg1 := createSegment(0, 0, 0, 100, 10, "vchan1", commonpb.SegmentState_Flushed)
@@ -1323,11 +1294,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("test get recovery of unflushed segments ", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			ID:     0,
 			Schema: newTestSchema(),
@@ -1398,17 +1367,15 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("test get binlogs", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
+		}
 		svr.meta.AddCollection(&collectionInfo{
 			Schema: newTestSchema(),
 		})
 
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
-		}
-
 		binlogReq := &datapb.SaveBinlogPathsRequest{
-			SegmentID:    0,
+			SegmentID:    10089,
 			CollectionID: 0,
 			Field2BinlogPaths: []*datapb.FieldBinlog{
 				{
@@ -1448,18 +1415,18 @@ func TestGetRecoveryInfo(t *testing.T) {
 					},
 				},
 			},
+			Flushed: true,
 		}
-		segment := createSegment(0, 0, 1, 100, 10, "vchan1", commonpb.SegmentState_Flushed)
+		segment := createSegment(binlogReq.SegmentID, 0, 1, 100, 10, "vchan1", commonpb.SegmentState_Growing)
 		err := svr.meta.AddSegment(context.TODO(), NewSegmentInfo(segment))
 		assert.NoError(t, err)
 
-		err = svr.meta.indexMeta.CreateIndex(context.TODO(), &model.Index{
-			TenantID:     "",
+		indexReq := &indexpb.CreateIndexRequest{
 			CollectionID: 0,
 			FieldID:      2,
-			IndexID:      0,
-			IndexName:    "",
-		})
+		}
+
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
 		err = svr.meta.indexMeta.AddSegmentIndex(context.TODO(), &model.SegmentIndex{
 			SegmentID: segment.ID,
@@ -1471,6 +1438,8 @@ func TestGetRecoveryInfo(t *testing.T) {
 			State:   commonpb.IndexState_Finished,
 		})
 		assert.NoError(t, err)
+		paramtable.Get().Save(Params.DataCoordCfg.EnableSortCompaction.Key, "false")
+		defer paramtable.Get().Reset(Params.DataCoordCfg.EnableSortCompaction.Key)
 
 		sResp, err := svr.SaveBinlogPaths(context.TODO(), binlogReq)
 		assert.NoError(t, err)
@@ -1484,7 +1453,7 @@ func TestGetRecoveryInfo(t *testing.T) {
 		assert.NoError(t, err)
 		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.EqualValues(t, 1, len(resp.GetBinlogs()))
-		assert.EqualValues(t, 0, resp.GetBinlogs()[0].GetSegmentID())
+		assert.EqualValues(t, binlogReq.SegmentID, resp.GetBinlogs()[0].GetSegmentID())
 		assert.EqualValues(t, 1, len(resp.GetBinlogs()[0].GetFieldBinlogs()))
 		assert.EqualValues(t, 1, resp.GetBinlogs()[0].GetFieldBinlogs()[0].GetFieldID())
 		for _, binlog := range resp.GetBinlogs()[0].GetFieldBinlogs()[0].GetBinlogs() {
@@ -1497,11 +1466,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("with dropped segments", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			ID:     0,
 			Schema: newTestSchema(),
@@ -1543,11 +1510,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("with fake segments", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			ID:     0,
 			Schema: newTestSchema(),
@@ -1584,11 +1549,9 @@ func TestGetRecoveryInfo(t *testing.T) {
 	t.Run("with continuous compaction", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			ID:     0,
 			Schema: newTestSchema(),
@@ -1618,19 +1581,12 @@ func TestGetRecoveryInfo(t *testing.T) {
 		assert.NoError(t, err)
 		err = svr.meta.AddSegment(context.TODO(), NewSegmentInfo(seg5))
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.CreateIndex(context.TODO(), &model.Index{
-			TenantID:        "",
-			CollectionID:    0,
-			FieldID:         2,
-			IndexID:         0,
-			IndexName:       "_default_idx_2",
-			IsDeleted:       false,
-			CreateTime:      0,
-			TypeParams:      nil,
-			IndexParams:     nil,
-			IsAutoIndex:     false,
-			UserIndexParams: nil,
-		})
+		indexReq := &indexpb.CreateIndexRequest{
+			CollectionID: 0,
+			FieldID:      2,
+			IndexName:    "_default_idx_2",
+		}
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
 		svr.meta.indexMeta.updateSegmentIndex(&model.SegmentIndex{
 			SegmentID:           seg4.ID,
@@ -1679,11 +1635,11 @@ func TestGetCompactionState(t *testing.T) {
 		svr := &Server{}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
 
-		mockHandler := NewMockCompactionPlanContext(t)
+		mockHandler := NewMockCompactionInspector(t)
 		mockHandler.EXPECT().getCompactionInfo(mock.Anything, mock.Anything).Return(&compactionInfo{
 			state: commonpb.CompactionState_Completed,
 		})
-		svr.compactionHandler = mockHandler
+		svr.compactionInspector = mockHandler
 		resp, err := svr.GetCompactionState(context.Background(), &milvuspb.GetCompactionStateRequest{})
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
@@ -1706,8 +1662,8 @@ func TestGetCompactionState(t *testing.T) {
 				{State: datapb.CompactionTaskState_timeout},
 				{State: datapb.CompactionTaskState_timeout},
 			})
-		mockHandler := newCompactionPlanHandler(nil, nil, mockMeta, nil, nil)
-		svr.compactionHandler = mockHandler
+		mockHandler := newCompactionInspector(mockMeta, nil, nil, nil, newMockVersionManager())
+		svr.compactionInspector = mockHandler
 		resp, err := svr.GetCompactionState(context.Background(), &milvuspb.GetCompactionStateRequest{CompactionID: 1})
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
@@ -1734,17 +1690,13 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual compaction successfully", func(t *testing.T) {
 		svr := &Server{allocator: allocator.NewMockAllocator(t)}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
-		svr.compactionTrigger = &mockCompactionTrigger{
-			methods: map[string]interface{}{
-				"triggerManualCompaction": func(collectionID int64) (UniqueID, error) {
-					return 1, nil
-				},
-			},
-		}
+		mockTrigger := NewMockTrigger(t)
+		svr.compactionTrigger = mockTrigger
+		mockTrigger.EXPECT().TriggerCompaction(mock.Anything, mock.Anything).Return(1, nil)
 
-		mockHandler := NewMockCompactionPlanContext(t)
+		mockHandler := NewMockCompactionInspector(t)
 		mockHandler.EXPECT().getCompactionTasksNumBySignalID(mock.Anything).Return(1)
-		svr.compactionHandler = mockHandler
+		svr.compactionInspector = mockHandler
 		resp, err := svr.ManualCompaction(context.TODO(), &milvuspb.ManualCompactionRequest{
 			CollectionID: 1,
 			Timetravel:   1,
@@ -1756,13 +1708,10 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual compaction failure", func(t *testing.T) {
 		svr := &Server{allocator: allocator.NewMockAllocator(t)}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
-		svr.compactionTrigger = &mockCompactionTrigger{
-			methods: map[string]interface{}{
-				"triggerManualCompaction": func(collectionID int64) (UniqueID, error) {
-					return 0, errors.New("mock error")
-				},
-			},
-		}
+		mockTrigger := NewMockTrigger(t)
+		svr.compactionTrigger = mockTrigger
+		mockTrigger.EXPECT().TriggerCompaction(mock.Anything, mock.Anything).Return(0, errors.New("mock error"))
+
 		resp, err := svr.ManualCompaction(context.TODO(), &milvuspb.ManualCompactionRequest{
 			CollectionID: 1,
 			Timetravel:   1,
@@ -1774,13 +1723,9 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual compaction with closed server", func(t *testing.T) {
 		svr := &Server{}
 		svr.stateCode.Store(commonpb.StateCode_Abnormal)
-		svr.compactionTrigger = &mockCompactionTrigger{
-			methods: map[string]interface{}{
-				"triggerManualCompaction": func(collectionID int64) (UniqueID, error) {
-					return 1, nil
-				},
-			},
-		}
+		mockTrigger := NewMockTrigger(t)
+		svr.compactionTrigger = mockTrigger
+		mockTrigger.EXPECT().TriggerCompaction(mock.Anything, mock.Anything).Return(1, nil).Maybe()
 
 		resp, err := svr.ManualCompaction(context.TODO(), &milvuspb.ManualCompactionRequest{
 			CollectionID: 1,
@@ -1796,12 +1741,12 @@ func TestGetCompactionStateWithPlans(t *testing.T) {
 		svr := &Server{}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
 
-		mockHandler := NewMockCompactionPlanContext(t)
+		mockHandler := NewMockCompactionInspector(t)
 		mockHandler.EXPECT().getCompactionInfo(mock.Anything, mock.Anything).Return(&compactionInfo{
 			state:        commonpb.CompactionState_Executing,
 			executingCnt: 1,
 		})
-		svr.compactionHandler = mockHandler
+		svr.compactionInspector = mockHandler
 
 		resp, err := svr.GetCompactionStateWithPlans(context.TODO(), &milvuspb.GetCompactionPlansRequest{
 			CompactionID: 1,
@@ -1829,21 +1774,22 @@ func TestOptions(t *testing.T) {
 		kv.Close()
 	}()
 
-	t.Run("WithRootCoordCreator", func(t *testing.T) {
+	t.Run("WithMixCoordCreator", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-		var crt rootCoordCreatorFunc = func(ctx context.Context) (types.RootCoordClient, error) {
+		var crt mixCoordCreatorFunc = func(ctx context.Context) (types.MixCoord, error) {
 			return nil, errors.New("dummy")
 		}
-		opt := WithRootCoordCreator(crt)
+		opt := WithMixCoordCreator(crt)
 		assert.NotNil(t, opt)
-		svr.rootCoordClientCreator = nil
+		svr.mixCoordCreator = nil
 		opt(svr)
 		// testify cannot compare function directly
 		// the behavior is actually undefined
 		assert.NotNil(t, crt)
-		assert.NotNil(t, svr.rootCoordClientCreator)
+		assert.NotNil(t, svr.mixCoordCreator)
 	})
+
 	t.Run("WithCluster", func(t *testing.T) {
 		defer kv.RemoveWithPrefix(context.TODO(), "")
 
@@ -1902,6 +1848,10 @@ func TestHandleSessionEvent(t *testing.T) {
 	defer cluster.Close()
 
 	svr := newTestServer(t, WithCluster(cluster))
+	manager := session.NewMockNodeManager(t)
+	manager.EXPECT().AddNode(mock.Anything, mock.Anything).Return(nil)
+	manager.EXPECT().RemoveNode(mock.Anything).Return()
+	svr.nodeManager = manager
 	defer closeTestServer(t, svr)
 	t.Run("handle events", func(t *testing.T) {
 		// None event
@@ -1962,7 +1912,7 @@ func TestHandleSessionEvent(t *testing.T) {
 }
 
 type rootCoordSegFlushComplete struct {
-	mockRootCoordClient
+	mockMixCoord
 	flag bool
 }
 
@@ -1986,7 +1936,7 @@ func TestPostFlush(t *testing.T) {
 	t.Run("success post flush", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-		svr.rootCoordClient = &rootCoordSegFlushComplete{flag: true}
+		svr.mixCoord = &rootCoordSegFlushComplete{flag: true}
 
 		err := svr.meta.AddSegment(context.TODO(), NewSegmentInfo(&datapb.SegmentInfo{
 			ID:           1,
@@ -2055,15 +2005,16 @@ func TestGetFlushAllState(t *testing.T) {
 			}
 			var err error
 			svr.meta = &meta{}
-			svr.rootCoordClient = mocks.NewMockRootCoordClient(t)
-			svr.broker = broker.NewCoordinatorBroker(svr.rootCoordClient)
+			svr.mixCoord = mocks.NewMixCoord(t)
+			svr.broker = broker.NewCoordinatorBroker(svr.mixCoord)
 			if test.ListDatabaseFailed {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ListDatabases(mock.Anything, mock.Anything).
-					Return(&milvuspb.ListDatabasesResponse{
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, atr *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
+					return &milvuspb.ListDatabasesResponse{
 						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
-					}, nil).Maybe()
+					}, nil
+				}).Once()
 			} else {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ListDatabases(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
 					Return(&milvuspb.ListDatabasesResponse{
 						DbNames: []string{"db1"},
 						Status:  merr.Success(),
@@ -2071,12 +2022,12 @@ func TestGetFlushAllState(t *testing.T) {
 			}
 
 			if test.ShowCollectionFailed {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ShowCollections(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
 					Return(&milvuspb.ShowCollectionsResponse{
 						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
 					}, nil).Maybe()
 			} else {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ShowCollections(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
 					Return(&milvuspb.ShowCollectionsResponse{
 						Status:        merr.Success(),
 						CollectionIds: []int64{collection},
@@ -2084,12 +2035,12 @@ func TestGetFlushAllState(t *testing.T) {
 			}
 
 			if test.DescribeCollectionFailed {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
 					Return(&milvuspb.DescribeCollectionResponse{
 						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
 					}, nil).Maybe()
 			} else {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
 					Return(&milvuspb.DescribeCollectionResponse{
 						Status:              merr.Success(),
 						VirtualChannelNames: vchannels,
@@ -2141,30 +2092,30 @@ func TestGetFlushAllStateWithDB(t *testing.T) {
 			svr.stateCode.Store(commonpb.StateCode_Healthy)
 			var err error
 			svr.meta = &meta{}
-			svr.rootCoordClient = mocks.NewMockRootCoordClient(t)
-			svr.broker = broker.NewCoordinatorBroker(svr.rootCoordClient)
+			svr.mixCoord = mocks.NewMixCoord(t)
+			svr.broker = broker.NewCoordinatorBroker(svr.mixCoord)
 
 			if test.DbExist {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ListDatabases(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
 					Return(&milvuspb.ListDatabasesResponse{
 						DbNames: []string{dbName},
 						Status:  merr.Success(),
 					}, nil).Maybe()
 			} else {
-				svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ListDatabases(mock.Anything, mock.Anything).
+				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
 					Return(&milvuspb.ListDatabasesResponse{
 						DbNames: []string{},
 						Status:  merr.Success(),
 					}, nil).Maybe()
 			}
 
-			svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().ShowCollections(mock.Anything, mock.Anything).
+			svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
 				Return(&milvuspb.ShowCollectionsResponse{
 					Status:        merr.Success(),
 					CollectionIds: []int64{collectionID},
 				}, nil).Maybe()
 
-			svr.rootCoordClient.(*mocks.MockRootCoordClient).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
+			svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
 				Return(&milvuspb.DescribeCollectionResponse{
 					Status:              merr.Success(),
 					VirtualChannelNames: vchannels,
@@ -2405,15 +2356,20 @@ func newTestServer(t *testing.T, opts ...Option) *Server {
 	svr.SetEtcdClient(etcdCli)
 	svr.SetTiKVClient(globalTestTikv)
 
+	dm := mocks.NewMockDataNodeClient(t)
+	dm.EXPECT().Close().Return(nil).Maybe()
+
 	svr.dataNodeCreator = func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
-		return mocks.NewMockDataNodeClient(t), nil
+		return dm, nil
 	}
-	svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-		return newMockRootCoordClient(), nil
+	svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+		return newMockMixCoord(), nil
 	}
 	for _, opt := range opts {
 		opt(svr)
 	}
+
+	svr.nodeManager = session.NewNodeManager(svr.dataNodeCreator)
 
 	err = svr.Init()
 	assert.NoError(t, err)
@@ -2455,6 +2411,153 @@ func closeTestServer(t *testing.T, svr *Server) {
 	paramtable.Get().Reset(Params.CommonCfg.DataCoordTimeTick.Key)
 }
 
+func TestServer_rewatchQueryNodes(t *testing.T) {
+	server := &Server{
+		indexEngineVersionManager: newIndexEngineVersionManager(),
+	}
+
+	// Test with empty sessions
+	err := server.rewatchQueryNodes(map[string]*sessionutil.Session{})
+	assert.NoError(t, err)
+
+	// Test with valid sessions
+	sessions := map[string]*sessionutil.Session{
+		"session1": {
+			SessionRaw: sessionutil.SessionRaw{
+				ServerID:           1,
+				IndexEngineVersion: sessionutil.IndexEngineVersion{CurrentIndexVersion: 20, MinimalIndexVersion: 10},
+			},
+		},
+		"session2": {
+			SessionRaw: sessionutil.SessionRaw{
+				ServerID:           2,
+				IndexEngineVersion: sessionutil.IndexEngineVersion{CurrentIndexVersion: 15, MinimalIndexVersion: 5},
+			},
+		},
+	}
+
+	err = server.rewatchQueryNodes(sessions)
+	assert.NoError(t, err)
+
+	// Verify the IndexEngineVersionManager received the sessions
+	assert.Equal(t, int32(15), server.indexEngineVersionManager.GetCurrentIndexEngineVersion())
+	assert.Equal(t, int32(10), server.indexEngineVersionManager.GetMinimalIndexEngineVersion())
+
+	// Test idempotent behavior - calling again with same sessions should not cause issues
+	err = server.rewatchQueryNodes(sessions)
+	assert.NoError(t, err)
+
+	// Verify values remain the same
+	assert.Equal(t, int32(15), server.indexEngineVersionManager.GetCurrentIndexEngineVersion())
+	assert.Equal(t, int32(10), server.indexEngineVersionManager.GetMinimalIndexEngineVersion())
+}
+
+func TestServer_rewatchDataNodes_Success(t *testing.T) {
+	// Mock semver.Parse to avoid dependency on paramtable
+	mockSemverParse := mockey.Mock(semver.Parse).Return(semver.Version{}, nil).Build()
+	defer mockSemverParse.UnPatch()
+
+	sessions := map[string]*sessionutil.Session{
+		"session1": {
+			SessionRaw: sessionutil.SessionRaw{
+				ServerID: 1,
+				Address:  "localhost:9001",
+				Version:  "2.3.0",
+			},
+		},
+		"session2": {
+			SessionRaw: sessionutil.SessionRaw{
+				ServerID: 2,
+				Address:  "localhost:9002",
+				Version:  "2.2.0", // legacy version
+			},
+		},
+	}
+
+	server := &Server{
+		ctx: context.Background(),
+	}
+
+	// Create actual implementations
+	nodeManager := session.NewNodeManager(func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
+		return nil, nil
+	})
+	cluster := NewClusterImpl(nil, nil)
+
+	server.nodeManager = nodeManager
+	server.cluster = cluster
+
+	// Mock Cluster.Startup to succeed
+	mockClusterStartup := mockey.Mock((*ClusterImpl).Startup).Return(nil).Build()
+	defer mockClusterStartup.UnPatch()
+
+	err := server.rewatchDataNodes(sessions)
+	assert.NoError(t, err)
+}
+
+func TestServer_rewatchDataNodes_EmptySession(t *testing.T) {
+	// Mock semver.Parse to avoid dependency on paramtable
+	mockSemverParse := mockey.Mock(semver.Parse).Return(semver.Version{}, nil).Build()
+	defer mockSemverParse.UnPatch()
+
+	server := &Server{
+		ctx: context.Background(),
+	}
+
+	// Create actual implementations
+	nodeManager := session.NewNodeManager(func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
+		return nil, nil
+	})
+	cluster := NewClusterImpl(nil, nil)
+
+	server.nodeManager = nodeManager
+	server.cluster = cluster
+
+	// Mock Cluster.Startup for empty nodes
+	mockStartup := mockey.Mock((*ClusterImpl).Startup).Return(nil).Build()
+	defer mockStartup.UnPatch()
+
+	err := server.rewatchDataNodes(map[string]*sessionutil.Session{})
+	assert.NoError(t, err)
+}
+
+func TestServer_rewatchDataNodes_ClusterStartupFails(t *testing.T) {
+	// Mock semver.Parse to avoid dependency on paramtable
+	mockSemverParse := mockey.Mock(semver.Parse).Return(semver.Version{}, nil).Build()
+	defer mockSemverParse.UnPatch()
+
+	sessions := map[string]*sessionutil.Session{
+		"session1": {
+			SessionRaw: sessionutil.SessionRaw{
+				ServerID: 1,
+				Address:  "localhost:9001",
+				Version:  "2.3.0",
+			},
+		},
+	}
+
+	server := &Server{
+		ctx: context.Background(),
+	}
+
+	// Create actual implementations
+	nodeManager := session.NewNodeManager(func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
+		return nil, nil
+	})
+	cluster := NewClusterImpl(nil, nil)
+
+	server.nodeManager = nodeManager
+	server.cluster = cluster
+
+	// Mock Cluster.Startup to fail
+	mockStartup := mockey.Mock((*ClusterImpl).Startup).Return(errors.New("cluster startup failed")).Build()
+	defer mockStartup.UnPatch()
+
+	err := server.rewatchDataNodes(sessions)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cluster startup failed")
+}
+
 func Test_CheckHealth(t *testing.T) {
 	getSessionManager := func(isHealthy bool) *session.DataNodeManagerImpl {
 		sm := session.NewDataNodeManagerImpl(session.WithDataNodeCreator(func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
@@ -2488,13 +2591,12 @@ func Test_CheckHealth(t *testing.T) {
 		return channelManager
 	}
 
-	collections := map[UniqueID]*collectionInfo{
-		449684528748778322: {
-			ID:            449684528748778322,
-			VChannelNames: []string{"ch1", "ch2"},
-		},
-		2: nil,
-	}
+	collections := typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()
+	collections.Insert(449684528748778322, &collectionInfo{
+		ID:            449684528748778322,
+		VChannelNames: []string{"ch1", "ch2"},
+	})
+	collections.Insert(2, nil)
 
 	t.Run("not healthy", func(t *testing.T) {
 		ctx := context.Background()
@@ -2634,30 +2736,11 @@ func Test_initGarbageCollection(t *testing.T) {
 	})
 }
 
-func TestDataCoord_DisableActiveStandby(t *testing.T) {
-	paramtable.Get().Save(Params.DataCoordCfg.EnableActiveStandby.Key, "false")
-	defer paramtable.Get().Reset(Params.DataCoordCfg.EnableActiveStandby.Key)
-	svr := newTestServer(t)
-	closeTestServer(t, svr)
-}
-
-// make sure the main functions work well when EnableActiveStandby=true
-func TestDataCoord_EnableActiveStandby(t *testing.T) {
-	paramtable.Get().Save(Params.DataCoordCfg.EnableActiveStandby.Key, "true")
-	defer paramtable.Get().Reset(Params.DataCoordCfg.EnableActiveStandby.Key)
-	svr := newTestServer(t)
-	defer closeTestServer(t, svr)
-	assert.Eventually(t, func() bool {
-		// return svr.
-		return svr.GetStateCode() == commonpb.StateCode_Healthy
-	}, time.Second*5, time.Millisecond*100)
-}
-
 func TestLoadCollectionFromRootCoord(t *testing.T) {
 	broker := broker.NewMockBroker(t)
 	s := &Server{
 		broker: broker,
-		meta:   &meta{collections: make(map[UniqueID]*collectionInfo)},
+		meta:   &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()},
 	}
 
 	t.Run("has collection fail with error", func(t *testing.T) {
@@ -2698,8 +2781,8 @@ func TestLoadCollectionFromRootCoord(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		err := s.loadCollectionFromRootCoord(context.TODO(), 0)
 		assert.NoError(t, err)
-		assert.Equal(t, 1, len(s.meta.collections))
-		_, ok := s.meta.collections[1]
+		assert.Equal(t, 1, s.meta.collections.Len())
+		_, ok := s.meta.collections.Get(1)
 		assert.True(t, ok)
 	})
 }
@@ -2759,4 +2842,72 @@ func TestUpdateAutoBalanceConfigLoop(t *testing.T) {
 		cancel()
 		wg.Wait()
 	})
+}
+
+func TestServer_InitMessageCallback(t *testing.T) {
+	ctx := context.Background()
+
+	mockCatalog := mocks2.NewDataCoordCatalog(t)
+	mockChunkManager := mocks.NewChunkManager(t)
+	mockManager := NewMockManager(t)
+
+	server := &Server{
+		ctx: ctx,
+		meta: &meta{
+			catalog:      mockCatalog,
+			chunkManager: mockChunkManager,
+			segments:     NewSegmentsInfo(),
+		},
+		importMeta:     &importMeta{},
+		segmentManager: mockManager,
+	}
+	server.stateCode.Store(commonpb.StateCode_Abnormal)
+
+	// Test initMessageCallback
+	server.initMessageCallback()
+
+	// Test DropPartition message callback
+	dropPartitionMsg, err := message.NewDropPartitionMessageBuilderV1().
+		WithVChannel("test_channel").
+		WithHeader(&message.DropPartitionMessageHeader{
+			CollectionId: 1,
+			PartitionId:  1,
+		}).
+		WithBody(&msgpb.DropPartitionRequest{
+			Base: &commonpb.MsgBase{
+				MsgType: commonpb.MsgType_DropPartition,
+			},
+		}).
+		BuildMutable()
+	assert.NoError(t, err)
+	err = registry.CallMessageAckCallback(ctx, dropPartitionMsg)
+	assert.Error(t, err) // server not healthy
+
+	// Test Import message check callback
+	resourceKey := message.NewImportJobIDResourceKey(1)
+	msg, err := message.NewImportMessageBuilderV1().
+		WithHeader(&message.ImportMessageHeader{}).
+		WithBody(&msgpb.ImportMsg{
+			Base: &commonpb.MsgBase{
+				MsgType: commonpb.MsgType_Import,
+			},
+		}).
+		WithBroadcast([]string{"ch-0"}, resourceKey).
+		BuildBroadcast()
+	err = registry.CallMessageCheckCallback(ctx, msg)
+	assert.NoError(t, err)
+
+	// Test Import message ack callback
+	importMsg, err := message.NewImportMessageBuilderV1().
+		WithVChannel("test_channel").
+		WithHeader(&message.ImportMessageHeader{}).
+		WithBody(&msgpb.ImportMsg{
+			Base: &commonpb.MsgBase{
+				MsgType: commonpb.MsgType_Import,
+			},
+		}).
+		BuildMutable()
+	assert.NoError(t, err)
+	err = registry.CallMessageAckCallback(ctx, importMsg)
+	assert.Error(t, err) // server not healthy
 }

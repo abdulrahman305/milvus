@@ -25,9 +25,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -470,7 +472,7 @@ func TestDocInDocOutCreateCollection(t *testing.T) {
 				"outputFieldNames": ["sparse_vector_1"]
 			}
 		]`)),
-		errMsg:  "actual=BM25_",
+		errMsg:  "Unsupported function type: BM25_",
 		errCode: 1100,
 	})
 
@@ -483,7 +485,7 @@ func TestDocInDocOutCreateCollection(t *testing.T) {
 				"outputFieldNames": ["sparse_vector_1"]
 			}
 		]`)),
-		errMsg:  "actual=", // unprovided function type is empty string
+		errMsg:  "Unsupported function type:", // unprovided function type is empty string
 		errCode: 1100,
 	})
 
@@ -601,6 +603,77 @@ func TestDocInDocOutInsertInvalid(t *testing.T) {
 	}
 
 	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
+}
+
+func TestSearchWithRerank(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	testEngine := initHTTPServerV2(mp, false)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, true, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Once()
+	mp.EXPECT().Search(mock.Anything, mock.Anything).Return(&milvuspb.SearchResults{Status: commonSuccessStatus, Results: &schemapb.SearchResultData{
+		TopK:         int64(3),
+		OutputFields: []string{FieldWordCount},
+		FieldsData:   generateFieldData(),
+		Ids:          generateIDs(schemapb.DataType_Int64, 3),
+		Scores:       DefaultScores,
+	}}, nil).Once()
+
+	testcase := requestBodyTestCase{
+		path: versionalV2(EntityCategory, SearchAction),
+		requestBody: []byte(`{
+                                         "collectionName": "book",
+                                         "data": [[0.1, 0.2]],
+                                         "limit": 4,
+                                         "outputFields": ["word_count"],
+                                         "functionScore": {
+                                             "functions": [{
+                                                  "name": "testRank",
+                                                  "description": "",
+                                                  "type": "Rerank",
+                                                  "inputFieldNames": ["FieldWordCount"],
+                                                  "params": {"name": "decay"}
+                                          }]}}`),
+	}
+	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
+}
+
+func TestHybridSearchWithRerank(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	testEngine := initHTTPServerV2(mp, false)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, true, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Once()
+
+	mp.EXPECT().HybridSearch(mock.Anything, mock.Anything).Return(&milvuspb.SearchResults{Status: commonSuccessStatus, Results: &schemapb.SearchResultData{
+		TopK:         int64(3),
+		OutputFields: []string{FieldWordCount},
+		FieldsData:   generateFieldData(),
+		Ids:          generateIDs(schemapb.DataType_Int64, 3),
+		Scores:       DefaultScores,
+	}}, nil).Once()
+
+	queryTestCases := requestBodyTestCase{
+		path:        versionalV2(EntityCategory, HybridSearchAction),
+		requestBody: []byte(`{"collectionName": "hello_milvus", "search": [{"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}, {"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}], "functionScore": {"functions": [{"name": "testRank", "type": "Rerank", "inputFieldNames": ["FieldWordCount"], "params": {"name": "decay"}}]}}`),
+	}
+	sendReqAndVerify(t, testEngine, queryTestCases.path, http.MethodPost, queryTestCases)
 }
 
 func TestDocInDocOutSearch(t *testing.T) {
@@ -1345,7 +1418,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=bool][actual=10]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"10\"(type: float64) as bool default value: invalid parameter",
 		errCode: 1100,
 	})
 
@@ -1359,7 +1432,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=string][actual=true]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"true\"(type: bool) as string default value: invalid parameter",
 		errCode: 1100,
 	})
 
@@ -1373,7 +1446,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=number][actual=10]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"\"10\"(type: string) as int default value: invalid parameter",
 		errCode: 1100,
 	})
 
@@ -1387,7 +1460,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=number][actual=10]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"10\"(type: string) as long default value: invalid parameter",
 		errCode: 1100,
 	})
 
@@ -1401,7 +1474,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=number][actual=10]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"10\"(type: string) as float default value: invalid parameter",
 		errCode: 1100,
 	})
 
@@ -1415,7 +1488,7 @@ func TestCreateCollection(t *testing.T) {
 	            {"fieldName": "book_intro", "dataType": "SparseFloatVector", "elementTypeParams": {"dim": 2}}
 	        ]
 	    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]}`),
-		errMsg:  "convert defaultValue fail, err:Wrong defaultValue type: invalid parameter[expected=number][actual=10]",
+		errMsg:  "convert defaultValue fail, err:cannot use \"10\"(type: string) as float default value: invalid parameter",
 		errCode: 1100,
 	})
 	postTestCases = append(postTestCases, requestBodyTestCase{
@@ -2043,9 +2116,9 @@ func validateTestCases(t *testing.T, testEngine *gin.Engine, queryTestCases []re
 			returnBody := &ReturnErrMsg{}
 			err := json.Unmarshal(w.Body.Bytes(), returnBody)
 			assert.Nil(t, err, "case %d: ", i)
-			assert.Equal(t, testcase.errCode, returnBody.Code, "case %d: ", i, string(testcase.requestBody))
+			assert.Equal(t, testcase.errCode, returnBody.Code, "case: %d, request body: %s ", i, string(testcase.requestBody))
 			if testcase.errCode != 0 {
-				assert.Equal(t, testcase.errMsg, returnBody.Message, "case %d: ", i, string(testcase.requestBody))
+				assert.Contains(t, returnBody.Message, testcase.errMsg, "case: %d, request body: %s", i, string(testcase.requestBody))
 			}
 			fmt.Println(w.Body.String())
 		})
@@ -2063,13 +2136,25 @@ func TestDML(t *testing.T) {
 		Schema:         generateCollectionSchema(schemapb.DataType_Int64, false, true),
 		ShardsNum:      ShardNumDefault,
 		Status:         &StatusSuccess,
+	}, nil).Times(2)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, false, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Times(3)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, false, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
 	}, nil).Times(6)
 	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{Status: commonErrorStatus}, nil).Times(4)
 	mp.EXPECT().Query(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *milvuspb.QueryRequest) (*milvuspb.QueryResults, error) {
 		if matchCountRule(req.OutputFields) {
 			for _, pair := range req.QueryParams {
-				if pair.GetKey() == ParamLimit {
-					return nil, fmt.Errorf("mock error")
+				if pair.GetKey() == proxy.LimitKey {
+					return nil, errors.New("mock error")
 				}
 			}
 		}
@@ -2108,6 +2193,18 @@ func TestDML(t *testing.T) {
 		requestBody: []byte(`{"collectionName": "book", "filter": "", "outputFields": ["count(*)"], "limit": 10}`),
 	})
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        QueryAction,
+		requestBody: []byte(`{"collectionName": "book", "filter": "", "outputFields":  ["book_id",  "word_count", "book_intro"], "limit": 10, "consistencyLevel": "AAA"}`),
+		errMsg:      "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded",
+		errCode:     1100, // ErrParameterInvalid
+	})
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        GetAction,
+		requestBody: []byte(`{"collectionName": "book", "id": [2, 4, 6, 8], "outputFields": ["book_id",  "word_count", "book_intro"], "consistencyLevel": "AAA"}`),
+		errMsg:      "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded",
+		errCode:     1100, // ErrParameterInvalid
+	})
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
 		path:        InsertAction,
 		requestBody: []byte(`{"collectionName": "book", "data": [{"book_id": 0, "word_count": 0, "book_intro": [0.11825, 0.6]}]}`),
 	})
@@ -2135,11 +2232,11 @@ func TestDML(t *testing.T) {
 	})
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
 		path:        GetAction,
-		requestBody: []byte(`{"collectionName": "book", "id" : [2, 4, 6, 8, 0], "outputFields": ["book_id",  "word_count", "book_intro"]}`),
+		requestBody: []byte(`{"collectionName": "book", "id": [2, 4, 6, 8, 0], "outputFields": ["book_id",  "word_count", "book_intro"]}`),
 	})
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
 		path:        GetAction,
-		requestBody: []byte(`{"collectionName": "book", "id" : [2, 4, 6, 8, 0], "outputFields": ["book_id",  "word_count", "book_intro"]}`),
+		requestBody: []byte(`{"collectionName": "book", "id": [2, 4, 6, 8, "0"], "outputFields": ["book_id",  "word_count", "book_intro"]}`),
 		errMsg:      "",
 		errCode:     65535,
 	})
@@ -2459,7 +2556,7 @@ func TestSearchV2(t *testing.T) {
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
 		path:        SearchAction,
 		requestBody: []byte(`{"collectionName": "book", "data": [["0.1", "0.2"]], "filter": "book_id in [2, 4, 6, 8]", "limit": 4, "outputFields": ["word_count"], "params": {"radius":0.9, "range_filter": 0.1}, "groupingField": "test"}`),
-		errMsg:      "can only accept json format request, error: Mismatch type float32 with value string \"at index 9: mismatched type with value\\n\\n\\t[[\\\"0.1\\\", \\\"0.2\\\"]]\\n\\t.........^......\\n\": invalid parameter[expected=FloatVector][actual=[[\"0.1\", \"0.2\"]]]",
+		errMsg:      "can only accept json format request, error: Mismatch type float32 with value",
 		errCode:     1801,
 	})
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
@@ -2501,7 +2598,7 @@ func TestSearchV2(t *testing.T) {
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
 		path:        SearchAction,
 		requestBody: []byte(`{"collectionName": "book", "data": [[0.1, 0.2]], "annsField": "binaryVector", "filter": "book_id in [2, 4, 6, 8]", "limit": 4, "outputFields": ["word_count"]}`),
-		errMsg:      "can only accept json format request, error: Mismatch type uint8 with value number \"at index 7: mismatched type with value\\n\\n\\t[[0.1, 0.2]]\\n\\t.......^....\\n\": invalid parameter[expected=BinaryVector][actual=[[0.1, 0.2]]]",
+		errMsg:      "can only accept json format request, error: Mismatch type uint8",
 		errCode:     1801,
 	})
 	queryTestCases = append(queryTestCases, requestBodyTestCase{
@@ -2639,4 +2736,139 @@ func TestSearchV2(t *testing.T) {
 		errCode:     1100, // ErrParameterInvalid
 	})
 	validateTestCases(t, testEngine, queryTestCases, false)
+}
+
+func TestGetQuotaMetrics(t *testing.T) {
+	paramtable.Init()
+
+	mp := mocks.NewMockProxy(t)
+	mp.EXPECT().GetQuotaMetrics(mock.Anything, mock.Anything).Return(&internalpb.GetQuotaMetricsResponse{
+		Status:      &StatusSuccess,
+		MetricsInfo: `{"proxy1": "1000", "proxy2": "2000"}`,
+	}, nil)
+	testEngine := initHTTPServerV2(mp, false)
+	testcase := requestBodyTestCase{
+		path:        DescribeAction,
+		requestBody: []byte(`{}`),
+	}
+
+	bodyReader := bytes.NewReader(testcase.requestBody)
+	req := httptest.NewRequest(http.MethodPost, versionalV2(QuotaCenterCategory, testcase.path), bodyReader)
+	w := httptest.NewRecorder()
+	testEngine.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "case %d: ", string(testcase.requestBody))
+	returnBody := &ReturnErrMsg{}
+	err := json.Unmarshal(w.Body.Bytes(), returnBody)
+	assert.Nil(t, err)
+	assert.Equal(t, testcase.errCode, returnBody.Code, "case: %d, request body: %s ", string(testcase.requestBody))
+	if testcase.errCode != 0 {
+		assert.Contains(t, returnBody.Message, testcase.errMsg, "case: %d, request body: %s", string(testcase.requestBody))
+	}
+	fmt.Println(w.Body.String())
+}
+
+type AddCollectionFieldSuite struct {
+	suite.Suite
+	testEngine *gin.Engine
+	mp         *mocks.MockProxy
+}
+
+func (s *AddCollectionFieldSuite) SetupSuite() {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+}
+
+func (s *AddCollectionFieldSuite) TearDownSuite() {
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+}
+
+func (s *AddCollectionFieldSuite) SetupTest() {
+	s.mp = mocks.NewMockProxy(s.T())
+	s.testEngine = initHTTPServerV2(s.mp, false)
+}
+
+func (s *AddCollectionFieldSuite) TestAddCollectionFieldNormal() {
+	addFieldTestCases := []requestBodyTestCase{
+		{
+			path:        versionalV2(CollectionFieldCategory, AddAction),
+			requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Int64", "nullable": true, "elementTypeParams": {}}}`),
+		},
+		{
+			path:        versionalV2(CollectionFieldCategory, AddAction),
+			requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "VarChar", "nullable": true, "elementTypeParams": {"max_length": "256"}}}`),
+		},
+		{
+			path:        versionalV2(CollectionFieldCategory, AddAction),
+			requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Int64", "nullable": true, "defaultValue": 42}}`),
+		},
+		{
+			path:        versionalV2(CollectionFieldCategory, AddAction),
+			requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Array", "elementDataType": "Int64", "nullable": true}}`),
+		},
+	}
+	s.mp.EXPECT().AddCollectionField(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+	validateRequestBodyTestCases(s.T(), s.testEngine, addFieldTestCases, false)
+}
+
+func (s *AddCollectionFieldSuite) TestAddCollectionFieldFail() {
+	s.Run("bad_request", func() {
+		addFieldTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "nullable": true, "elementTypeParams": {}}}`),
+				errCode:     1802, // missing param
+				errMsg:      "missing required parameters, error: Key: 'CollectionFieldReqWithSchema.Schema.DataType' Error:Field validation for 'DataType' failed on the 'required' tag",
+			},
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Int64", "nullable": true, "defaultValue": "aaa"}}`),
+				errCode:     1100, // invalid param
+				errMsg:      "convert defaultValue fail, err: cannot use \"aaa\"(type: string) as long default value: invalid parameter: invalid parameter",
+			},
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "LONGLONGLONGLONGTEXT", "nullable": true}}`),
+				errCode:     1100, // invalid param
+				errMsg:      "data type LONGLONGLONGLONGTEXT is invalid(case sensitive): invalid parameter",
+			},
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Array", "nullable": true}}`),
+				errCode:     1100, // invalid param
+				errMsg:      "element data type  is invalid(case sensitive): invalid parameter",
+			},
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Array", "elementDataType": "MYBLOB", "nullable": true}}`),
+				errCode:     1100, // missing param
+				errMsg:      "element data type MYBLOB is invalid(case sensitive): invalid parameter",
+			},
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field"`),
+				errCode:     1801, // bad request
+				errMsg:      "can only accept json format request, error: unexpected EOF",
+			},
+		}
+		validateRequestBodyTestCases(s.T(), s.testEngine, addFieldTestCases, false)
+	})
+
+	s.Run("server_error", func() {
+		addFieldTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionFieldCategory, AddAction),
+				requestBody: []byte(`{"collectionName": "book", "schema": {"fieldName": "new_field", "dataType": "Int64", "nullable": true, "elementTypeParams": {}}}`),
+				errCode:     5,
+				errMsg:      "service internal error: mock error",
+			},
+		}
+		s.mp.EXPECT().AddCollectionField(mock.Anything, mock.Anything).Return(merr.Status(merr.WrapErrServiceInternal("mock error")), nil).Maybe()
+
+		validateRequestBodyTestCases(s.T(), s.testEngine, addFieldTestCases, false)
+	})
+}
+
+func TestAddCollectionFieldSuite(t *testing.T) {
+	suite.Run(t, new(AddCollectionFieldSuite))
 }

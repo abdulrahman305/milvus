@@ -18,7 +18,6 @@ package meta
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"time"
 
@@ -55,17 +54,14 @@ type Broker interface {
 }
 
 type CoordinatorBroker struct {
-	dataCoord types.DataCoordClient
-	rootCoord types.RootCoordClient
+	mixCoord types.MixCoord
 }
 
 func NewCoordinatorBroker(
-	dataCoord types.DataCoordClient,
-	rootCoord types.RootCoordClient,
+	mixCoord types.MixCoord,
 ) *CoordinatorBroker {
 	return &CoordinatorBroker{
-		dataCoord,
-		rootCoord,
+		mixCoord,
 	}
 }
 
@@ -80,7 +76,7 @@ func (broker *CoordinatorBroker) DescribeCollection(ctx context.Context, collect
 		// please do not specify the collection name alone after database feature.
 		CollectionID: collectionID,
 	}
-	resp, err := broker.rootCoord.DescribeCollection(ctx, req)
+	resp, err := broker.mixCoord.DescribeCollection(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Ctx(ctx).Warn("failed to get collection schema", zap.Error(err))
 		return nil, err
@@ -98,7 +94,7 @@ func (broker *CoordinatorBroker) DescribeDatabase(ctx context.Context, dbName st
 		),
 		DbName: dbName,
 	}
-	resp, err := broker.rootCoord.DescribeDatabase(ctx, req)
+	resp, err := broker.mixCoord.DescribeDatabase(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Ctx(ctx).Warn("failed to describe database", zap.Error(err))
 		return nil, err
@@ -183,7 +179,7 @@ func (broker *CoordinatorBroker) GetPartitions(ctx context.Context, collectionID
 		// please do not specify the collection name alone after database feature.
 		CollectionID: collectionID,
 	}
-	resp, err := broker.rootCoord.ShowPartitions(ctx, req)
+	resp, err := broker.mixCoord.ShowPartitions(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Warn("failed to get partitions", zap.Error(err))
 		return nil, err
@@ -207,7 +203,7 @@ func (broker *CoordinatorBroker) GetRecoveryInfo(ctx context.Context, collection
 		CollectionID: collectionID,
 		PartitionID:  partitionID,
 	}
-	recoveryInfo, err := broker.dataCoord.GetRecoveryInfo(ctx, getRecoveryInfoRequest)
+	recoveryInfo, err := broker.mixCoord.GetRecoveryInfo(ctx, getRecoveryInfoRequest)
 	if err := merr.CheckRPCCall(recoveryInfo, err); err != nil {
 		log.Warn("get recovery info failed", zap.Error(err))
 		return nil, nil, err
@@ -247,7 +243,7 @@ func (broker *CoordinatorBroker) GetRecoveryInfoV2(ctx context.Context, collecti
 		CollectionID: collectionID,
 		PartitionIDs: partitionIDs,
 	}
-	recoveryInfo, err := broker.dataCoord.GetRecoveryInfoV2(ctx, getRecoveryInfoRequest)
+	recoveryInfo, err := broker.mixCoord.GetRecoveryInfoV2(ctx, getRecoveryInfoRequest)
 
 	if err := merr.CheckRPCCall(recoveryInfo, err); err != nil {
 		log.Warn("get recovery info failed", zap.Error(err))
@@ -270,7 +266,7 @@ func (broker *CoordinatorBroker) GetSegmentInfo(ctx context.Context, ids ...Uniq
 			SegmentIDs:       ids,
 			IncludeUnHealthy: true,
 		}
-		resp, err := broker.dataCoord.GetSegmentInfo(ctx, req)
+		resp, err := broker.mixCoord.GetSegmentInfo(ctx, req)
 		if err := merr.CheckRPCCall(resp, err); err != nil {
 			log.Warn("failed to get segment info from DataCoord", zap.Error(err))
 			return nil, err
@@ -278,7 +274,7 @@ func (broker *CoordinatorBroker) GetSegmentInfo(ctx context.Context, ids ...Uniq
 
 		if len(resp.Infos) == 0 {
 			log.Warn("No such segment in DataCoord")
-			return nil, fmt.Errorf("no such segment in DataCoord")
+			return nil, errors.New("no such segment in DataCoord")
 		}
 
 		err = binlog.DecompressMultiBinLogs(resp.GetInfos())
@@ -321,7 +317,7 @@ func (broker *CoordinatorBroker) GetIndexInfo(ctx context.Context, collectionID 
 	var resp *indexpb.GetIndexInfoResponse
 	var err error
 	retry.Do(ctx, func() error {
-		resp, err = broker.dataCoord.GetIndexInfos(ctx, &indexpb.GetIndexInfoRequest{
+		resp, err = broker.mixCoord.GetIndexInfos(ctx, &indexpb.GetIndexInfoRequest{
 			CollectionID: collectionID,
 			SegmentIDs:   segmentIDs,
 		})
@@ -376,7 +372,7 @@ func (broker *CoordinatorBroker) describeIndex(ctx context.Context, collectionID
 	var resp *indexpb.DescribeIndexResponse
 	var err error
 	retry.Do(ctx, func() error {
-		resp, err = broker.dataCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+		resp, err = broker.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
 			CollectionID: collectionID,
 		})
 		if errors.Is(err, merr.ErrServiceUnimplemented) {
@@ -399,7 +395,7 @@ func (broker *CoordinatorBroker) ListIndexes(ctx context.Context, collectionID U
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 
-	resp, err := broker.dataCoord.ListIndexes(ctx, &indexpb.ListIndexesRequest{
+	resp, err := broker.mixCoord.ListIndexes(ctx, &indexpb.ListIndexesRequest{
 		CollectionID: collectionID,
 	})
 

@@ -15,6 +15,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -498,12 +499,12 @@ func (b *MultiTargetBalancer) BalanceReplica(ctx context.Context, replica *meta.
 func (b *MultiTargetBalancer) balanceChannels(ctx context.Context, br *balanceReport, replica *meta.Replica, stoppingBalance bool) []ChannelAssignPlan {
 	var rwNodes, roNodes []int64
 	if streamingutil.IsStreamingServiceEnabled() {
-		rwNodes, roNodes = replica.GetRWSQNodes(), replica.GetROSQNodes()
+		rwNodes, roNodes = utils.GetChannelRWAndRONodesFor260(replica, b.nodeManager)
 	} else {
 		rwNodes, roNodes = replica.GetRWNodes(), replica.GetRONodes()
 	}
 
-	if len(rwNodes) == 0 || !b.permitBalanceChannel(replica.GetCollectionID()) {
+	if len(rwNodes) == 0 {
 		return nil
 	}
 
@@ -525,7 +526,7 @@ func (b *MultiTargetBalancer) balanceSegments(ctx context.Context, replica *meta
 	rwNodes := replica.GetRWNodes()
 	roNodes := replica.GetRONodes()
 
-	if len(rwNodes) == 0 || !b.permitBalanceSegment(replica.GetCollectionID()) {
+	if len(rwNodes) == 0 {
 		return nil
 	}
 	// print current distribution before generating plans

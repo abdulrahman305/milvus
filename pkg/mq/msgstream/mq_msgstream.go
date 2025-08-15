@@ -39,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/common"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
@@ -221,9 +222,9 @@ func (ms *mqMsgStream) SetRepackFunc(repackFunc RepackFunc) {
 }
 
 func (ms *mqMsgStream) Close() {
-	log.Ctx(ms.ctx).Info("start to close mq msg stream",
-		zap.Int("producer num", len(ms.producers)),
-		zap.Int("consumer num", len(ms.consumers)))
+	log := log.Ctx(ms.ctx).With(zap.Strings("producers", ms.producerChannels),
+		zap.Strings("consumers", ms.consumerChannels))
+	log.Info("start to close mq msg stream")
 	ms.streamCancel()
 	ms.closeRWMutex.Lock()
 	defer ms.closeRWMutex.Unlock()
@@ -244,7 +245,7 @@ func (ms *mqMsgStream) Close() {
 	ms.client.Close()
 	close(ms.receiveBuf)
 	paramtable.Get().Unwatch(paramtable.Get().CommonCfg.TTMsgEnabled.Key, ms.configEvent)
-	log.Ctx(ms.ctx).Info("mq msg stream closed")
+	log.Info("mq msg stream closed")
 }
 
 func (ms *mqMsgStream) ComputeProduceChannelIndexes(tsMsgs []TsMsg) [][]int32 {
@@ -457,6 +458,10 @@ func (ms *mqMsgStream) receiveMsg(consumer mqwrapper.Consumer) {
 			consumer.Ack(msg)
 			if msg.Payload() == nil {
 				log.Ctx(ms.ctx).Warn("MqMsgStream get msg whose payload is nil")
+				continue
+			}
+			if message.CheckIfMessageFromStreaming(msg.Properties()) {
+				log.Ctx(ms.ctx).Warn("MqMsgStream can not consume the message from streaming service")
 				continue
 			}
 
@@ -826,11 +831,17 @@ func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 func (ms *MqTtMsgStream) consumeToTtMsg(consumer mqwrapper.Consumer) {
 	log := log.Ctx(ms.ctx)
 	defer ms.chanWaitGroup.Done()
+	msgTick := time.NewTimer(3 * time.Second)
+	defer msgTick.Stop()
 	for {
+		msgTick.Reset(3 * time.Second)
 		select {
 		case <-ms.ctx.Done():
 			return
 		case <-ms.chanStopChan[consumer]:
+			return
+		case <-msgTick.C:
+			log.Info("stop consumer, because no msg received in 3s", zap.Strings("channel", ms.consumerChannels))
 			return
 		case msg, ok := <-consumer.Chan():
 			if !ok {
@@ -841,6 +852,10 @@ func (ms *MqTtMsgStream) consumeToTtMsg(consumer mqwrapper.Consumer) {
 
 			if msg.Payload() == nil {
 				log.Warn("MqTtMsgStream get msg whose payload is nil")
+				continue
+			}
+			if message.CheckIfMessageFromStreaming(msg.Properties()) {
+				log.Warn("MqTtMsgStream can not consume the message from streaming service")
 				continue
 			}
 
@@ -910,7 +925,7 @@ func (ms *MqTtMsgStream) Seek(ctx context.Context, msgPositions []*MsgPosition, 
 		}
 
 		if consumer == nil {
-			return false, fmt.Errorf("consumer is nil")
+			return false, errors.New("consumer is nil")
 		}
 
 		seekMsgID, err := ms.client.BytesToMsgID(mp.MsgID)
@@ -951,7 +966,7 @@ func (ms *MqTtMsgStream) Seek(ctx context.Context, msgPositions []*MsgPosition, 
 	for idx := range msgPositions {
 		mp = msgPositions[idx]
 		if len(mp.MsgID) == 0 {
-			return fmt.Errorf("when msgID's length equal to 0, please use AsConsumer interface")
+			return errors.New("when msgID's length equal to 0, please use AsConsumer interface")
 		}
 		err = retry.Handle(ctx, fn, retry.Attempts(20), retry.Sleep(time.Millisecond*200), retry.MaxSleepTime(5*time.Second))
 		// err = retry.Do(ctx, fn, retry.Attempts(20), retry.Sleep(time.Millisecond*200), retry.MaxSleepTime(5*time.Second))
@@ -975,7 +990,7 @@ func (ms *MqTtMsgStream) Seek(ctx context.Context, msgPositions []*MsgPosition, 
 				log.Info("seek loop tick", zap.Int("loopMsgCnt", loopMsgCnt), zap.String("channel", mp.ChannelName))
 			case msg, ok := <-consumer.Chan():
 				if !ok {
-					return fmt.Errorf("consumer closed")
+					return errors.New("consumer closed")
 				}
 				loopMsgCnt++
 				consumer.Ack(msg)

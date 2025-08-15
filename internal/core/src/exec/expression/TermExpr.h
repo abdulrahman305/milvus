@@ -57,7 +57,8 @@ class PhyTermFilterExpr : public SegmentExpr {
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
         milvus::Timestamp timestamp,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
@@ -67,13 +68,29 @@ class PhyTermFilterExpr : public SegmentExpr {
                           ? DataType::NONE
                           : FromValCase(expr->vals_[0].val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr),
           query_timestamp_(timestamp) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
 
  private:
     void
@@ -88,39 +105,43 @@ class PhyTermFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecVisitorImpl(OffsetVector* input = nullptr);
+    ExecVisitorImpl(EvalCtx& context);
 
     template <typename T>
     VectorPtr
-    ExecVisitorImplForIndex(OffsetVector* input = nullptr);
+    ExecVisitorImplForIndex();
 
     template <typename T>
     VectorPtr
-    ExecVisitorImplForData(OffsetVector* input = nullptr);
+    ExecVisitorImplForData(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecVisitorImplTemplateJson(OffsetVector* input = nullptr);
+    ExecVisitorImplTemplateJson(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermJsonVariableInField(OffsetVector* input = nullptr);
+    ExecTermJsonVariableInField(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermJsonFieldInVariable(OffsetVector* input = nullptr);
+    ExecTermJsonFieldInVariable(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecVisitorImplTemplateArray(OffsetVector* input = nullptr);
+    ExecVisitorImplTemplateArray(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermArrayVariableInField(OffsetVector* input = nullptr);
+    ExecTermArrayVariableInField(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermArrayFieldInVariable(OffsetVector* input = nullptr);
+    ExecTermArrayFieldInVariable(EvalCtx& context);
+
+    template <typename ValueType>
+    VectorPtr
+    ExecJsonInVariableByKeyIndex();
 
  private:
     std::shared_ptr<const milvus::expr::TermFilterExpr> expr_;
@@ -129,7 +150,9 @@ class PhyTermFilterExpr : public SegmentExpr {
     TargetBitmap cached_bits_;
     bool arg_inited_{false};
     std::shared_ptr<MultiElement> arg_set_;
+    std::shared_ptr<MultiElement> arg_set_float_;
     SingleElement arg_val_;
+    int32_t consistency_level_ = 0;
 };
 }  //namespace exec
 }  // namespace milvus

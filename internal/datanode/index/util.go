@@ -26,18 +26,22 @@ package index
 #include "indexbuilder/init_c.h"
 */
 import "C"
+
 import (
 	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func getCurrentIndexVersion(v int32) int32 {
-	cCurrent := int32(C.GetCurrentIndexVersion())
-	if cCurrent < v {
-		return cCurrent
+	cMaximum := int32(C.GetMaximumIndexVersion())
+	if cMaximum < v {
+		return cMaximum
 	}
 	return v
 }
@@ -74,4 +78,21 @@ func mapToKVPairs(m map[string]string) []*commonpb.KeyValuePair {
 		})
 	}
 	return kvs
+}
+
+func CalculateNodeSlots() int64 {
+	cpuNum := hardware.GetCPUNum()
+	memory := hardware.GetMemoryCount()
+
+	slot := int64(cpuNum / 2)
+	memorySlot := int64(memory / (8 * 1024 * 1024 * 1024))
+	if slot > memorySlot {
+		slot = memorySlot
+	}
+
+	totalSlot := max(slot, 1) * paramtable.Get().DataNodeCfg.WorkerSlotUnit.GetAsInt64() * paramtable.Get().DataNodeCfg.BuildParallel.GetAsInt64()
+	if paramtable.GetRole() == typeutil.StandaloneRole {
+		totalSlot = max(int64(float64(totalSlot)*paramtable.Get().DataNodeCfg.StandaloneSlotRatio.GetAsFloat()), 1)
+	}
+	return totalSlot
 }

@@ -18,7 +18,6 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -44,7 +43,7 @@ type alterDatabaseTask struct {
 
 func (a *alterDatabaseTask) Prepare(ctx context.Context) error {
 	if a.Req.GetDbName() == "" {
-		return fmt.Errorf("alter database failed, database name does not exists")
+		return errors.New("alter database failed, database name does not exists")
 	}
 
 	// TODO SimFG maybe it will support to alter the replica.id properties in the future when the database has no collections
@@ -187,7 +186,7 @@ func executeAlterDatabaseTaskSteps(ctx context.Context,
 				return nil, nil
 			}
 
-			resp, err := core.queryCoord.UpdateLoadConfig(ctx, &querypb.UpdateLoadConfigRequest{
+			resp, err := core.mixCoord.UpdateLoadConfig(ctx, &querypb.UpdateLoadConfigRequest{
 				CollectionIDs:  lo.Map(colls, func(coll *model.Collection, _ int) int64 { return coll.CollectionID }),
 				ReplicaNumber:  int32(newReplicaNumber),
 				ResourceGroups: newResourceGroups,

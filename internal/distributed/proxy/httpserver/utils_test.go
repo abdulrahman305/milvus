@@ -17,6 +17,8 @@
 package httpserver
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -1087,14 +1089,14 @@ func TestConvertQueries2Placeholder(t *testing.T) {
 				dataType,
 				0,
 				func() [][]byte {
-					return [][]byte{nil, nil}
+					return [][]byte{{}, {}}
 				},
 			}, {
 				`"{"data": [""]}"`,
 				dataType,
 				0,
 				func() [][]byte {
-					return [][]byte{nil}
+					return [][]byte{{}}
 				},
 			},
 		}...)
@@ -1159,7 +1161,8 @@ func TestConvertQueries2Placeholder(t *testing.T) {
 	for _, testcase := range testCases {
 		phv, err := convertQueries2Placeholder(testcase.requestBody, testcase.dataType, testcase.dim)
 		assert.Nil(t, err)
-		assert.Equal(t, testcase.placehoderValue(), phv.GetValues())
+		assert.Equal(t, testcase.placehoderValue(), phv.GetValues(),
+			fmt.Sprintf("check equal fail, data: %s, type: %s, dim: %d", testcase.requestBody, testcase.dataType, testcase.dim))
 	}
 
 	for _, testcase := range []testCase{
@@ -1186,7 +1189,8 @@ func TestConvertQueries2Placeholder(t *testing.T) {
 	} {
 		phv, err := convertQueries2Placeholder(testcase.requestBody, testcase.dataType, testcase.dim)
 		assert.Nil(t, err)
-		assert.NotEqual(t, testcase.placehoderValue(), phv.GetValues())
+		assert.NotEqual(t, testcase.placehoderValue(), phv.GetValues(),
+			fmt.Sprintf("check not equal fail, data: %s, type: %s, dim: %d", testcase.requestBody, testcase.dataType, testcase.dim))
 	}
 
 	for _, testcase := range []testCase{
@@ -1307,7 +1311,7 @@ func compareRows(row1 []map[string]interface{}, row2 []map[string]interface{}, c
 
 func TestBuildQueryResp(t *testing.T) {
 	outputFields := []string{FieldBookID, FieldWordCount, "author", "date"}
-	rows, err := buildQueryResp(int64(0), outputFields, generateFieldData(), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true) // []*schemapb.FieldData{&fieldData1, &fieldData2, &fieldData3}
+	rows, err := buildQueryResp(int64(0), outputFields, generateFieldData(), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true, nil) // []*schemapb.FieldData{&fieldData1, &fieldData2, &fieldData3}
 	assert.Equal(t, nil, err)
 	exceptRows := generateSearchResult(schemapb.DataType_Int64)
 	assert.Equal(t, true, compareRows(rows, exceptRows, compareRow))
@@ -2220,7 +2224,7 @@ func TestBuildQueryResps(t *testing.T) {
 	outputFields := []string{"XXX", "YYY"}
 	outputFieldsList := [][]string{outputFields, {"$meta"}, {"$meta", FieldBookID, FieldBookIntro, "YYY"}}
 	for _, theOutputFields := range outputFieldsList {
-		rows, err := buildQueryResp(int64(0), theOutputFields, newFieldData(generateFieldData(), schemapb.DataType_None), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true)
+		rows, err := buildQueryResp(int64(0), theOutputFields, newFieldData(generateFieldData(), schemapb.DataType_None), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true, nil)
 		assert.Equal(t, nil, err)
 		exceptRows := newSearchResult(generateSearchResult(schemapb.DataType_Int64))
 		assert.Equal(t, true, compareRows(rows, exceptRows, compareRow))
@@ -2235,30 +2239,30 @@ func TestBuildQueryResps(t *testing.T) {
 		schemapb.DataType_JSON, schemapb.DataType_Array,
 	}
 	for _, dateType := range dataTypes {
-		_, err := buildQueryResp(int64(0), outputFields, newFieldData([]*schemapb.FieldData{}, dateType), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true)
+		_, err := buildQueryResp(int64(0), outputFields, newFieldData([]*schemapb.FieldData{}, dateType), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true, nil)
 		assert.Equal(t, nil, err)
 	}
 
-	_, err := buildQueryResp(int64(0), outputFields, newFieldData([]*schemapb.FieldData{}, 1000), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true)
+	_, err := buildQueryResp(int64(0), outputFields, newFieldData([]*schemapb.FieldData{}, 1000), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true, nil)
 	assert.Equal(t, "the type(1000) of field(wrong-field-type) is not supported, use other sdk please", err.Error())
 
-	res, err := buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true)
+	res, err := buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_Int64, 3), DefaultScores, true, nil)
 	assert.Equal(t, 3, len(res))
 	assert.Equal(t, nil, err)
 
-	res, err = buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_Int64, 3), DefaultScores, false)
+	res, err = buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_Int64, 3), DefaultScores, false, nil)
 	assert.Equal(t, 3, len(res))
 	assert.Equal(t, nil, err)
 
-	res, err = buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_VarChar, 3), DefaultScores, true)
+	res, err = buildQueryResp(int64(0), outputFields, []*schemapb.FieldData{}, generateIDs(schemapb.DataType_VarChar, 3), DefaultScores, true, nil)
 	assert.Equal(t, 3, len(res))
 	assert.Equal(t, nil, err)
 
-	_, err = buildQueryResp(int64(0), outputFields, generateFieldData(), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, false)
+	_, err = buildQueryResp(int64(0), outputFields, generateFieldData(), generateIDs(schemapb.DataType_Int64, 3), DefaultScores, false, nil)
 	assert.Equal(t, nil, err)
 
 	// len(rows) != len(scores), didn't show distance
-	_, err = buildQueryResp(int64(0), outputFields, newFieldData(generateFieldData(), schemapb.DataType_None), generateIDs(schemapb.DataType_Int64, 3), []float32{0.01, 0.04}, true)
+	_, err = buildQueryResp(int64(0), outputFields, newFieldData(generateFieldData(), schemapb.DataType_None), generateIDs(schemapb.DataType_Int64, 3), []float32{0.01, 0.04}, true, nil)
 	assert.Equal(t, nil, err)
 }
 
@@ -2293,7 +2297,7 @@ func TestConvertToExtraParams(t *testing.T) {
 		if pair.Key == common.IndexTypeKey {
 			assert.Equal(t, "IVF_FLAT", pair.Value)
 		}
-		if pair.Key == common.IndexParamsKey {
+		if pair.Key == common.ParamsKey {
 			assert.Equal(t, string("{\"nlist\":128}"), pair.Value)
 		}
 	}
@@ -2521,4 +2525,74 @@ func TestGenerateSearchParams(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestGenFunctionSchem(t *testing.T) {
+	{
+		funcSchema := &FunctionSchema{
+			FunctionName:    "test",
+			Description:     "",
+			FunctionType:    "unknow",
+			InputFieldNames: []string{"test"},
+		}
+		_, err := genFunctionSchema(context.Background(), funcSchema)
+		assert.ErrorContains(t, err, "Unsupported function type:")
+	}
+	{
+		funcSchema := &FunctionSchema{
+			FunctionName:    "test",
+			Description:     "",
+			FunctionType:    "Rerank",
+			InputFieldNames: []string{"test"},
+		}
+		_, err := genFunctionSchema(context.Background(), funcSchema)
+		assert.NoError(t, err)
+	}
+	{
+		funcSchema := &FunctionSchema{
+			FunctionName:    "test",
+			Description:     "",
+			FunctionType:    "Rerank",
+			InputFieldNames: []string{"test"},
+			Params: map[string]interface{}{
+				"test": []string{"test", "test2"},
+				"test2": map[string]interface{}{
+					"test3": "test4",
+				},
+				"test3": []int{1, 2, 3},
+			},
+		}
+		_, err := genFunctionSchema(context.Background(), funcSchema)
+		assert.NoError(t, err)
+	}
+}
+
+func TestGenFunctionScore(t *testing.T) {
+	{
+		fScore := FunctionScore{}
+		funcSchema := FunctionSchema{
+			FunctionName:    "test",
+			Description:     "",
+			FunctionType:    "unknow",
+			InputFieldNames: []string{"test"},
+		}
+
+		fScore.Functions = append(fScore.Functions, funcSchema)
+		_, err := genFunctionScore(context.Background(), &fScore)
+		assert.ErrorContains(t, err, "Unsupported function typ")
+	}
+	{
+		fScore := FunctionScore{}
+		funcSchema := FunctionSchema{
+			FunctionName:    "test",
+			Description:     "",
+			FunctionType:    "Rerank",
+			InputFieldNames: []string{"test"},
+		}
+
+		fScore.Functions = append(fScore.Functions, funcSchema)
+		fScore.Params = map[string]interface{}{"testStr": "test", "testInt": 6, "testBool": true}
+		_, err := genFunctionScore(context.Background(), &fScore)
+		assert.NoError(t, err)
+	}
 }

@@ -51,7 +51,7 @@ struct ExprInfo {
                 case GenericValue::VAL_NOT_SET:
                     return true;
                 default:
-                    PanicInfo(NotImplemented,
+                    ThrowInfo(NotImplemented,
                               "Not supported GenericValue type");
             }
         }
@@ -78,7 +78,7 @@ struct ExprInfo {
                 case GenericValue::VAL_NOT_SET:
                     break;
                 default:
-                    PanicInfo(NotImplemented,
+                    ThrowInfo(NotImplemented,
                               "Not supported GenericValue type");
             }
             return h;
@@ -138,6 +138,18 @@ struct ColumnInfo {
           nullable_(nullable) {
     }
 
+    ColumnInfo(FieldId field_id,
+               DataType data_type,
+               DataType element_type,
+               std::vector<std::string> nested_path = {},
+               bool nullable = false)
+        : field_id_(field_id),
+          data_type_(data_type),
+          element_type_(element_type),
+          nested_path_(std::move(nested_path)),
+          nullable_(nullable) {
+    }
+
     bool
     operator==(const ColumnInfo& other) {
         if (field_id_ != other.field_id_) {
@@ -159,6 +171,19 @@ struct ColumnInfo {
         }
 
         return true;
+    }
+
+    bool
+    operator<(const ColumnInfo& other) const {
+        return std::tie(field_id_,
+                        data_type_,
+                        element_type_,
+                        nested_path_,
+                        nullable_) < std::tie(other.field_id_,
+                                              other.data_type_,
+                                              other.element_type_,
+                                              other.nested_path_,
+                                              other.nullable_);
     }
 
     std::string
@@ -353,7 +378,8 @@ class UnaryRangeFilterExpr : public ITypeFilterExpr {
         const ColumnInfo& column,
         proto::plan::OpType op_type,
         const proto::plan::GenericValue& val,
-        const std::vector<proto::plan::GenericValue>& extra_values)
+        const std::vector<proto::plan::GenericValue>& extra_values =
+            std::vector<proto::plan::GenericValue>{})
         : ITypeFilterExpr(),
           column_(column),
           op_type_(op_type),

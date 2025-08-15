@@ -42,6 +42,8 @@ namespace milvus {
 #define VEC_FIELD_DATA(data_array, type) \
     (data_array->vectors().type##_vector().data())
 
+using CheckDataValid = std::function<bool(size_t)>;
+
 inline DatasetPtr
 GenDataset(const int64_t nb, const int64_t dim, const void* xb) {
     return knowhere::GenDataSet(nb, dim, xb);
@@ -136,6 +138,14 @@ PostfixMatch(const std::string_view str, const std::string_view postfix) {
     return true;
 }
 
+inline bool
+InnerMatch(const std::string_view str, const std::string_view pattern) {
+    if (pattern.length() > str.length()) {
+        return false;
+    }
+    return str.find(pattern) != std::string::npos;
+}
+
 inline int64_t
 upper_align(int64_t value, int64_t align) {
     Assert(align > 0);
@@ -160,7 +170,8 @@ inline bool
 PositivelyRelated(const knowhere::MetricType& metric_type) {
     return IsMetricType(metric_type, knowhere::metric::IP) ||
            IsMetricType(metric_type, knowhere::metric::COSINE) ||
-           IsMetricType(metric_type, knowhere::metric::BM25);
+           IsMetricType(metric_type, knowhere::metric::BM25) ||
+           IsMetricType(metric_type, knowhere::metric::MHJACCARD);
 }
 
 inline std::string
@@ -216,6 +227,22 @@ GetCommonPrefix(const std::string& str1, const std::string& str2) {
     size_t i = 0;
     while (i < len && str1[i] == str2[i]) ++i;
     return str1.substr(0, i);
+}
+
+// Escape braces in the input string,
+// used for fmt::format json string
+inline std::string
+EscapeBraces(const std::string& input) {
+    std::string result;
+    for (char ch : input) {
+        if (ch == '{')
+            result += "{{";
+        else if (ch == '}')
+            result += "}}";
+        else
+            result += ch;
+    }
+    return result;
 }
 
 inline knowhere::sparse::SparseRow<float>

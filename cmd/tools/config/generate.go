@@ -233,11 +233,17 @@ func WriteYaml(w io.Writer) {
 		{
 			name: "mq",
 			header: `
-# Milvus supports four MQ: rocksmq(based on RockDB), natsmq(embedded nats-server), Pulsar and Kafka.
-# You can change your mq by setting mq.type field.
-# If you don't set mq.type field as default, there is a note about enabling priority if we config multiple mq in this file.
-# 1. standalone(local) mode: rocksmq(default) > natsmq > Pulsar > Kafka
-# 2. cluster mode:  Pulsar(default) > Kafka (rocksmq and natsmq is unsupported in cluster mode)`,
+# Milvus supports four message queues (MQ): rocksmq (based on RocksDB), Pulsar, Kafka, and Woodpecker.
+# You can change the MQ by setting the mq.type field.
+# If the mq.type field is not set, the following priority is used when multiple MQs are configured in this file:
+# 1. standalone (local) mode: rocksmq (default) > Pulsar > Kafka > Woodpecker
+# 2. cluster mode: Pulsar (default) > Kafka (rocksmq is unsupported in cluster mode) > Woodpecker
+# Note: These MQ priorities are compatible with existing instances. For new instances, it is recommended to explicitly use Woodpecker to achieve better performance, operational simplicity, and cost efficiency.`,
+		},
+		{
+			name: "woodpecker",
+			header: `
+# Related configuration of woodpecker, used to manage Milvus logs of recent mutation operations, output streaming log, and provide embedded log sequential read and write.`,
 		},
 		{
 			name: "pulsar",
@@ -253,10 +259,8 @@ func WriteYaml(w io.Writer) {
 			name: "rocksmq",
 		},
 		{
-			name: "natsmq",
-			header: `
-# natsmq configuration.
-# more detail: https://docs.nats.io/running-a-nats-service/configuration`,
+			name:   "mixCoord",
+			header: "\n# Related configuration of mixCoord",
 		},
 		{
 			name:   "rootCoord",
@@ -350,6 +354,25 @@ func WriteYaml(w io.Writer) {
 			name: "knowhere",
 			header: `
 # Any configuration related to the knowhere vector search engine`,
+		},
+		{
+			name: "credential",
+			header: `
+# credential configs, support apikey, AKSK, gcp credential
+# examples:
+# credential:
+#  your_apikey_crendential_name:
+#    apikey:  # Your apikey credential
+#  your_aksk_crendential_name:
+#    access_key_id:
+#    secret_access_key:
+#  your_gcp_credential_name:
+#    credential_json:`,
+		},
+		{
+			name: "function",
+			header: `
+# Any configuration related to functions`,
 		},
 	}
 	marshller := YamlMarshaller{w, groups, result}

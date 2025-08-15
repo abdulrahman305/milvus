@@ -16,18 +16,18 @@ import (
 )
 
 const (
-	mqTypeDefault = "default"
-	mqTypeNatsmq  = "natsmq"
-	mqTypeRocksmq = "rocksmq"
-	mqTypeKafka   = "kafka"
-	mqTypePulsar  = "pulsar"
+	mqTypeDefault    = "default"
+	mqTypeRocksmq    = "rocksmq"
+	mqTypeKafka      = "kafka"
+	mqTypePulsar     = "pulsar"
+	mqTypeWoodpecker = "woodpecker"
 )
 
 type mqEnable struct {
-	Rocksmq bool
-	Natsmq  bool
-	Pulsar  bool
-	Kafka   bool
+	Rocksmq    bool
+	Pulsar     bool
+	Kafka      bool
+	Woodpecker bool
 }
 
 // DefaultFactory is a factory that produces instances of storage.ChunkManager and message queue.
@@ -65,8 +65,8 @@ func NewFactory(standAlone bool) *DefaultFactory {
 // Init create a msg factory(TODO only support one mq at the same time.)
 // In order to guarantee backward compatibility of config file, we still support multiple mq configs.
 // The initialization of MQ follows the following rules, if the mq.type is default.
-// 1. standalone(local) mode: rocksmq(default) > natsmq > Pulsar > Kafka
-// 2. cluster mode:  Pulsar(default) > Kafka (rocksmq and natsmq is unsupported in cluster mode)
+// 1. standalone(local) mode: rocksmq(default) > Pulsar > Kafka
+// 2. cluster mode:  Pulsar(default) > Kafka (rocksmq is unsupported in cluster mode)
 func (f *DefaultFactory) Init(params *paramtable.ComponentParam) {
 	// skip if using default factory
 	if f.msgStreamFactory != nil {
@@ -82,19 +82,19 @@ func (f *DefaultFactory) Init(params *paramtable.ComponentParam) {
 }
 
 func (f *DefaultFactory) initMQ(standalone bool, params *paramtable.ComponentParam) error {
-	mqType := mustSelectMQType(standalone, params.MQCfg.Type.GetValue(), mqEnable{params.RocksmqEnable(), params.NatsmqEnable(), params.PulsarEnable(), params.KafkaEnable()})
+	mqType := mustSelectMQType(standalone, params.MQCfg.Type.GetValue(), mqEnable{params.RocksmqEnable(), params.PulsarEnable(), params.KafkaEnable(), params.WoodpeckerEnable()})
 	metrics.RegisterMQType(mqType)
 	log.Info("try to init mq", zap.Bool("standalone", standalone), zap.String("mqType", mqType))
 
 	switch mqType {
-	case mqTypeNatsmq:
-		f.msgStreamFactory = msgstream.NewNatsmqFactory()
 	case mqTypeRocksmq:
 		f.msgStreamFactory = msgstream.NewRocksmqFactory(params.RocksmqCfg.Path.GetValue(), &params.ServiceParam)
 	case mqTypePulsar:
 		f.msgStreamFactory = msgstream.NewPmsFactory(&params.ServiceParam)
 	case mqTypeKafka:
 		f.msgStreamFactory = msgstream.NewKmsFactory(&params.ServiceParam)
+	case mqTypeWoodpecker:
+		f.msgStreamFactory = msgstream.NewWpmsFactory(&params.ServiceParam)
 	}
 	if f.msgStreamFactory == nil {
 		return errors.New("failed to create MQ: check the milvus log for initialization failures")
@@ -122,16 +122,19 @@ func mustSelectMQType(standalone bool, mqType string, enable mqEnable) string {
 	if enable.Kafka {
 		return mqTypeKafka
 	}
+	if enable.Woodpecker {
+		return mqTypeWoodpecker
+	}
 
 	panic(errors.Errorf("no available mq config found, %s, enable: %+v", mqType, enable))
 }
 
 // Validate mq type.
 func validateMQType(standalone bool, mqType string) error {
-	if mqType != mqTypeNatsmq && mqType != mqTypeRocksmq && mqType != mqTypeKafka && mqType != mqTypePulsar {
+	if mqType != mqTypeRocksmq && mqType != mqTypeKafka && mqType != mqTypePulsar && mqType != mqTypeWoodpecker {
 		return errors.Newf("mq type %s is invalid", mqType)
 	}
-	if !standalone && (mqType == mqTypeRocksmq || mqType == mqTypeNatsmq) {
+	if !standalone && mqType == mqTypeRocksmq {
 		return errors.Newf("mq %s is only valid in standalone mode")
 	}
 	return nil
@@ -162,9 +165,6 @@ type Factory interface {
 func HealthCheck(mqType string) *common.MQClusterStatus {
 	clusterStatus := &common.MQClusterStatus{MqType: mqType}
 	switch mqType {
-	case mqTypeNatsmq:
-		// TODO: implement health check for nats mq
-		clusterStatus.Health = true
 	case mqTypeRocksmq:
 		// TODO: implement health checker for rocks mq
 		clusterStatus.Health = true
@@ -172,6 +172,9 @@ func HealthCheck(mqType string) *common.MQClusterStatus {
 		msgstream.PulsarHealthCheck(clusterStatus)
 	case mqTypeKafka:
 		msgstream.KafkaHealthCheck(clusterStatus)
+	case mqTypeWoodpecker:
+		// TODO: implement health checker for woodpecker
+		clusterStatus.Health = true
 	}
 	return clusterStatus
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/manager"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/idalloc"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -28,10 +27,10 @@ func OptETCD(etcd *clientv3.Client) optResourceInit {
 }
 
 // OptRootCoordClient provides the root coordinator client to the resource.
-func OptRootCoordClient(rootCoordClient *syncutil.Future[types.RootCoordClient]) optResourceInit {
+func OptMixCoordClient(mixCoordClient *syncutil.Future[types.MixCoordClient]) optResourceInit {
 	return func(r *resourceImpl) {
-		r.rootCoordClient = rootCoordClient
-		r.idAllocator = idalloc.NewIDAllocator(r.rootCoordClient)
+		r.mixCoordClient = mixCoordClient
+		r.idAllocator = idalloc.NewIDAllocator(r.mixCoordClient)
 	}
 }
 
@@ -52,14 +51,19 @@ func Init(opts ...optResourceInit) {
 		opt(newR)
 	}
 	assertNotNil(newR.IDAllocator())
-	assertNotNil(newR.RootCoordClient())
+	assertNotNil(newR.MixCoordClient())
 	assertNotNil(newR.ETCD())
 	assertNotNil(newR.StreamingCatalog())
-	if streamingutil.IsStreamingServiceEnabled() {
-		newR.streamingNodeManagerClient = manager.NewManagerClient(newR.etcdClient)
-		assertNotNil(newR.StreamingNodeManagerClient())
-	}
+	newR.streamingNodeManagerClient = manager.NewManagerClient(newR.etcdClient)
+	assertNotNil(newR.StreamingNodeManagerClient())
 	r = newR
+}
+
+// Release release the streamingnode client
+func Release() {
+	if r.streamingNodeManagerClient != nil {
+		r.streamingNodeManagerClient.Close()
+	}
 }
 
 // Resource access the underlying singleton of resources.
@@ -71,7 +75,7 @@ func Resource() *resourceImpl {
 // All utility on it is concurrent-safe and singleton.
 type resourceImpl struct {
 	idAllocator                idalloc.Allocator
-	rootCoordClient            *syncutil.Future[types.RootCoordClient]
+	mixCoordClient             *syncutil.Future[types.MixCoordClient]
 	etcdClient                 *clientv3.Client
 	streamingCatalog           metastore.StreamingCoordCataLog
 	streamingNodeManagerClient manager.ManagerClient
@@ -79,8 +83,8 @@ type resourceImpl struct {
 }
 
 // RootCoordClient returns the root coordinator client.
-func (r *resourceImpl) RootCoordClient() *syncutil.Future[types.RootCoordClient] {
-	return r.rootCoordClient
+func (r *resourceImpl) MixCoordClient() *syncutil.Future[types.MixCoordClient] {
+	return r.mixCoordClient
 }
 
 // IDAllocator returns the IDAllocator client.

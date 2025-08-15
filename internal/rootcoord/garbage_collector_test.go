@@ -18,24 +18,27 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	"google.golang.org/grpc"
 
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
+	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
 	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestGarbageCollectorCtx_ReDropCollection(t *testing.T) {
@@ -284,7 +287,7 @@ func TestGarbageCollectorCtx_RemoveCreatingCollection(t *testing.T) {
 		).Return(func(ctx context.Context, collectionID UniqueID, ts Timestamp) error {
 			removeCollectionCalled = true
 			removeCollectionChan <- struct{}{}
-			return fmt.Errorf("error mock RemoveCollection")
+			return errors.New("error mock RemoveCollection")
 		})
 
 		core := newTestCore(withTtSynchronizer(ticker), withMeta(meta), withTsoAllocator(tsoAllocator))
@@ -464,13 +467,13 @@ func TestGarbageCollector_RemoveCreatingPartition(t *testing.T) {
 				signal <- struct{}{}
 			})
 
-		qc := mocks.NewMockQueryCoordClient(t)
+		qc := mocks.NewMixCoord(t)
 		qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		core := newTestCore(withTtSynchronizer(ticker),
 			withMeta(meta),
 			withTsoAllocator(tsoAllocator),
-			withQueryCoord(qc))
+			withMixCoord(qc))
 		gc := newBgGarbageCollector(core)
 		core.ddlTsLockManager = newDdlTsLockManager(tsoAllocator)
 		core.garbageCollector = gc
@@ -489,17 +492,17 @@ func TestGarbageCollector_RemoveCreatingPartition(t *testing.T) {
 		signal := make(chan struct{}, 1)
 		meta := mockrootcoord.NewIMetaTable(t)
 
-		qc := mocks.NewMockQueryCoordClient(t)
-		qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything, mock.Anything).
-			Return(merr.Success(), fmt.Errorf("mock err")).
-			Run(func(ctx context.Context, req *querypb.ReleasePartitionsRequest, opts ...grpc.CallOption) {
+		qc := mocks.NewMixCoord(t)
+		qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything).
+			Return(merr.Success(), errors.New("mock err")).
+			Run(func(ctx context.Context, req *querypb.ReleasePartitionsRequest) {
 				signal <- struct{}{}
 			})
 
 		core := newTestCore(withTtSynchronizer(ticker),
 			withMeta(meta),
 			withTsoAllocator(tsoAllocator),
-			withQueryCoord(qc))
+			withMixCoord(qc))
 		gc := newBgGarbageCollector(core)
 		core.ddlTsLockManager = newDdlTsLockManager(tsoAllocator)
 		core.garbageCollector = gc
@@ -518,18 +521,18 @@ func TestGarbageCollector_RemoveCreatingPartition(t *testing.T) {
 		signal := make(chan struct{}, 1)
 		meta := mockrootcoord.NewIMetaTable(t)
 		meta.EXPECT().RemovePartition(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(fmt.Errorf("mock err")).
+			Return(errors.New("mock err")).
 			Run(func(ctx context.Context, dbID, collectionID int64, partitionID int64, ts uint64) {
 				signal <- struct{}{}
 			})
 
-		qc := mocks.NewMockQueryCoordClient(t)
-		qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		qc := mocks.NewMixCoord(t)
+		qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		core := newTestCore(withTtSynchronizer(ticker),
 			withMeta(meta),
 			withTsoAllocator(tsoAllocator),
-			withQueryCoord(qc))
+			withMixCoord(qc))
 		gc := newBgGarbageCollector(core)
 		core.ddlTsLockManager = newDdlTsLockManager(tsoAllocator)
 		core.garbageCollector = gc
@@ -546,8 +549,26 @@ func TestGcPartitionData(t *testing.T) {
 	streamingutil.SetStreamingServiceEnabled()
 	defer streamingutil.UnsetStreamingServiceEnabled()
 
+	snmanager.ResetStreamingNodeManager()
+	b := mock_balancer.NewMockBalancer(t)
+	b.EXPECT().WatchChannelAssignments(mock.Anything, mock.Anything).Run(
+		func(ctx context.Context, cb func(typeutil.VersionInt64Pair, []types.PChannelInfoAssigned) error) {
+			<-ctx.Done()
+		})
+	b.EXPECT().RegisterStreamingEnabledNotifier(mock.Anything).Run(func(notifier *syncutil.AsyncTaskNotifier[struct{}]) {
+		notifier.Cancel()
+	})
+	snmanager.StaticStreamingNodeManager.SetBalancerReady(b)
+
 	wal := mock_streaming.NewMockWALAccesser(t)
-	wal.EXPECT().AppendMessages(mock.Anything, mock.Anything, mock.Anything).Return(streaming.AppendResponses{})
+	broadcast := mock_streaming.NewMockBroadcast(t)
+	broadcast.EXPECT().Append(mock.Anything, mock.Anything).Return(&types.BroadcastAppendResult{
+		BroadcastID: 0,
+		AppendResults: map[string]*types.AppendResult{
+			"ch-0": {},
+		},
+	}, nil)
+	wal.EXPECT().Broadcast().Return(broadcast)
 	streaming.SetWALForTest(wal)
 
 	tsoAllocator := mocktso.NewAllocator(t)

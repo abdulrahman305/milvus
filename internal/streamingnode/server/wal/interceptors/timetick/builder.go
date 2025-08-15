@@ -3,7 +3,6 @@ package timetick
 import (
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/txn"
 )
 
 var _ interceptors.InterceptorBuilder = (*interceptorBuilder)(nil)
@@ -19,13 +18,13 @@ func NewInterceptorBuilder() interceptors.InterceptorBuilder {
 type interceptorBuilder struct{}
 
 // Build implements Builder.
-func (b *interceptorBuilder) Build(param interceptors.InterceptorBuildParam) interceptors.Interceptor {
+func (b *interceptorBuilder) Build(param *interceptors.InterceptorBuildParam) interceptors.Interceptor {
 	operator := newTimeTickSyncOperator(param)
 	// initialize operation can be async to avoid block the build operation.
-	go operator.initialize()
 	resource.Resource().TimeTickInspector().RegisterSyncOperator(operator)
+
 	return &timeTickAppendInterceptor{
 		operator:   operator,
-		txnManager: txn.NewTxnManager(param.WALImpls.Channel()),
+		txnManager: param.TxnManager,
 	}
 }

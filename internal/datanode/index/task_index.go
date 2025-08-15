@@ -23,11 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/datanode/util"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
@@ -135,6 +135,10 @@ func (it *indexBuildTask) OnEnqueue(ctx context.Context) error {
 	return nil
 }
 
+func (it *indexBuildTask) GetSlot() int64 {
+	return it.req.GetTaskSlot()
+}
+
 func (it *indexBuildTask) PreExecute(ctx context.Context) error {
 	it.queueDur = it.tr.RecordSpan()
 	log.Ctx(ctx).Info("Begin to prepare indexBuildTask", zap.Int64("buildID", it.req.GetBuildID()),
@@ -186,7 +190,7 @@ func (it *indexBuildTask) PreExecute(ctx context.Context) error {
 			var err error
 			it.req.Dim, err = strconv.ParseInt(dimStr, 10, 64)
 			if err != nil {
-				log.Ctx(ctx).Error("parse dimesion failed", zap.Error(err))
+				log.Ctx(ctx).Error("parse dimension failed", zap.Error(err))
 				// ignore error
 			}
 		}
@@ -219,34 +223,12 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 
 	indexType := it.newIndexParams[common.IndexTypeKey]
 	var fieldDataSize uint64
+	var err error
 	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexType) {
-		// check index node support disk index
-		if !paramtable.Get().DataNodeCfg.EnableDisk.GetAsBool() {
-			log.Warn("don't support build disk index",
-				zap.String("index type", it.newIndexParams[common.IndexTypeKey]),
-				zap.Bool("enable disk", paramtable.Get().DataNodeCfg.EnableDisk.GetAsBool()))
-			return errors.New("index node don't support build disk index")
-		}
-
-		// check load size and size of field data
-		localUsedSize, err := indexcgowrapper.GetLocalUsedSize(paramtable.Get().LocalStorageCfg.Path.GetValue())
-		if err != nil {
-			log.Warn("get local used size failed")
-			return err
-		}
 		fieldDataSize, err = estimateFieldDataSize(it.req.GetDim(), it.req.GetNumRows(), it.req.GetField().GetDataType())
 		if err != nil {
 			log.Warn("get local used size failed")
 			return err
-		}
-		usedLocalSizeWhenBuild := int64(float64(fieldDataSize)*DiskUsageRatio) + localUsedSize
-		maxUsedLocalSize := int64(paramtable.Get().DataNodeCfg.DiskCapacityLimit.GetAsFloat() * paramtable.Get().DataNodeCfg.MaxDiskUsagePercentage.GetAsFloat())
-
-		if usedLocalSizeWhenBuild > maxUsedLocalSize {
-			log.Warn("don't has enough disk size to build disk ann index",
-				zap.Int64("usedLocalSizeWhenBuild", usedLocalSizeWhenBuild),
-				zap.Int64("maxUsedLocalSize", maxUsedLocalSize))
-			return errors.New("index node don't has enough disk size to build disk ann index")
 		}
 
 		err = indexparams.SetDiskIndexBuildParams(it.newIndexParams, int64(fieldDataSize))
@@ -311,10 +293,21 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 		IndexStorePath:            it.req.GetIndexStorePath(),
 		OptFields:                 optFields,
 		PartitionKeyIsolation:     it.req.GetPartitionKeyIsolation(),
+		LackBinlogRows:            it.req.GetLackBinlogRows(),
+		StorageVersion:            it.req.GetStorageVersion(),
 	}
 
-	log.Info("debug create index", zap.Any("buildIndexParams", buildIndexParams))
-	var err error
+	if buildIndexParams.StorageVersion == storage.StorageV2 {
+		buildIndexParams.SegmentInsertFiles = util.GetSegmentInsertFiles(
+			it.req.GetInsertLogs(),
+			it.req.GetStorageConfig(),
+			it.req.GetCollectionID(),
+			it.req.GetPartitionID(),
+			it.req.GetSegmentID())
+	}
+
+	log.Info("create index", zap.Any("buildIndexParams", buildIndexParams))
+
 	it.index, err = indexcgowrapper.CreateIndex(ctx, buildIndexParams)
 	if err != nil {
 		if it.index != nil && it.index.CleanLocalData() != nil {

@@ -63,7 +63,7 @@ func (f walImplsTestFramework) Run() {
 	wg.Add(pchannelCnt)
 	for i := 0; i < pchannelCnt; i++ {
 		// construct pChannel
-		name := fmt.Sprintf("test_%d_%s", i, randString(4))
+		name := fmt.Sprintf("test_%d_%s", i, randString(10))
 		go func(name string) {
 			defer wg.Done()
 			newTestOneWALImpls(f.t, o, name, f.messageCount).Run()
@@ -125,8 +125,39 @@ func (f *testOneWALImplsFramework) Run() {
 		assert.Panics(f.t, func() {
 			w.Append(ctx, nil)
 		})
+		assert.Panics(f.t, func() {
+			w.Truncate(ctx, nil)
+		})
 		w.Close()
 	}
+
+	// Test truncate on a wal that is not in read-write mode.
+	pChannel := types.PChannelInfo{
+		Name:       f.pchannel,
+		Term:       int64(f.term),
+		AccessMode: types.AccessModeRW,
+	}
+	// crea
+	w, err := f.opener.Open(ctx, &OpenOption{
+		Channel: pChannel,
+	})
+	assert.NoError(f.t, err)
+	f.testTruncate(ctx, w)
+	w.Close()
+	w, err = f.opener.Open(ctx, &OpenOption{
+		Channel: pChannel,
+	})
+	assert.NoError(f.t, err)
+	w.Close()
+}
+
+// testTruncate tests the truncate function of walimpls.
+func (f *testOneWALImplsFramework) testTruncate(ctx context.Context, w WALImpls) {
+	msgID, err := w.Append(ctx, message.CreateTestEmptyInsertMesage(0, map[string]string{}))
+	assert.NoError(f.t, err)
+	assert.NotNil(f.t, msgID)
+	err = w.Truncate(ctx, msgID)
+	assert.NoError(f.t, err)
 }
 
 func (f *testOneWALImplsFramework) testReadAndWrite(ctx context.Context, w WALImpls) {
@@ -156,6 +187,7 @@ func (f *testOneWALImplsFramework) testReadAndWrite(ctx context.Context, w WALIm
 	}()
 
 	wg.Wait()
+	f.testReadWithFastClose(ctx, w)
 
 	f.assertSortedMessageList(read1)
 	f.assertSortedMessageList(read2)
@@ -277,6 +309,25 @@ func (f *testOneWALImplsFramework) testAppend(ctx context.Context, w WALImpls) (
 	assert.NoError(f.t, err)
 	ids[f.messageCount-1] = msg.IntoImmutableMessage(id)
 	return ids, nil
+}
+
+func (f *testOneWALImplsFramework) testReadWithFastClose(ctx context.Context, w WALImpls) {
+	wg := sync.WaitGroup{}
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		name := fmt.Sprintf("scanner-fast-close-%d", i)
+		go func() {
+			defer wg.Done()
+			s, err := w.Read(ctx, ReadOption{
+				Name:                name,
+				DeliverPolicy:       options.DeliverPolicyAll(),
+				ReadAheadBufferSize: 128,
+			})
+			assert.NoError(f.t, err)
+			s.Close()
+		}()
+	}
+	wg.Wait()
 }
 
 func (f *testOneWALImplsFramework) testRead(ctx context.Context, w ROWALImpls, name string) ([]message.ImmutableMessage, error) {

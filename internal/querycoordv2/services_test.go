@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
@@ -220,6 +221,17 @@ func (suite *ServiceSuite) SetupTest() {
 		proxyClientManager:  suite.proxyManager,
 	}
 
+	// Initialize checkerController to prevent nil pointer dereference in handleNodeUp
+	suite.server.checkerController = checkers.NewCheckerController(
+		suite.meta,
+		suite.dist,
+		suite.targetMgr,
+		suite.nodeMgr,
+		suite.taskScheduler,
+		suite.broker,
+		suite.server.getBalancerFunc,
+	)
+
 	suite.server.registerMetricsRequest()
 	suite.server.UpdateStateCode(commonpb.StateCode_Healthy)
 
@@ -234,7 +246,7 @@ func (suite *ServiceSuite) TestShowCollections() {
 
 	// Test get all collections
 	req := &querypb.ShowCollectionsRequest{}
-	resp, err := server.ShowCollections(ctx, req)
+	resp, err := server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	suite.Len(resp.CollectionIDs, collectionNum)
@@ -245,7 +257,7 @@ func (suite *ServiceSuite) TestShowCollections() {
 	// Test get 1 collection
 	collection := suite.collections[0]
 	req.CollectionIDs = []int64{collection}
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	suite.Len(resp.CollectionIDs, 1)
@@ -256,7 +268,7 @@ func (suite *ServiceSuite) TestShowCollections() {
 	err = suite.meta.CollectionManager.RemoveCollection(ctx, collection)
 	suite.NoError(err)
 	meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_InsufficientMemoryToLoad, resp.GetStatus().GetErrorCode())
 	meta.GlobalFailedLoadCache.Remove(collection)
@@ -265,7 +277,7 @@ func (suite *ServiceSuite) TestShowCollections() {
 
 	// Test when server is not healthy
 	server.UpdateStateCode(commonpb.StateCode_Initializing)
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -283,7 +295,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 		req := &querypb.ShowPartitionsRequest{
 			CollectionID: collection,
 		}
-		resp, err := server.ShowPartitions(ctx, req)
+		resp, err := server.ShowLoadPartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.Len(resp.PartitionIDs, partitionNum)
@@ -296,7 +308,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 			CollectionID: collection,
 			PartitionIDs: partitions[0:1],
 		}
-		resp, err = server.ShowPartitions(ctx, req)
+		resp, err = server.ShowLoadPartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.Len(resp.PartitionIDs, 1)
@@ -310,7 +322,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 			err = suite.meta.CollectionManager.RemoveCollection(ctx, collection)
 			suite.NoError(err)
 			meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-			resp, err = server.ShowPartitions(ctx, req)
+			resp, err = server.ShowLoadPartitions(ctx, req)
 			suite.NoError(err)
 			err := merr.CheckRPCCall(resp, err)
 			assert.True(suite.T(), errors.Is(err, merr.ErrPartitionNotLoaded))
@@ -323,7 +335,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 			err = suite.meta.CollectionManager.RemovePartition(ctx, collection, partitionID)
 			suite.NoError(err)
 			meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-			resp, err = server.ShowPartitions(ctx, req)
+			resp, err = server.ShowLoadPartitions(ctx, req)
 			suite.NoError(err)
 			err := merr.CheckRPCCall(resp, err)
 			assert.True(suite.T(), errors.Is(err, merr.ErrPartitionNotLoaded))
@@ -338,7 +350,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 		CollectionID: suite.collections[0],
 	}
 	server.UpdateStateCode(commonpb.StateCode_Initializing)
-	resp, err := server.ShowPartitions(ctx, req)
+	resp, err := server.ShowLoadPartitions(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -380,6 +392,58 @@ func (suite *ServiceSuite) TestLoadCollection() {
 	resp, err := server.LoadCollection(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetCode(), merr.Code(merr.ErrServiceNotReady))
+}
+
+func (suite *ServiceSuite) TestLoadCollectionWithUserSpecifiedReplicaMode() {
+	mockey.PatchConvey("TestLoadCollectionWithUserSpecifiedReplicaMode", suite.T(), func() {
+		ctx := context.Background()
+		server := suite.server
+		collectionID := suite.collections[0]
+
+		// Mock broker methods using mockey
+		mockey.Mock(mockey.GetMethod(suite.broker, "DescribeCollection")).Return(nil, nil).Build()
+		suite.expectGetRecoverInfo(collectionID)
+
+		// Test when user specifies replica number - should set IsUserSpecifiedReplicaMode to true
+		req := &querypb.LoadCollectionRequest{
+			CollectionID:  collectionID,
+			ReplicaNumber: 2, // User specified replica number
+		}
+		resp, err := server.LoadCollection(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		// Verify that IsUserSpecifiedReplicaMode is set to true
+		collection := suite.meta.GetCollection(ctx, collectionID)
+		suite.NotNil(collection)
+		suite.True(collection.UserSpecifiedReplicaMode)
+	})
+}
+
+func (suite *ServiceSuite) TestLoadCollectionWithoutUserSpecifiedReplicaMode() {
+	mockey.PatchConvey("TestLoadCollectionWithoutUserSpecifiedReplicaMode", suite.T(), func() {
+		ctx := context.Background()
+		server := suite.server
+		collectionID := suite.collections[0]
+
+		// Mock broker methods using mockey
+		mockey.Mock(mockey.GetMethod(suite.broker, "DescribeCollection")).Return(nil, nil).Build()
+		suite.expectGetRecoverInfo(collectionID)
+
+		// Test when user doesn't specify replica number - should not set IsUserSpecifiedReplicaMode
+		req := &querypb.LoadCollectionRequest{
+			CollectionID:  collectionID,
+			ReplicaNumber: 0, // No user specified replica number
+		}
+		resp, err := server.LoadCollection(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		// Verify that IsUserSpecifiedReplicaMode is not set to true
+		collection := suite.meta.GetCollection(ctx, collectionID)
+		suite.NotNil(collection)
+		suite.False(collection.UserSpecifiedReplicaMode)
+	})
 }
 
 func (suite *ServiceSuite) TestResourceGroup() {
@@ -958,6 +1022,62 @@ func (suite *ServiceSuite) TestLoadPartitionFailed() {
 	}
 }
 
+func (suite *ServiceSuite) TestLoadPartitionsWithUserSpecifiedReplicaMode() {
+	mockey.PatchConvey("TestLoadPartitionsWithUserSpecifiedReplicaMode", suite.T(), func() {
+		ctx := context.Background()
+		server := suite.server
+		collectionID := suite.collections[0]
+		partitionIDs := suite.partitions[collectionID]
+
+		// Mock broker methods using mockey
+		mockey.Mock(mockey.GetMethod(suite.broker, "DescribeCollection")).Return(nil, nil).Build()
+		suite.expectGetRecoverInfo(collectionID)
+
+		// Test when user specifies replica number - should set IsUserSpecifiedReplicaMode to true
+		req := &querypb.LoadPartitionsRequest{
+			CollectionID:  collectionID,
+			PartitionIDs:  partitionIDs,
+			ReplicaNumber: 3, // User specified replica number
+		}
+		resp, err := server.LoadPartitions(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		// Verify that IsUserSpecifiedReplicaMode is set to true
+		collection := suite.meta.GetCollection(ctx, collectionID)
+		suite.NotNil(collection)
+		suite.True(collection.UserSpecifiedReplicaMode)
+	})
+}
+
+func (suite *ServiceSuite) TestLoadPartitionsWithoutUserSpecifiedReplicaMode() {
+	mockey.PatchConvey("TestLoadPartitionsWithoutUserSpecifiedReplicaMode", suite.T(), func() {
+		ctx := context.Background()
+		server := suite.server
+		collectionID := suite.collections[0]
+		partitionIDs := suite.partitions[collectionID]
+
+		// Mock broker methods using mockey
+		mockey.Mock(mockey.GetMethod(suite.broker, "DescribeCollection")).Return(nil, nil).Build()
+		suite.expectGetRecoverInfo(collectionID)
+
+		// Test when user doesn't specify replica number - should not set IsUserSpecifiedReplicaMode
+		req := &querypb.LoadPartitionsRequest{
+			CollectionID:  collectionID,
+			PartitionIDs:  partitionIDs,
+			ReplicaNumber: 0, // No user specified replica number
+		}
+		resp, err := server.LoadPartitions(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		// Verify that IsUserSpecifiedReplicaMode is not set to true
+		collection := suite.meta.GetCollection(ctx, collectionID)
+		suite.NotNil(collection)
+		suite.False(collection.UserSpecifiedReplicaMode)
+	})
+}
+
 func (suite *ServiceSuite) TestReleaseCollection() {
 	suite.loadAll()
 	ctx := context.Background()
@@ -1131,7 +1251,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 		req := &querypb.GetSegmentInfoRequest{
 			CollectionID: collection,
 		}
-		resp, err := server.GetSegmentInfo(ctx, req)
+		resp, err := server.GetLoadSegmentInfo(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.assertSegments(collection, resp.GetInfos())
@@ -1143,7 +1263,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 			CollectionID: collection,
 			SegmentIDs:   suite.getAllSegments(collection),
 		}
-		resp, err := server.GetSegmentInfo(ctx, req)
+		resp, err := server.GetLoadSegmentInfo(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.assertSegments(collection, resp.GetInfos())
@@ -1154,7 +1274,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 	req := &querypb.GetSegmentInfoRequest{
 		CollectionID: suite.collections[0],
 	}
-	resp, err := server.GetSegmentInfo(ctx, req)
+	resp, err := server.GetLoadSegmentInfo(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -1701,7 +1821,6 @@ func (suite *ServiceSuite) TestGetShardLeadersFailed() {
 		for _, node := range suite.nodes {
 			suite.dist.SegmentDistManager.Update(node)
 			suite.dist.ChannelDistManager.Update(node)
-			suite.dist.LeaderViewManager.Update(node)
 		}
 		suite.updateChannelDistWithoutSegment(ctx, collection)
 		suite.fetchHeartbeats(time.Now())
@@ -1712,7 +1831,7 @@ func (suite *ServiceSuite) TestGetShardLeadersFailed() {
 
 	// channel not subscribed
 	for _, node := range suite.nodes {
-		suite.dist.LeaderViewManager.Update(node)
+		suite.dist.ChannelDistManager.Update(node)
 	}
 	for _, collection := range suite.collections {
 		req := &querypb.GetShardLeadersRequest{
@@ -1799,6 +1918,7 @@ func (suite *ServiceSuite) loadAll() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.jobScheduler.Add(job)
 			err := job.Wait()
@@ -1823,6 +1943,7 @@ func (suite *ServiceSuite) loadAll() {
 				suite.targetObserver,
 				suite.collectionObserver,
 				suite.nodeMgr,
+				false,
 			)
 			suite.jobScheduler.Add(job)
 			err := job.Wait()
@@ -1955,20 +2076,26 @@ func (suite *ServiceSuite) updateChannelDist(ctx context.Context, collection int
 	for _, replica := range replicas {
 		i := 0
 		for _, node := range suite.sortInt64(replica.GetNodes()) {
-			suite.dist.ChannelDistManager.Update(node, meta.DmChannelFromVChannel(&datapb.VchannelInfo{
-				CollectionID: collection,
-				ChannelName:  channels[i],
-			}))
-			suite.dist.LeaderViewManager.Update(node, &meta.LeaderView{
-				ID:           node,
-				CollectionID: collection,
-				Channel:      channels[i],
-				Segments: lo.SliceToMap(segments, func(segment int64) (int64, *querypb.SegmentDist) {
-					return segment, &querypb.SegmentDist{
-						NodeID:  node,
-						Version: time.Now().Unix(),
-					}
-				}),
+			suite.dist.ChannelDistManager.Update(node, &meta.DmChannel{
+				VchannelInfo: &datapb.VchannelInfo{
+					CollectionID: collection,
+					ChannelName:  channels[i],
+				},
+				Node: node,
+				View: &meta.LeaderView{
+					ID:           node,
+					CollectionID: collection,
+					Channel:      channels[i],
+					Segments: lo.SliceToMap(segments, func(segment int64) (int64, *querypb.SegmentDist) {
+						return segment, &querypb.SegmentDist{
+							NodeID:  node,
+							Version: time.Now().Unix(),
+						}
+					}),
+					Status: &querypb.LeaderViewStatus{
+						Serviceable: true,
+					},
+				},
 			})
 			i++
 			if i >= len(channels) {
@@ -1992,15 +2119,17 @@ func (suite *ServiceSuite) updateChannelDistWithoutSegment(ctx context.Context, 
 	for _, replica := range replicas {
 		i := 0
 		for _, node := range suite.sortInt64(replica.GetNodes()) {
-			suite.dist.ChannelDistManager.Update(node, meta.DmChannelFromVChannel(&datapb.VchannelInfo{
-				CollectionID: collection,
-				ChannelName:  channels[i],
-			}))
-			suite.dist.LeaderViewManager.Update(node, &meta.LeaderView{
-				ID:                 node,
-				CollectionID:       collection,
-				Channel:            channels[i],
-				UnServiceableError: merr.ErrSegmentLack,
+			suite.dist.ChannelDistManager.Update(node, &meta.DmChannel{
+				VchannelInfo: &datapb.VchannelInfo{
+					CollectionID: collection,
+					ChannelName:  channels[i],
+				},
+				Node: node,
+				View: &meta.LeaderView{
+					ID:           node,
+					CollectionID: collection,
+					Channel:      channels[i],
+				},
 			})
 			i++
 			if i >= len(channels) {

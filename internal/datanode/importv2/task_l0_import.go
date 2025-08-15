@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -32,11 +31,12 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/importutilv2"
 	"github.com/milvus-io/milvus/internal/util/importutilv2/binlog"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -61,8 +61,8 @@ func NewL0ImportTask(req *datapb.ImportRequest,
 	cm storage.ChunkManager,
 ) Task {
 	ctx, cancel := context.WithCancel(context.Background())
-	// Setting end as math.MaxInt64 to incrementally allocate logID.
-	alloc := allocator.NewLocalAllocator(req.GetIDRange().GetBegin(), math.MaxInt64)
+	// Allocator for autoIDs and logIDs.
+	alloc := allocator.NewLocalAllocator(req.GetIDRange().GetBegin(), req.GetIDRange().GetEnd())
 	task := &L0ImportTask{
 		ImportTaskV2: &datapb.ImportTaskV2{
 			JobID:        req.GetJobID(),
@@ -100,7 +100,12 @@ func (t *L0ImportTask) GetSchema() *schemapb.CollectionSchema {
 }
 
 func (t *L0ImportTask) GetSlots() int64 {
-	return 1
+	return t.req.GetTaskSlot()
+}
+
+// L0 import task buffer size is fixed
+func (t *L0ImportTask) GetBufferSize() int64 {
+	return paramtable.Get().DataNodeCfg.ImportBaseBufferSize.GetAsInt64()
 }
 
 func (t *L0ImportTask) Cancel() {
@@ -123,37 +128,52 @@ func (t *L0ImportTask) Clone() Task {
 		cancel:       cancel,
 		segmentsInfo: infos,
 		req:          t.req,
+		allocator:    t.allocator,
+		manager:      t.manager,
+		syncMgr:      t.syncMgr,
+		cm:           t.cm,
 		metaCaches:   t.metaCaches,
 	}
 }
 
 func (t *L0ImportTask) Execute() []*conc.Future[any] {
-	bufferSize := paramtable.Get().DataNodeCfg.ReadBufferSizeInMB.GetAsInt() * 1024 * 1024
+	bufferSize := int(t.GetBufferSize())
 	log.Info("start to import l0", WrapLogFields(t,
 		zap.Int("bufferSize", bufferSize),
-		zap.Any("schema", t.GetSchema()))...)
+		zap.Int64("taskSlot", t.GetSlots()),
+		zap.Any("files", t.req.GetFiles()),
+		zap.Any("schema", t.GetSchema()),
+	)...)
 	t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
 
-	fn := func() (err error) {
+	req := t.req
+
+	fn := func(file *internalpb.ImportFile) (err error) {
 		defer func() {
 			if err != nil {
-				log.Warn("l0 import task execute failed", WrapLogFields(t, zap.Error(err))...)
-				t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+				var reason string = err.Error()
+				if len(t.req.GetFiles()) == 1 {
+					reason = fmt.Sprintf("error: %v, file: %s", err, t.req.GetFiles()[0].String())
+				}
+				log.Warn("l0 import task execute failed", WrapLogFields(t, zap.Any("file", t.req.GetFiles()), zap.String("err", reason))...)
+				t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			}
 		}()
 
-		if len(t.req.GetFiles()) != 1 {
-			err = merr.WrapErrImportFailed(
-				fmt.Sprintf("there should be one prefix for l0 import, but got %v", t.req.GetFiles()))
-			return
-		}
 		var pkField *schemapb.FieldSchema
 		pkField, err = typeutil.GetPrimaryFieldSchema(t.GetSchema())
 		if err != nil {
 			return
 		}
+
+		// Parse ts parameters from options
+		tsStart, tsEnd, err := importutilv2.ParseTimeRange(t.req.GetOptions())
+		if err != nil {
+			return
+		}
+
 		var reader binlog.L0Reader
-		reader, err = binlog.NewL0Reader(t.ctx, t.cm, pkField, t.req.GetFiles()[0], bufferSize)
+		reader, err = binlog.NewL0Reader(t.ctx, t.cm, pkField, file, bufferSize, tsStart, tsEnd)
 		if err != nil {
 			return
 		}
@@ -163,16 +183,21 @@ func (t *L0ImportTask) Execute() []*conc.Future[any] {
 			return
 		}
 		log.Info("l0 import done", WrapLogFields(t,
-			zap.Strings("l0 prefix", t.req.GetFiles()[0].GetPaths()),
+			zap.Strings("l0 prefix", file.GetPaths()),
 			zap.Duration("dur", time.Since(start)))...)
 		return nil
 	}
 
-	f := GetExecPool().Submit(func() (any, error) {
-		err := fn()
-		return err, err
-	})
-	return []*conc.Future[any]{f}
+	futures := make([]*conc.Future[any], 0, len(req.GetFiles()))
+	for _, file := range req.GetFiles() {
+		file := file
+		f := GetExecPool().Submit(func() (any, error) {
+			err := fn(file)
+			return err, err
+		})
+		futures = append(futures, f)
+	}
+	return futures
 }
 
 func (t *L0ImportTask) importL0(reader binlog.L0Reader) error {
@@ -227,11 +252,12 @@ func (t *L0ImportTask) syncDelete(delData []*storage.DeleteData) ([]*conc.Future
 			return nil, nil, err
 		}
 		syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
-			segmentID, partitionID, t.GetCollectionID(), channel, nil, data, nil)
+			segmentID, partitionID, t.GetCollectionID(), channel, nil, data,
+			nil, t.req.GetStorageVersion(), t.req.GetStorageConfig())
 		if err != nil {
 			return nil, nil, err
 		}
-		future, err := t.syncMgr.SyncData(t.ctx, syncTask)
+		future, err := t.syncMgr.SyncDataWithChunkManager(t.ctx, syncTask, t.cm)
 		if err != nil {
 			log.Ctx(context.TODO()).Error("failed to sync l0 delete data", WrapLogFields(t, zap.Error(err))...)
 			return nil, nil, err

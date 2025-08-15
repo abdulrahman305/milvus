@@ -10,26 +10,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/remeh/sizedwaitgroup"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/mocks/mock_metastore"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/lock"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/redo"
-	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/segment"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/timetick"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/registry"
 	internaltypes "github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/idalloc"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/walimplstest"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
@@ -43,14 +47,18 @@ type walTestFramework struct {
 	messageCount int
 }
 
+func TestFencedError(t *testing.T) {
+	assert.True(t, errors.IsAny(errors.Mark(errors.New("test"), walimpls.ErrFenced), context.Canceled, walimpls.ErrFenced))
+	assert.True(t, errors.IsAny(errors.Wrap(walimpls.ErrFenced, "some message"), context.Canceled, walimpls.ErrFenced))
+}
+
 func TestWAL(t *testing.T) {
 	initResourceForTest(t)
 	b := registry.MustGetBuilder(walimplstest.WALName,
 		redo.NewInterceptorBuilder(),
-		// TODO: current flusher interceptor cannot work well with the walimplstest.
-		// flusher.NewInterceptorBuilder(),
+		lock.NewInterceptorBuilder(),
 		timetick.NewInterceptorBuilder(),
-		segment.NewInterceptorBuilder(),
+		shard.NewInterceptorBuilder(),
 	)
 	f := &walTestFramework{
 		b:            b,
@@ -69,23 +77,18 @@ func initResourceForTest(t *testing.T) {
 	rc := idalloc.NewMockRootCoordClient(t)
 	rc.EXPECT().GetPChannelInfo(mock.Anything, mock.Anything).Return(&rootcoordpb.GetPChannelInfoResponse{}, nil)
 
-	fRootCoordClient := syncutil.NewFuture[internaltypes.RootCoordClient]()
-	fRootCoordClient.Set(rc)
-
-	dc := mocks.NewMockDataCoordClient(t)
-	dc.EXPECT().AllocSegment(mock.Anything, mock.Anything).Return(&datapb.AllocSegmentResponse{}, nil)
-
-	fDataCoordClient := syncutil.NewFuture[internaltypes.DataCoordClient]()
-	fDataCoordClient.Set(dc)
-
 	catalog := mock_metastore.NewMockStreamingNodeCataLog(t)
+	catalog.EXPECT().GetConsumeCheckpoint(mock.Anything, mock.Anything).Return(nil, nil)
+	catalog.EXPECT().SaveConsumeCheckpoint(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	catalog.EXPECT().ListSegmentAssignment(mock.Anything, mock.Anything).Return(nil, nil)
-	catalog.EXPECT().SaveSegmentAssignments(mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
+	catalog.EXPECT().SaveSegmentAssignments(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	catalog.EXPECT().ListVChannel(mock.Anything, mock.Anything).Return(nil, nil)
+	catalog.EXPECT().SaveVChannels(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	fMixCoordClient := syncutil.NewFuture[internaltypes.MixCoordClient]()
+	fMixCoordClient.Set(rc)
 	resource.InitForTest(
 		t,
-		resource.OptRootCoordClient(fRootCoordClient),
-		resource.OptDataCoordClient(fDataCoordClient),
+		resource.OptMixCoordClient(fMixCoordClient),
 		resource.OptStreamingNodeCatalog(catalog),
 	)
 }
@@ -136,49 +139,99 @@ func (f *testOneWALFramework) Run() {
 			Name: f.pchannel,
 			Term: int64(f.term),
 		}
-		w, err := f.opener.Open(ctx, &wal.OpenOption{
-			Channel: pChannel,
+		rwWAL, err := f.opener.Open(ctx, &wal.OpenOption{
+			Channel:        pChannel,
+			DisableFlusher: true,
 		})
 		assert.NoError(f.t, err)
-		assert.NotNil(f.t, w)
-		assert.Equal(f.t, pChannel.Name, w.Channel().Name)
+		assert.NotNil(f.t, rwWAL)
+		assert.Equal(f.t, pChannel.Name, rwWAL.Channel().Name)
+		// TODO: add test here after remove the flusher component.
+		// metrics := rwWAL.Metrics()
 
-		f.testReadAndWrite(ctx, w)
+		pChannel.AccessMode = types.AccessModeRO
+		roWAL, err := f.opener.Open(ctx, &wal.OpenOption{
+			Channel:        pChannel,
+			DisableFlusher: true,
+		})
+		assert.NoError(f.t, err)
+		metrics := roWAL.Metrics()
+		_ = metrics.(types.ROWALMetrics)
+		f.testReadAndWrite(ctx, rwWAL, roWAL)
 		// close the wal
-		w.Close()
+		roWAL.Close()
+		walimplstest.EnableFenced(pChannel.Name)
+
+		// create collection before start test
+		createMsg := message.NewCreateCollectionMessageBuilderV1().
+			WithHeader(&message.CreateCollectionMessageHeader{
+				CollectionId: 100,
+				PartitionIds: []int64{200},
+			}).
+			WithBody(&msgpb.CreateCollectionRequest{}).
+			WithVChannel(testVChannel).
+			MustBuildMutable()
+
+		result, err := rwWAL.Append(ctx, createMsg)
+		assert.Nil(f.t, result)
+		assert.True(f.t, status.AsStreamingError(err).IsFenced())
+		walimplstest.DisableFenced(pChannel.Name)
+		rwWAL.Close()
 	}
 }
 
-func (f *testOneWALFramework) testReadAndWrite(ctx context.Context, w wal.WAL) {
-	f.testSendCreateCollection(ctx, w)
-	defer f.testSendDropCollection(ctx, w)
+func (f *testOneWALFramework) testReadAndWrite(ctx context.Context, rwWAL wal.WAL, roWAL wal.ROWAL) {
+	f.testSendCreateCollection(ctx, rwWAL)
+	defer f.testSendDropCollection(ctx, rwWAL)
 
 	// Test read and write.
 	wg := sync.WaitGroup{}
-	wg.Add(3)
+	wg.Add(5)
 
 	var newWritten []message.ImmutableMessage
-	var read1, read2 []message.ImmutableMessage
+	var read1, read2, read3 []message.ImmutableMessage
 	appendDone := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		lastMVCC, err := rwWAL.GetLatestMVCCTimestamp(context.Background(), testVChannel)
+		assert.NoError(f.t, err)
+		for {
+			select {
+			case <-appendDone:
+				return
+			case <-time.After(time.Duration(rand.Int31n(100)) * time.Millisecond):
+				newMVCC, err := rwWAL.GetLatestMVCCTimestamp(context.Background(), testVChannel)
+				assert.NoError(f.t, err)
+				assert.GreaterOrEqual(f.t, newMVCC, lastMVCC)
+				lastMVCC = newMVCC
+			}
+		}
+	}()
 	go func() {
 		defer func() {
 			close(appendDone)
 			wg.Done()
 		}()
 		var err error
-		newWritten, err = f.testAppend(ctx, w)
+		newWritten, err = f.testAppend(ctx, rwWAL)
 		assert.NoError(f.t, err)
 	}()
 	go func() {
 		defer wg.Done()
 		var err error
-		read1, err = f.testRead(ctx, w)
+		read1, err = f.testRead(ctx, rwWAL)
 		assert.NoError(f.t, err)
 	}()
 	go func() {
 		defer wg.Done()
 		var err error
-		read2, err = f.testRead(ctx, w)
+		read3, err = f.testRead(ctx, roWAL)
+		assert.NoError(f.t, err)
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		read2, err = f.testRead(ctx, rwWAL)
 		assert.NoError(f.t, err)
 	}()
 	wg.Wait()
@@ -186,17 +239,29 @@ func (f *testOneWALFramework) testReadAndWrite(ctx context.Context, w wal.WAL) {
 	// read result should be sorted by timetick.
 	f.assertSortByTimeTickMessageList(read1)
 	f.assertSortByTimeTickMessageList(read2)
+	f.assertSortByTimeTickMessageList(read3)
 
 	// all written messages should be read.
 	sort.Sort(sortByMessageID(newWritten))
 	f.written = append(f.written, newWritten...)
 	sort.Sort(sortByMessageID(read1))
 	sort.Sort(sortByMessageID(read2))
+	sort.Sort(sortByMessageID(read3))
 	f.assertEqualMessageList(f.written, read1)
 	f.assertEqualMessageList(f.written, read2)
+	f.assertEqualMessageList(f.written, read3)
 
 	// test read with option
-	f.testReadWithOption(ctx, w)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		f.testReadWithOption(ctx, rwWAL)
+	}()
+	go func() {
+		defer wg.Done()
+		f.testReadWithOption(ctx, roWAL)
+	}()
+	wg.Wait()
 }
 
 func (f *testOneWALFramework) testSendCreateCollection(ctx context.Context, w wal.WAL) {
@@ -230,9 +295,13 @@ func (f *testOneWALFramework) testSendDropCollection(ctx context.Context, w wal.
 		BuildMutable()
 	assert.NoError(f.t, err)
 
-	msgID, err := w.Append(ctx, dropMsg)
-	assert.NoError(f.t, err)
-	assert.NotNil(f.t, msgID)
+	done := make(chan struct{})
+	w.AppendAsync(ctx, dropMsg, func(ar *wal.AppendResult, err error) {
+		assert.NoError(f.t, err)
+		assert.NotNil(f.t, ar)
+		close(done)
+	})
+	<-done
 }
 
 func (f *testOneWALFramework) testAppend(ctx context.Context, w wal.WAL) ([]message.ImmutableMessage, error) {
@@ -259,8 +328,7 @@ func (f *testOneWALFramework) testAppend(ctx context.Context, w wal.WAL) ([]mess
 				assert.NotNil(f.t, appendResult)
 
 				immutableMsg := msg.IntoImmutableMessage(appendResult.MessageID)
-				begin, err := message.AsImmutableBeginTxnMessageV2(immutableMsg)
-				assert.NoError(f.t, err)
+				begin := message.MustAsImmutableBeginTxnMessageV2(immutableMsg)
 				b := message.NewImmutableTxnMessageBuilder(begin)
 				txnCtx := appendResult.TxnCtx
 				for i := 0; i < int(rand.Int31n(5)); i++ {
@@ -343,7 +411,7 @@ func (f *testOneWALFramework) testAppend(ctx context.Context, w wal.WAL) ([]mess
 	return messages, nil
 }
 
-func (f *testOneWALFramework) testRead(ctx context.Context, w wal.WAL) ([]message.ImmutableMessage, error) {
+func (f *testOneWALFramework) testRead(ctx context.Context, w wal.ROWAL) ([]message.ImmutableMessage, error) {
 	s, err := w.Read(ctx, wal.ReadOption{
 		VChannel:      testVChannel,
 		DeliverPolicy: options.DeliverPolicyAll(),
@@ -359,6 +427,7 @@ func (f *testOneWALFramework) testRead(ctx context.Context, w wal.WAL) ([]messag
 	cnt := 5
 	for {
 		msg, ok := <-s.Chan()
+		log.Info("read message", zap.Uint64("msg", msg.TimeTick()))
 		// make a random slow down to trigger cache expire.
 		if rand.Int31n(10) == 0 && cnt > 0 {
 			cnt--
@@ -385,7 +454,7 @@ func (f *testOneWALFramework) testRead(ctx context.Context, w wal.WAL) ([]messag
 	return msgs, nil
 }
 
-func (f *testOneWALFramework) testReadWithOption(ctx context.Context, w wal.WAL) {
+func (f *testOneWALFramework) testReadWithOption(ctx context.Context, w wal.ROWAL) {
 	loopCount := 5
 	wg := sync.WaitGroup{}
 	wg.Add(loopCount)

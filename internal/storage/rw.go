@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	sio "io"
+	"path"
 	"sort"
 
 	"github.com/samber/lo"
@@ -29,7 +30,9 @@ import (
 	"github.com/milvus-io/milvus/internal/storagecommon"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -42,21 +45,59 @@ type (
 	uploaderFn   func(ctx context.Context, kvs map[string][]byte) error
 )
 
+// rwOp is enum alias for rwOption op field.
+type rwOp int32
+
+const (
+	OpWrite rwOp = 0
+	OpRead  rwOp = 1
+)
+
 type rwOptions struct {
 	version             int64
+	op                  rwOp
 	bufferSize          int64
 	downloader          downloaderFn
 	uploader            uploaderFn
 	multiPartUploadSize int64
 	columnGroups        []storagecommon.ColumnGroup
+	storageConfig       *indexpb.StorageConfig
+	neededFields        typeutil.Set[int64]
+}
+
+func (o *rwOptions) validate() error {
+	if o.storageConfig == nil {
+		return merr.WrapErrServiceInternal("storage config is nil")
+	}
+	if o.op == OpWrite && o.uploader == nil {
+		return merr.WrapErrServiceInternal("uploader is nil for writer")
+	}
+	switch o.version {
+	case StorageV1:
+		if o.op == OpRead && o.downloader == nil {
+			return merr.WrapErrServiceInternal("downloader is nil for v1 reader")
+		}
+	case StorageV2:
+	default:
+		return merr.WrapErrServiceInternal(fmt.Sprintf("unsupported storage version %d", o.version))
+	}
+	return nil
 }
 
 type RwOption func(*rwOptions)
 
-func DefaultRwOptions() *rwOptions {
+func DefaultWriterOptions() *rwOptions {
 	return &rwOptions{
 		bufferSize:          packed.DefaultWriteBufferSize,
 		multiPartUploadSize: packed.DefaultMultiPartUploadSize,
+		op:                  OpWrite,
+	}
+}
+
+func DefaultReaderOptions() *rwOptions {
+	return &rwOptions{
+		bufferSize: packed.DefaultReadBufferSize,
+		op:         OpRead,
 	}
 }
 
@@ -93,6 +134,18 @@ func WithUploader(uploader func(ctx context.Context, kvs map[string][]byte) erro
 func WithColumnGroups(columnGroups []storagecommon.ColumnGroup) RwOption {
 	return func(options *rwOptions) {
 		options.columnGroups = columnGroups
+	}
+}
+
+func WithStorageConfig(storageConfig *indexpb.StorageConfig) RwOption {
+	return func(options *rwOptions) {
+		options.storageConfig = storageConfig
+	}
+}
+
+func WithNeededFields(neededFields typeutil.Set[int64]) RwOption {
+	return func(options *rwOptions) {
+		options.neededFields = neededFields
 	}
 }
 
@@ -167,44 +220,69 @@ func makeBlobsReader(ctx context.Context, binlogs []*datapb.FieldBinlog, downloa
 	}, nil
 }
 
-func NewBinlogRecordReader(ctx context.Context, binlogs []*datapb.FieldBinlog, schema *schemapb.CollectionSchema, option ...RwOption) (RecordReader, error) {
-	rwOptions := DefaultRwOptions()
+func NewBinlogRecordReader(ctx context.Context, binlogs []*datapb.FieldBinlog, schema *schemapb.CollectionSchema, option ...RwOption) (rr RecordReader, err error) {
+	rwOptions := DefaultReaderOptions()
 	for _, opt := range option {
 		opt(rwOptions)
 	}
+	if err := rwOptions.validate(); err != nil {
+		return nil, err
+	}
 	switch rwOptions.version {
 	case StorageV1:
-		blobsReader, err := makeBlobsReader(ctx, binlogs, rwOptions.downloader)
+		var blobsReader ChunkedBlobsReader
+		blobsReader, err = makeBlobsReader(ctx, binlogs, rwOptions.downloader)
 		if err != nil {
 			return nil, err
 		}
-		return newCompositeBinlogRecordReader(schema, blobsReader)
+
+		rr, err = newCompositeBinlogRecordReader(schema, blobsReader)
 	case StorageV2:
 		if len(binlogs) <= 0 {
 			return nil, sio.EOF
 		}
+		sort.Slice(binlogs, func(i, j int) bool {
+			return binlogs[i].GetFieldID() < binlogs[j].GetFieldID()
+		})
 		binlogLists := lo.Map(binlogs, func(fieldBinlog *datapb.FieldBinlog, _ int) []*datapb.Binlog {
 			return fieldBinlog.GetBinlogs()
 		})
+		bucketName := rwOptions.storageConfig.BucketName
 		paths := make([][]string, len(binlogLists[0]))
 		for _, binlogs := range binlogLists {
 			for j, binlog := range binlogs {
-				paths[j] = append(paths[j], binlog.GetLogPath())
+				logPath := binlog.GetLogPath()
+				if rwOptions.storageConfig.StorageType != "local" {
+					logPath = path.Join(bucketName, logPath)
+				}
+				paths[j] = append(paths[j], logPath)
 			}
 		}
-		return newPackedRecordReader(paths, schema, rwOptions.bufferSize)
+		rr, err = newPackedRecordReader(paths, schema, rwOptions.bufferSize, rwOptions.storageConfig)
+	default:
+		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("unsupported storage version %d", rwOptions.version))
 	}
-	return nil, merr.WrapErrServiceInternal(fmt.Sprintf("unsupported storage version %d", rwOptions.version))
+	if err != nil {
+		return nil, err
+	}
+	if rwOptions.neededFields != nil {
+		rr.SetNeededFields(rwOptions.neededFields)
+	}
+	return rr, nil
 }
 
 func NewBinlogRecordWriter(ctx context.Context, collectionID, partitionID, segmentID UniqueID,
-	schema *schemapb.CollectionSchema, allocator allocator.Interface, chunkSize uint64, rootPath string, maxRowNum int64,
+	schema *schemapb.CollectionSchema, allocator allocator.Interface, chunkSize uint64, maxRowNum int64,
 	option ...RwOption,
 ) (BinlogRecordWriter, error) {
-	rwOptions := DefaultRwOptions()
+	rwOptions := DefaultWriterOptions()
 	for _, opt := range option {
 		opt(rwOptions)
 	}
+	if err := rwOptions.validate(); err != nil {
+		return nil, err
+	}
+
 	blobsWriter := func(blobs []*Blob) error {
 		kvs := make(map[string][]byte, len(blobs))
 		for _, blob := range blobs {
@@ -214,13 +292,15 @@ func NewBinlogRecordWriter(ctx context.Context, collectionID, partitionID, segme
 	}
 	switch rwOptions.version {
 	case StorageV1:
+		rootPath := rwOptions.storageConfig.GetRootPath()
 		return newCompositeBinlogRecordWriter(collectionID, partitionID, segmentID, schema,
 			blobsWriter, allocator, chunkSize, rootPath, maxRowNum,
 		)
 	case StorageV2:
 		return newPackedBinlogRecordWriter(collectionID, partitionID, segmentID, schema,
-			blobsWriter, allocator, chunkSize, rootPath, maxRowNum,
+			blobsWriter, allocator, maxRowNum,
 			rwOptions.bufferSize, rwOptions.multiPartUploadSize, rwOptions.columnGroups,
+			rwOptions.storageConfig,
 		)
 	}
 	return nil, merr.WrapErrServiceInternal(fmt.Sprintf("unsupported storage version %d", rwOptions.version))

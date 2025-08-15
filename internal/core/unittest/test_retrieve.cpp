@@ -14,8 +14,8 @@
 #include "common/Types.h"
 #include "knowhere/comp/index_param.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/storage_test_utils.h"
 #include "test_utils/GenExprProto.h"
-#include "plan/PlanNode.h"
 
 using namespace milvus;
 using namespace milvus::segcore;
@@ -61,11 +61,10 @@ TEST_P(RetrieveTest, AutoID) {
     auto choose = [=](int i) { return i * 3 % N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<proto::plan::GenericValue> values;
     for (int i = 0; i < req_size; ++i) {
         proto::plan::GenericValue val;
@@ -119,11 +118,10 @@ TEST_P(RetrieveTest, AutoID2) {
     auto choose = [=](int i) { return i * 3 % N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<proto::plan::GenericValue> values;
     {
         for (int i = 0; i < req_size; ++i) {
@@ -180,11 +178,10 @@ TEST_P(RetrieveTest, NotExist) {
     auto choose2 = [=](int i) { return i * 3 % N + 3 * N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<proto::plan::GenericValue> values;
     {
         for (int i = 0; i < req_size; ++i) {
@@ -245,7 +242,7 @@ TEST_P(RetrieveTest, Empty) {
 
     auto segment = CreateSealedSegment(schema);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<proto::plan::GenericValue> values;
     {
         for (int i = 0; i < req_size; ++i) {
@@ -290,10 +287,9 @@ TEST_P(RetrieveTest, Limit) {
 
     int64_t N = 101;
     auto dataset = DataGen(schema, N, 42);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     proto::plan::GenericValue unary_val;
     unary_val.set_int64_val(0);
     auto expr = std::make_shared<expr::UnaryRangeFilterExpr>(
@@ -339,9 +335,8 @@ TEST_P(RetrieveTest, FillEntry) {
 
     int64_t N = 101;
     auto dataset = DataGen(schema, N, 42);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     proto::plan::GenericValue unary_val;
     unary_val.set_int64_val(0);
     auto expr = std::make_shared<expr::UnaryRangeFilterExpr>(
@@ -383,11 +378,10 @@ TEST_P(RetrieveTest, LargeTimestamp) {
     auto choose = [=](int i) { return i * choose_sep % N; };
     uint64_t ts_offset = 100;
     auto dataset = DataGen(schema, N, 42, ts_offset + 1);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<proto::plan::GenericValue> values;
     {
         for (int i = 0; i < req_size; ++i) {
@@ -452,12 +446,11 @@ TEST_P(RetrieveTest, Delete) {
     auto choose = [=](int i) { return i; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
     auto ts_col = dataset.get_col<int64_t>(fid_ts);
 
-    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
     std::vector<int64_t> timestamps;
     for (int i = 0; i < req_size; ++i) {
         timestamps.emplace_back(ts_col[choose(i)]);
@@ -535,10 +528,7 @@ TEST_P(RetrieveTest, Delete) {
     auto ids = std::make_unique<IdArray>();
     ids->mutable_int_id()->mutable_data()->Add(new_pks.begin(), new_pks.end());
     std::vector<idx_t> new_timestamps{10, 10, 10, 10, 10, 10};
-    auto reserved_offset = segment->get_deleted_count();
-    ASSERT_EQ(reserved_offset, row_count);
-    segment->Delete(reserved_offset,
-                    new_count,
+    segment->Delete(new_count,
                     ids.get(),
                     reinterpret_cast<const Timestamp*>(new_timestamps.data()));
 

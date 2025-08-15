@@ -19,7 +19,6 @@ package rootcoord
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 
 	"github.com/cockroachdb/errors"
@@ -30,6 +29,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
@@ -43,7 +43,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -75,7 +74,12 @@ func (t *createCollectionTask) validate(ctx context.Context) error {
 
 	// 1. check shard number
 	shardsNum := t.Req.GetShardsNum()
-	cfgMaxShardNum := Params.RootCoordCfg.DmlChannelNum.GetAsInt32()
+	var cfgMaxShardNum int32
+	if Params.CommonCfg.PreCreatedTopicEnabled.GetAsBool() {
+		cfgMaxShardNum = int32(len(Params.CommonCfg.TopicNames.GetAsStrings()))
+	} else {
+		cfgMaxShardNum = Params.RootCoordCfg.DmlChannelNum.GetAsInt32()
+	}
 	if shardsNum > cfgMaxShardNum {
 		return fmt.Errorf("shard num (%d) exceeds max configuration (%d)", shardsNum, cfgMaxShardNum)
 	}
@@ -139,108 +143,13 @@ func (t *createCollectionTask) checkMaxCollectionsPerDB(ctx context.Context, db2
 		if err != nil {
 			log.Ctx(ctx).Warn("parse value of property fail", zap.String("key", common.DatabaseMaxCollectionsKey),
 				zap.String("value", maxColNumPerDBStr), zap.Error(err))
-			return fmt.Errorf(fmt.Sprintf("parse value of property fail, key:%s, value:%s", common.DatabaseMaxCollectionsKey, maxColNumPerDBStr))
+			return fmt.Errorf("parse value of property fail, key:%s, value:%s", common.DatabaseMaxCollectionsKey, maxColNumPerDBStr)
 		}
 		return check(maxColNumPerDB)
 	}
 
 	maxColNumPerDB := Params.QuotaConfig.MaxCollectionNumPerDB.GetAsInt()
 	return check(maxColNumPerDB)
-}
-
-func checkFieldSchema(schema *schemapb.CollectionSchema) error {
-	for _, fieldSchema := range schema.Fields {
-		if fieldSchema.GetNullable() && typeutil.IsVectorType(fieldSchema.GetDataType()) {
-			msg := fmt.Sprintf("vector type not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
-			return merr.WrapErrParameterInvalidMsg(msg)
-		}
-		if fieldSchema.GetNullable() && fieldSchema.IsPrimaryKey {
-			msg := fmt.Sprintf("primary field not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
-			return merr.WrapErrParameterInvalidMsg(msg)
-		}
-		if fieldSchema.GetDefaultValue() != nil {
-			if fieldSchema.IsPrimaryKey {
-				msg := fmt.Sprintf("primary field not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
-				return merr.WrapErrParameterInvalidMsg(msg)
-			}
-			dtype := fieldSchema.GetDataType()
-			if dtype == schemapb.DataType_Array || dtype == schemapb.DataType_JSON || typeutil.IsVectorType(dtype) {
-				msg := fmt.Sprintf("type not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
-				return merr.WrapErrParameterInvalidMsg(msg)
-			}
-			errTypeMismatch := func(fieldName, fieldType, defaultValueType string) error {
-				msg := fmt.Sprintf("type (%s) of field (%s) is not equal to the type(%s) of default_value", fieldType, fieldName, defaultValueType)
-				return merr.WrapErrParameterInvalidMsg(msg)
-			}
-			switch fieldSchema.GetDefaultValue().Data.(type) {
-			case *schemapb.ValueField_BoolData:
-				if dtype != schemapb.DataType_Bool {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Bool")
-				}
-			case *schemapb.ValueField_IntData:
-				if dtype != schemapb.DataType_Int32 && dtype != schemapb.DataType_Int16 && dtype != schemapb.DataType_Int8 {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int")
-				}
-				defaultValue := fieldSchema.GetDefaultValue().GetIntData()
-				if dtype == schemapb.DataType_Int16 {
-					if defaultValue > math.MaxInt16 || defaultValue < math.MinInt16 {
-						return merr.WrapErrParameterInvalidRange(math.MinInt16, math.MaxInt16, defaultValue, "default value out of range")
-					}
-				}
-				if dtype == schemapb.DataType_Int8 {
-					if defaultValue > math.MaxInt8 || defaultValue < math.MinInt8 {
-						return merr.WrapErrParameterInvalidRange(math.MinInt8, math.MaxInt8, defaultValue, "default value out of range")
-					}
-				}
-			case *schemapb.ValueField_LongData:
-				if dtype != schemapb.DataType_Int64 {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int64")
-				}
-			case *schemapb.ValueField_FloatData:
-				if dtype != schemapb.DataType_Float {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Float")
-				}
-			case *schemapb.ValueField_DoubleData:
-				if dtype != schemapb.DataType_Double {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Double")
-				}
-			case *schemapb.ValueField_StringData:
-				if dtype != schemapb.DataType_VarChar {
-					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_VarChar")
-				}
-				maxLength, err := parameterutil.GetMaxLength(fieldSchema)
-				if err != nil {
-					return err
-				}
-				defaultValueLength := len(fieldSchema.GetDefaultValue().GetStringData())
-				if int64(defaultValueLength) > maxLength {
-					msg := fmt.Sprintf("the length (%d) of string exceeds max length (%d)", defaultValueLength, maxLength)
-					return merr.WrapErrParameterInvalid("valid length string", "string length exceeds max length", msg)
-				}
-			default:
-				panic("default value unsupport data type")
-			}
-		}
-		if err := checkDupKvPairs(fieldSchema.GetTypeParams(), "type"); err != nil {
-			return err
-		}
-		if err := checkDupKvPairs(fieldSchema.GetIndexParams(), "index"); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func checkDupKvPairs(params []*commonpb.KeyValuePair, paramType string) error {
-	set := typeutil.NewSet[string]()
-	for _, kv := range params {
-		if set.Contain(kv.GetKey()) {
-			return merr.WrapErrParameterInvalidMsg("duplicated %s param key \"%s\"", paramType, kv.GetKey())
-		}
-		set.Insert(kv.GetKey())
-	}
-	return nil
 }
 
 func hasSystemFields(schema *schemapb.CollectionSchema, systemFields []string) bool {
@@ -252,15 +161,6 @@ func hasSystemFields(schema *schemapb.CollectionSchema, systemFields []string) b
 	return false
 }
 
-func validateFieldDataType(schema *schemapb.CollectionSchema) error {
-	for _, field := range schema.GetFields() {
-		if _, ok := schemapb.DataType_name[int32(field.GetDataType())]; !ok || field.GetDataType() == schemapb.DataType_None {
-			return merr.WrapErrParameterInvalid("valid field", fmt.Sprintf("field data type: %s is not supported", field.GetDataType()))
-		}
-	}
-	return nil
-}
-
 func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schemapb.CollectionSchema) error {
 	log.Ctx(ctx).With(zap.String("CollectionName", t.Req.CollectionName))
 	if t.Req.GetCollectionName() != schema.GetName() {
@@ -269,7 +169,11 @@ func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schem
 		return merr.WrapErrParameterInvalid("collection name matches schema name", "don't match", msg)
 	}
 
-	if err := checkFieldSchema(schema); err != nil {
+	if err := checkFieldSchema(schema.GetFields()); err != nil {
+		return err
+	}
+
+	if err := checkStructArrayFieldSchema(schema.GetStructArrayFields()); err != nil {
 		return err
 	}
 
@@ -281,14 +185,32 @@ func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schem
 		msg := fmt.Sprintf("schema contains system field: %s, %s, %s", RowIDFieldName, TimeStampFieldName, MetaFieldName)
 		return merr.WrapErrParameterInvalid("schema don't contains system field", "contains", msg)
 	}
-	return validateFieldDataType(schema)
+
+	if err := validateStructArrayFieldDataType(schema.GetStructArrayFields()); err != nil {
+		return err
+	}
+
+	return validateFieldDataType(schema.GetFields())
 }
 
 func (t *createCollectionTask) assignFieldAndFunctionID(schema *schemapb.CollectionSchema) error {
 	name2id := map[string]int64{}
-	for idx, field := range schema.GetFields() {
+	idx := 0
+	for _, field := range schema.GetFields() {
 		field.FieldID = int64(idx + StartOfUserFieldID)
+		idx++
+
 		name2id[field.GetName()] = field.GetFieldID()
+	}
+
+	for _, structArrayField := range schema.GetStructArrayFields() {
+		structArrayField.FieldID = int64(idx + StartOfUserFieldID)
+		idx++
+
+		for _, field := range structArrayField.GetFields() {
+			field.FieldID = int64(idx + StartOfUserFieldID)
+			idx++
+		}
 	}
 
 	for fidx, function := range schema.GetFunctions() {
@@ -311,6 +233,7 @@ func (t *createCollectionTask) assignFieldAndFunctionID(schema *schemapb.Collect
 			function.OutputFieldIds[idx] = fieldId
 		}
 	}
+
 	return nil
 }
 
@@ -521,6 +444,19 @@ func (t *createCollectionTask) addChannelsAndGetStartPositions(ctx context.Conte
 }
 
 func (t *createCollectionTask) broadcastCreateCollectionMsgIntoStreamingService(ctx context.Context, ts uint64) (map[string][]byte, error) {
+	notifier := snmanager.NewStreamingReadyNotifier()
+	if err := snmanager.StaticStreamingNodeManager.RegisterStreamingEnabledListener(ctx, notifier); err != nil {
+		return nil, err
+	}
+	if !notifier.IsReady() {
+		// streaming service is not ready, so we send it into msgstream.
+		defer notifier.Release()
+		msg := t.genCreateCollectionMsg(ctx, ts)
+		return t.core.chanTimeTick.broadcastMarkDmlChannels(t.channels.physicalChannels, msg)
+	}
+	// streaming service is ready, so we release the ready notifier and send it into streaming service.
+	notifier.Release()
+
 	req := t.genCreateCollectionRequest()
 	// dispatch the createCollectionMsg into all vchannel.
 	msgs := make([]message.MutableMessage, 0, len(req.VirtualChannelNames))
@@ -602,6 +538,7 @@ func (t *createCollectionTask) Execute(ctx context.Context) error {
 		Description:          t.schema.Description,
 		AutoID:               t.schema.AutoID,
 		Fields:               model.UnmarshalFieldModels(t.schema.Fields),
+		StructArrayFields:    model.UnmarshalStructArrayFieldModels(t.schema.StructArrayFields),
 		Functions:            model.UnmarshalFunctionModels(t.schema.Functions),
 		VirtualChannelNames:  vchanNames,
 		PhysicalChannelNames: chanNames,
@@ -709,13 +646,14 @@ func executeCreateCollectionTaskSteps(ctx context.Context,
 			vChannels:      col.VirtualChannelNames,
 			startPositions: col.StartPositions,
 			schema: &schemapb.CollectionSchema{
-				Name:        col.Name,
-				DbName:      col.DBName,
-				Description: col.Description,
-				AutoID:      col.AutoID,
-				Fields:      model.MarshalFieldModels(col.Fields),
-				Properties:  col.Properties,
-				Functions:   model.MarshalFunctionModels(col.Functions),
+				Name:              col.Name,
+				DbName:            col.DBName,
+				Description:       col.Description,
+				AutoID:            col.AutoID,
+				Fields:            model.MarshalFieldModels(col.Fields),
+				StructArrayFields: model.MarshalStructArrayFieldModels(col.StructArrayFields),
+				Properties:        col.Properties,
+				Functions:         model.MarshalFunctionModels(col.Functions),
 			},
 			dbProperties: dbProperties,
 		},

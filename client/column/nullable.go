@@ -16,11 +16,6 @@
 
 package column
 
-import (
-	"github.com/cockroachdb/errors"
-	"github.com/samber/lo"
-)
-
 var (
 	// scalars
 	NewNullableColumnBool      NullableColumnCreateFunc[bool, *ColumnBool]        = NewNullableColumnCreator(NewColumnBool).New
@@ -47,33 +42,32 @@ var (
 type NullableColumnCreateFunc[T any, Col interface {
 	Column
 	Data() []T
-}] func(name string, values []T, validData []bool) (Col, error)
+}] func(name string, values []T, validData []bool, opts ...ColumnOption[T]) (Col, error)
 
 type NullableColumnCreator[col interface {
 	Column
 	withValidData([]bool)
+	base() *genericColumnBase[T]
 }, T any] struct {
 	base func(name string, values []T) col
 }
 
-func (c NullableColumnCreator[col, T]) New(name string, values []T, validData []bool) (col, error) {
-	var result col
-	validCnt := lo.CountBy(validData, func(v bool) bool {
-		return v
-	})
-	if validCnt != len(values) {
-		return result, errors.Newf("values number(%d) does not match valid count(%d)", len(values), validCnt)
+func (c NullableColumnCreator[col, T]) New(name string, values []T, validData []bool, opts ...ColumnOption[T]) (col, error) {
+	result := c.base(name, values)
+	result.withValidData(validData)
+	base := result.base()
+
+	for _, opt := range opts {
+		opt(base)
 	}
 
-	result = c.base(name, values)
-	result.withValidData(validData)
-
-	return result, nil
+	return result, result.ValidateNullable()
 }
 
 func NewNullableColumnCreator[col interface {
 	Column
 	withValidData([]bool)
+	base() *genericColumnBase[T]
 }, T any](base func(name string, values []T) col) NullableColumnCreator[col, T] {
 	return NullableColumnCreator[col, T]{
 		base: base,

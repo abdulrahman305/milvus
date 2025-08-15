@@ -1,13 +1,14 @@
 import sys
+import time
 from typing import Optional
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, DataType
 
 sys.path.append("..")
 from check.func_check import ResponseChecker
 from utils.api_request import api_request
 from utils.wrapper import trace
 from utils.util_log import test_log as log
-from common import common_func as cf
+from common import common_func as cf, common_type as ct
 from base.client_base import Base
 
 TIMEOUT = 120
@@ -29,7 +30,7 @@ class TestMilvusClientV2Base(Base):
         }
         self.async_milvus_client_wrap.init_async_client(**kwargs)
 
-    def _client(self, active_trace=False):
+    def _client(self, active_trace=False, **kwargs):
         """ return MilvusClient instance if connected successfully, otherwise return None"""
         if self.skip_connection:
             return None
@@ -37,7 +38,7 @@ class TestMilvusClientV2Base(Base):
             uri = cf.param_info.param_uri
         else:
             uri = "http://" + cf.param_info.param_host + ":" + str(cf.param_info.param_port)
-        res, is_succ = self.init_milvus_client(uri=uri, token=cf.param_info.param_token, active_trace=active_trace)
+        res, is_succ = self.init_milvus_client(uri=uri, token=cf.param_info.param_token, active_trace=active_trace, **kwargs)
         if is_succ:
             # self.milvus_client = res
             log.info(f"server version: {res.get_server_version()}")
@@ -72,12 +73,31 @@ class TestMilvusClientV2Base(Base):
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        **kwargs).run()
         return res, check_result
+    
+    @trace()
+    def add_field(self, schema, field_name, datatype, check_task=None, check_items=None, **kwargs):
+
+        # Set default parameters for specific field types
+        if datatype == DataType.VARCHAR and 'max_length' not in kwargs:
+            kwargs['max_length'] = ct.default_length
+        elif datatype == DataType.ARRAY:
+            if 'element_type' not in kwargs:
+                kwargs['element_type'] = DataType.INT64
+            if 'max_capacity' not in kwargs:
+                kwargs['max_capacity'] = ct.default_max_capacity
+
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([schema.add_field, field_name, datatype], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
+                                       **kwargs).run()
+        return res, check_result
+    
 
     @trace()
     def create_collection(self, client, collection_name, dimension=None, primary_field_name='id',
                           id_type='int', vector_field_name='vector', metric_type='COSINE',
-                          auto_id=False, schema=None, index_params=None, timeout=None, check_task=None,
-                          check_items=None, **kwargs):
+                          auto_id=False, schema=None, index_params=None, timeout=None, force_teardown=True,
+                          check_task=None, check_items=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         consistency_level = kwargs.get("consistency_level", "Strong")
         kwargs.update({"consistency_level": consistency_level})
@@ -89,8 +109,9 @@ class TestMilvusClientV2Base(Base):
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        collection_name=collection_name, dimension=dimension,
                                        **kwargs).run()
-
-        self.tear_down_collection_names.append(collection_name)
+        if force_teardown:
+            # if running with collection-shared-mode, please not teardown here, but do it in the specific test class
+            self.tear_down_collection_names.append(collection_name)
         return res, check_result
 
     def has_collection(self, client, collection_name, timeout=None, check_task=None,
@@ -306,6 +327,8 @@ class TestMilvusClientV2Base(Base):
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        collection_name=collection_name,
                                        **kwargs).run()
+        if check_result is True and collection_name in self.tear_down_collection_names:
+            self.tear_down_collection_names.remove(collection_name)
         return res, check_result
 
     @trace()
@@ -353,6 +376,18 @@ class TestMilvusClientV2Base(Base):
 
         func_name = sys._getframe().f_code.co_name
         res, check = api_request([client.load_collection, collection_name], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task,
+                                       check_items, check,
+                                       collection_name=collection_name, **kwargs).run()
+        return res, check_result
+
+    @trace()
+    def refresh_load(self, client, collection_name, timeout=None, check_task=None, check_items=None, **kwargs):
+        timeout = TIMEOUT if timeout is None else timeout
+        kwargs.update({"timeout": timeout})
+
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([client.refresh_load, collection_name], **kwargs)
         check_result = ResponseChecker(res, func_name, check_task,
                                        check_items, check,
                                        collection_name=collection_name, **kwargs).run()
@@ -544,18 +579,15 @@ class TestMilvusClientV2Base(Base):
                                        **kwargs).run()
         return res, check_result
 
-    @trace()
-    def list_indexes(self, client, collection_name, timeout=None, check_task=None, check_items=None, **kwargs):
+    def wait_for_index_ready(self, client, collection_name, index_name, timeout=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
-        kwargs.update({"timeout": timeout})
-
-        func_name = sys._getframe().f_code.co_name
-        res, check = api_request([client.list_indexes, collection_name], **kwargs)
-        check_result = ResponseChecker(res, func_name, check_task,
-                                       check_items, check,
-                                       collection_name=collection_name,
-                                       **kwargs).run()
-        return res, check_result
+        start_time = time.time()
+        while start_time + timeout > time.time():
+            index_info, _ = self.describe_index(client, collection_name, index_name, **kwargs)
+            if index_info.get("pending_index_rows", 1) == 0:
+                return True
+            time.sleep(2)
+        return False
 
     @trace()
     def create_alias(self, client, collection_name, alias, timeout=None, check_task=None, check_items=None, **kwargs):
@@ -907,7 +939,7 @@ class TestMilvusClientV2Base(Base):
 
     @trace()
     def alter_collection_properties(self, client, collection_name, properties, timeout=None,
-                               check_task=None, check_items=None, **kwargs):
+                                    check_task=None, check_items=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         kwargs.update({"timeout": timeout})
 
@@ -1087,5 +1119,16 @@ class TestMilvusClientV2Base(Base):
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        source_group=source_group, target_group=target_group,
                                        collection_name=collection_name, num_replicas=num_replicas,
+                                       **kwargs).run()
+        return res, check_result
+
+    @trace()
+    def add_collection_field(self, client, collection_name, field_name, data_type, desc="", timeout=None, check_task=None, check_items=None, **kwargs):
+        timeout = TIMEOUT if timeout is None else timeout
+        kwargs.update({"timeout": timeout})
+
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([client.add_collection_field, collection_name, field_name, data_type, desc], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        **kwargs).run()
         return res, check_result

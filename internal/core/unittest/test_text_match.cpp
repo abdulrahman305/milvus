@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <gtest/gtest.h>
+#include <optional>
 #include <string>
 
 #include "common/Schema.h"
@@ -33,7 +34,11 @@ GenTestSchema(std::map<std::string, std::string> params = {},
               bool nullable = false) {
     auto schema = std::make_shared<Schema>();
     {
-        FieldMeta f(FieldName("pk"), FieldId(100), DataType::INT64, false);
+        FieldMeta f(FieldName("pk"),
+                    FieldId(100),
+                    DataType::INT64,
+                    false,
+                    std::nullopt);
         schema->AddField(std::move(f));
         schema->set_primary_field_id(FieldId(100));
     }
@@ -45,7 +50,8 @@ GenTestSchema(std::map<std::string, std::string> params = {},
                     nullable,
                     true,
                     true,
-                    params);
+                    params,
+                    std::nullopt);
         schema->AddField(std::move(f));
     }
     {
@@ -54,7 +60,8 @@ GenTestSchema(std::map<std::string, std::string> params = {},
                     DataType::VECTOR_FLOAT,
                     16,
                     knowhere::metric::L2,
-                    false);
+                    false,
+                    std::nullopt);
         schema->AddField(std::move(f));
     }
     return schema;
@@ -78,7 +85,7 @@ GetMatchExpr(SchemaPtr schema,
     auto expr = test::GenExpr();
     expr->set_allocated_unary_range_expr(unary_range_expr);
 
-    auto parser = ProtoParser(*schema);
+    auto parser = ProtoParser(schema);
     auto typed_expr = parser.ParseExprs(*expr);
     auto parsed =
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, typed_expr);
@@ -148,10 +155,10 @@ TEST(TextMatch, Index) {
                                          "unique_id",
                                          "milvus_tokenizer",
                                          "{}");
-    index->CreateReader();
-    index->AddText("football, basketball, pingpang", true, 0);
-    index->AddText("", false, 1);
-    index->AddText("swimming, football", true, 2);
+    index->CreateReader(milvus::index::SetBitsetSealed);
+    index->AddTextSealed("football, basketball, pingpang", true, 0);
+    index->AddTextSealed("", false, 1);
+    index->AddTextSealed("swimming, football", true, 2);
     index->Commit();
     index->Reload();
 
@@ -170,7 +177,10 @@ TEST(TextMatch, Index) {
         ASSERT_FALSE(res2[1]);
         ASSERT_TRUE(res2[2]);
         res = index->MatchQuery("nothing");
-        ASSERT_EQ(res.size(), 0);
+        ASSERT_EQ(res.size(), 3);
+        ASSERT_FALSE(res[0]);
+        ASSERT_FALSE(res[1]);
+        ASSERT_FALSE(res[2]);
     }
 
     {
@@ -187,10 +197,16 @@ TEST(TextMatch, Index) {
         ASSERT_TRUE(res1[2]);
 
         auto res2 = index->PhraseMatchQuery("football swimming", 0);
-        ASSERT_EQ(res2.size(), 0);
+        ASSERT_EQ(res2.size(), 3);
+        ASSERT_FALSE(res2[0]);
+        ASSERT_FALSE(res2[1]);
+        ASSERT_FALSE(res2[2]);
 
         auto res3 = index->PhraseMatchQuery("football swimming", 1);
-        ASSERT_EQ(res3.size(), 0);
+        ASSERT_EQ(res3.size(), 3);
+        ASSERT_FALSE(res3[0]);
+        ASSERT_FALSE(res3[1]);
+        ASSERT_FALSE(res3[2]);
 
         auto res4 = index->PhraseMatchQuery("football swimming", 2);
         ASSERT_EQ(res4.size(), 3);
@@ -393,7 +409,6 @@ TEST(TextMatch, GrowingNaiveNullable) {
 
 TEST(TextMatch, SealedNaive) {
     auto schema = GenTestSchema();
-    auto seg = CreateSealedSegment(schema, empty_index_meta);
     std::vector<std::string> raw_str = {"football, basketball, pingpang",
                                         "swimming, football"};
 
@@ -409,7 +424,7 @@ TEST(TextMatch, SealedNaive) {
         str_col->at(i) = raw_str[i];
     }
 
-    SealedLoadFieldData(raw_data, *seg);
+    auto seg = CreateSealedWithFieldDataLoaded(schema, raw_data);
     seg->CreateTextIndex(FieldId(101));
 
     {
@@ -476,7 +491,6 @@ TEST(TextMatch, SealedNaive) {
 
 TEST(TextMatch, SealedNaiveNullable) {
     auto schema = GenTestSchema({}, true);
-    auto seg = CreateSealedSegment(schema, empty_index_meta);
     std::vector<std::string> raw_str = {
         "football, basketball, pingpang", "swimming, football", ""};
     std::vector<bool> raw_str_valid = {true, true, false};
@@ -498,7 +512,7 @@ TEST(TextMatch, SealedNaiveNullable) {
         str_col_valid->at(i) = raw_str_valid[i];
     }
 
-    SealedLoadFieldData(raw_data, *seg);
+    auto seg = CreateSealedWithFieldDataLoaded(schema, raw_data);
     seg->CreateTextIndex(FieldId(101));
     {
         BitsetType final;
@@ -766,7 +780,6 @@ TEST(TextMatch, SealedJieBa) {
         {"enable_analyzer", "true"},
         {"analyzer_params", R"({"tokenizer": "jieba"})"},
     });
-    auto seg = CreateSealedSegment(schema, empty_index_meta);
     std::vector<std::string> raw_str = {"青铜时代", "黄金时代"};
 
     int64_t N = 2;
@@ -781,7 +794,7 @@ TEST(TextMatch, SealedJieBa) {
         str_col->at(i) = raw_str[i];
     }
 
-    SealedLoadFieldData(raw_data, *seg);
+    auto seg = CreateSealedWithFieldDataLoaded(schema, raw_data);
     seg->CreateTextIndex(FieldId(101));
 
     {
@@ -850,7 +863,6 @@ TEST(TextMatch, SealedJieBaNullable) {
             {"analyzer_params", R"({"tokenizer": "jieba"})"},
         },
         true);
-    auto seg = CreateSealedSegment(schema, empty_index_meta);
     std::vector<std::string> raw_str = {"青铜时代", "黄金时代", ""};
     std::vector<bool> raw_str_valid = {true, true, false};
 
@@ -871,7 +883,7 @@ TEST(TextMatch, SealedJieBaNullable) {
         str_col_valid->at(i) = raw_str_valid[i];
     }
 
-    SealedLoadFieldData(raw_data, *seg);
+    auto seg = CreateSealedWithFieldDataLoaded(schema, raw_data);
     seg->CreateTextIndex(FieldId(101));
 
     {
@@ -943,9 +955,13 @@ TEST(TextMatch, SealedJieBaNullable) {
 TEST(TextMatch, GrowingLoadData) {
     int64_t N = 7;
     auto schema = GenTestSchema({}, true);
-    schema->AddField(FieldName("RowID"), FieldId(0), DataType::INT64, false);
     schema->AddField(
-        FieldName("Timestamp"), FieldId(1), DataType::INT64, false);
+        FieldName("RowID"), FieldId(0), DataType::INT64, false, std::nullopt);
+    schema->AddField(FieldName("Timestamp"),
+                     FieldId(1),
+                     DataType::INT64,
+                     false,
+                     std::nullopt);
     std::vector<std::string> raw_str = {"football, basketball, pingpang",
                                         "swimming, football",
                                         "golf",
@@ -972,13 +988,7 @@ TEST(TextMatch, GrowingLoadData) {
 
     auto storage_config = get_default_local_storage_config();
     auto cm = storage::CreateChunkManager(storage_config);
-    auto load_info = PrepareInsertBinlog(
-        1,
-        2,
-        3,
-        storage_config.root_path + "/" + "test_growing_segment_load_data",
-        raw_data,
-        cm);
+    auto load_info = PrepareInsertBinlog(1, 2, 3, raw_data, cm);
 
     auto segment = CreateGrowingSegment(schema, empty_index_meta);
     auto status = LoadFieldData(segment.get(), &load_info);

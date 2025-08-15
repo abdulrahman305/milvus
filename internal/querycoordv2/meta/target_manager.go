@@ -54,6 +54,7 @@ type TargetManagerInterface interface {
 	UpdateCollectionNextTarget(ctx context.Context, collectionID int64) error
 	RemoveCollection(ctx context.Context, collectionID int64)
 	RemovePartition(ctx context.Context, collectionID int64, partitionIDs ...int64)
+	RemovePartitionFromNextTarget(ctx context.Context, collectionID int64, partitionIDs ...int64)
 	GetGrowingSegmentsByCollection(ctx context.Context, collectionID int64, scope TargetScope) typeutil.UniqueSet
 	GetGrowingSegmentsByChannel(ctx context.Context, collectionID int64, channelName string, scope TargetScope) typeutil.UniqueSet
 	GetSealedSegmentsByCollection(ctx context.Context, collectionID int64, scope TargetScope) map[int64]*datapb.SegmentInfo
@@ -72,6 +73,7 @@ type TargetManagerInterface interface {
 	GetTargetJSON(ctx context.Context, scope TargetScope, collectionID int64) string
 	GetPartitions(ctx context.Context, collectionID int64, scope TargetScope) ([]int64, error)
 	IsCurrentTargetReady(ctx context.Context, collectionID int64) bool
+	GetCollectionRowCount(ctx context.Context, collectionID int64, scope TargetScope) int64
 }
 
 type TargetManager struct {
@@ -228,6 +230,7 @@ func (mgr *TargetManager) RemoveCollection(ctx context.Context, collectionID int
 
 // RemovePartition removes all segment in the given partition,
 // NOTE: this doesn't remove any channel even the given one is the only partition
+// Deprecated: use RemovePartitionFromNextTarget instead @weiliu1031
 func (mgr *TargetManager) RemovePartition(ctx context.Context, collectionID int64, partitionIDs ...int64) {
 	log := log.With(zap.Int64("collectionID", collectionID),
 		zap.Int64s("PartitionIDs", partitionIDs))
@@ -260,6 +263,32 @@ func (mgr *TargetManager) RemovePartition(ctx context.Context, collectionID int6
 				zap.Strings("channels", newTarget.GetAllDmChannelNames()))
 		} else {
 			log.Info("all partitions have been released, release the collection current target now")
+			mgr.next.removeCollectionTarget(collectionID)
+		}
+	}
+}
+
+// remove partition from next target
+// NOTE: don't edit current target directly, it will be updated by target observer, which push the new next target as current target
+// need the full progress to update next target to current target, so the query view on delegator could be updated when current target is updated
+func (mgr *TargetManager) RemovePartitionFromNextTarget(ctx context.Context, collectionID int64, partitionIDs ...int64) {
+	log := log.With(zap.Int64("collectionID", collectionID),
+		zap.Int64s("PartitionIDs", partitionIDs))
+
+	partitionSet := typeutil.NewUniqueSet(partitionIDs...)
+
+	log.Info("remove partition from next target")
+	oleNextTarget := mgr.next.getCollectionTarget(collectionID)
+	if oleNextTarget != nil {
+		newTarget := mgr.removePartitionFromCollectionTarget(oleNextTarget, partitionSet)
+		if newTarget != nil {
+			mgr.next.updateCollectionTarget(collectionID, newTarget)
+			log.Info("finish to remove partition from next target for collection",
+				zap.Int64s("segments", newTarget.GetAllSegmentIDs()),
+				zap.Strings("channels", newTarget.GetAllDmChannelNames()))
+		} else {
+			log.Info("all partitions have been released, release the collection current target now")
+			mgr.current.removeCollectionTarget(collectionID)
 			mgr.next.removeCollectionTarget(collectionID)
 		}
 	}
@@ -608,4 +637,12 @@ func (mgr *TargetManager) IsCurrentTargetReady(ctx context.Context, collectionID
 	}
 
 	return target.Ready()
+}
+
+func (mgr *TargetManager) GetCollectionRowCount(ctx context.Context, collectionID int64, scope TargetScope) int64 {
+	target := mgr.getCollectionTarget(scope, collectionID)
+	if len(target) == 0 {
+		return 0
+	}
+	return target[0].GetRowCount()
 }

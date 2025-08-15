@@ -18,7 +18,6 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 
 	"github.com/cockroachdb/errors"
@@ -44,7 +43,7 @@ type alterCollectionTask struct {
 
 func (a *alterCollectionTask) Prepare(ctx context.Context) error {
 	if a.Req.GetCollectionName() == "" {
-		return fmt.Errorf("alter collection failed, collection name does not exists")
+		return errors.New("alter collection failed, collection name does not exists")
 	}
 
 	return nil
@@ -91,6 +90,21 @@ func (a *alterCollectionTask) GetLockerKey() LockerKey {
 	)
 }
 
+func getCollectionDescription(props ...*commonpb.KeyValuePair) (bool, string, []*commonpb.KeyValuePair) {
+	hasDesc := false
+	desc := ""
+	newProperties := make([]*commonpb.KeyValuePair, 0, len(props))
+	for _, p := range props {
+		if p.GetKey() == common.CollectionDescription {
+			hasDesc = true
+			desc = p.GetValue()
+		} else {
+			newProperties = append(newProperties, p)
+		}
+	}
+	return hasDesc, desc, newProperties
+}
+
 func getConsistencyLevel(props ...*commonpb.KeyValuePair) (bool, commonpb.ConsistencyLevel) {
 	for _, p := range props {
 		if p.GetKey() == common.ConsistencyLevel {
@@ -123,7 +137,12 @@ func executeAlterCollectionTaskSteps(ctx context.Context,
 	if ok, level := getConsistencyLevel(newProperties...); ok {
 		newColl.ConsistencyLevel = level
 	}
-	newColl.Properties = newProperties
+	if ok, desc, props := getCollectionDescription(newProperties...); ok {
+		newColl.Description = desc
+		newColl.Properties = props
+	} else {
+		newColl.Properties = newProperties
+	}
 	tso, err := core.tsoAllocator.GenerateTSO(1)
 	if err == nil {
 		newColl.UpdateTimestamp = tso
@@ -169,7 +188,7 @@ func executeAlterCollectionTaskSteps(ctx context.Context,
 			zap.Strings("newResourceGroups", newResourceGroups),
 		)
 		redoTask.AddAsyncStep(NewSimpleStep("", func(ctx context.Context) ([]nestedStep, error) {
-			resp, err := core.queryCoord.UpdateLoadConfig(ctx, &querypb.UpdateLoadConfigRequest{
+			resp, err := core.mixCoord.UpdateLoadConfig(ctx, &querypb.UpdateLoadConfigRequest{
 				CollectionIDs:  []int64{oldColl.CollectionID},
 				ReplicaNumber:  int32(newReplicaNumber),
 				ResourceGroups: newResourceGroups,
@@ -244,19 +263,19 @@ type alterCollectionFieldTask struct {
 
 func (a *alterCollectionFieldTask) Prepare(ctx context.Context) error {
 	if a.Req.GetCollectionName() == "" {
-		return fmt.Errorf("alter collection field failed, collection name does not exists")
+		return errors.New("alter collection field failed, collection name does not exists")
 	}
 
 	if a.Req.GetFieldName() == "" {
-		return fmt.Errorf("alter collection field failed, filed name does not exists")
+		return errors.New("alter collection field failed, field name does not exists")
 	}
 
 	return nil
 }
 
 func (a *alterCollectionFieldTask) Execute(ctx context.Context) error {
-	if a.Req.GetProperties() == nil {
-		return errors.New("only support alter collection properties, but collection field properties is empty")
+	if len(a.Req.GetProperties()) == 0 && len(a.Req.GetDeleteKeys()) == 0 {
+		return errors.New("The field properties to alter and keys to delete must not be empty at the same time")
 	}
 
 	oldColl, err := a.core.meta.GetCollectionByName(ctx, a.Req.GetDbName(), a.Req.GetCollectionName(), a.ts)
@@ -294,15 +313,21 @@ func executeAlterCollectionFieldTaskSteps(ctx context.Context,
 	ts Timestamp,
 ) error {
 	var err error
-	filedName := request.GetFieldName()
-	newFieldProperties := UpdateFieldPropertyParams(oldFieldProperties, request.GetProperties())
+	fieldName := request.GetFieldName()
+
+	var newFieldProperties []*commonpb.KeyValuePair
+	if len(request.Properties) > 0 {
+		newFieldProperties = UpdateFieldPropertyParams(oldFieldProperties, request.GetProperties())
+	} else if len(request.DeleteKeys) > 0 {
+		newFieldProperties = DeleteProperties(oldFieldProperties, request.GetDeleteKeys())
+	}
 	oldColl := col.Clone()
-	err = ResetFieldProperties(oldColl, filedName, oldFieldProperties)
+	err = ResetFieldProperties(oldColl, fieldName, oldFieldProperties)
 	if err != nil {
 		return err
 	}
 	newColl := col.Clone()
-	err = ResetFieldProperties(newColl, filedName, newFieldProperties)
+	err = ResetFieldProperties(newColl, fieldName, newFieldProperties)
 	if err != nil {
 		return err
 	}
@@ -314,10 +339,11 @@ func executeAlterCollectionFieldTaskSteps(ctx context.Context,
 
 	redoTask := newBaseRedoTask(core.stepExecutor)
 	redoTask.AddSyncStep(&AlterCollectionStep{
-		baseStep: baseStep{core: core},
-		oldColl:  oldColl,
-		newColl:  newColl,
-		ts:       ts,
+		baseStep:    baseStep{core: core},
+		oldColl:     oldColl,
+		newColl:     newColl,
+		ts:          ts,
+		fieldModify: true,
 	})
 
 	redoTask.AddSyncStep(&BroadcastAlteredCollectionStep{

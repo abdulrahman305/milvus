@@ -97,7 +97,7 @@ func parseTxnMsg(msg message.ImmutableMessage) ([]msgstream.TsMsg, error) {
 // parseSingleMsg converts message to ts message.
 func parseSingleMsg(msg message.ImmutableMessage) (msgstream.TsMsg, error) {
 	switch msg.Version() {
-	case message.VersionV1:
+	case message.VersionV1, message.VersionOld:
 		return fromMessageToTsMsgV1(msg)
 	case message.VersionV2:
 		return fromMessageToTsMsgV2(msg)
@@ -135,6 +135,8 @@ func fromMessageToTsMsgV2(msg message.ImmutableMessage) (msgstream.TsMsg, error)
 		tsMsg, err = NewManualFlushMessageBody(msg)
 	case message.MessageTypeCreateSegment:
 		tsMsg, err = NewCreateSegmentMessageBody(msg)
+	case message.MessageTypeSchemaChange:
+		tsMsg, err = NewSchemaChangeMessageBody(msg)
 	default:
 		panic("unsupported message type")
 	}

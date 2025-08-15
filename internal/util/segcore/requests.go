@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
@@ -34,9 +35,11 @@ type DeleteRequest struct {
 }
 
 type LoadFieldDataRequest struct {
-	Fields   []LoadFieldDataInfo
-	MMapDir  string
-	RowCount int64
+	Fields         []LoadFieldDataInfo
+	MMapDir        string
+	RowCount       int64
+	StorageVersion int64
+	LoadPriority   commonpb.LoadPriority
 }
 
 type LoadFieldDataInfo struct {
@@ -46,7 +49,7 @@ type LoadFieldDataInfo struct {
 
 func (req *LoadFieldDataRequest) getCLoadFieldDataRequest() (result *cLoadFieldDataRequest, err error) {
 	var cLoadFieldDataInfo C.CLoadFieldDataInfo
-	status := C.NewLoadFieldDataInfo(&cLoadFieldDataInfo)
+	status := C.NewLoadFieldDataInfo(&cLoadFieldDataInfo, C.int64_t(req.StorageVersion))
 	if err := ConsumeCStatusIntoError(&status); err != nil {
 		return nil, errors.Wrap(err, "NewLoadFieldDataInfo failed")
 	}
@@ -59,17 +62,17 @@ func (req *LoadFieldDataRequest) getCLoadFieldDataRequest() (result *cLoadFieldD
 
 	for _, field := range req.Fields {
 		cFieldID := C.int64_t(field.Field.GetFieldID())
-
 		status = C.AppendLoadFieldInfo(cLoadFieldDataInfo, cFieldID, rowCount)
 		if err := ConsumeCStatusIntoError(&status); err != nil {
 			return nil, errors.Wrapf(err, "AppendLoadFieldInfo failed at fieldID, %d", field.Field.GetFieldID())
 		}
 		for _, binlog := range field.Field.Binlogs {
 			cEntriesNum := C.int64_t(binlog.GetEntriesNum())
+			cMemorySize := C.int64_t(binlog.GetMemorySize())
 			cFile := C.CString(binlog.GetLogPath())
 			defer C.free(unsafe.Pointer(cFile))
 
-			status = C.AppendLoadFieldDataPath(cLoadFieldDataInfo, cFieldID, cEntriesNum, cFile)
+			status = C.AppendLoadFieldDataPath(cLoadFieldDataInfo, cFieldID, cEntriesNum, cMemorySize, cFile)
 			if err := ConsumeCStatusIntoError(&status); err != nil {
 				return nil, errors.Wrapf(err, "AppendLoadFieldDataPath failed at binlog, %d, %s", field.Field.GetFieldID(), binlog.GetLogPath())
 			}
@@ -77,11 +80,13 @@ func (req *LoadFieldDataRequest) getCLoadFieldDataRequest() (result *cLoadFieldD
 
 		C.EnableMmap(cLoadFieldDataInfo, cFieldID, C.bool(field.EnableMMap))
 	}
+
 	if len(req.MMapDir) > 0 {
 		mmapDir := C.CString(req.MMapDir)
 		defer C.free(unsafe.Pointer(mmapDir))
 		C.AppendMMapDirPath(cLoadFieldDataInfo, mmapDir)
 	}
+	C.SetLoadPriority(cLoadFieldDataInfo, C.int32_t(req.LoadPriority))
 	return &cLoadFieldDataRequest{
 		cLoadFieldDataInfo: cLoadFieldDataInfo,
 	}, nil

@@ -19,27 +19,21 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestApply(t *testing.T) {
-	Apply()
-	Apply(OptETCD(&clientv3.Client{}))
-	Apply(OptRootCoordClient(syncutil.NewFuture[types.RootCoordClient]()))
-
+func TestInit(t *testing.T) {
 	assert.Panics(t, func() {
-		Done()
+		Init(OptETCD(&clientv3.Client{}),
+			OptMixCoordClient(syncutil.NewFuture[types.MixCoordClient]()))
 	})
 
-	Apply(
+	Init(
 		OptChunkManager(mock_storage.NewMockChunkManager(t)),
 		OptETCD(&clientv3.Client{}),
-		OptRootCoordClient(syncutil.NewFuture[types.RootCoordClient]()),
-		OptDataCoordClient(syncutil.NewFuture[types.DataCoordClient]()),
+		OptMixCoordClient(syncutil.NewFuture[types.MixCoordClient]()),
 		OptStreamingNodeCatalog(mock_metastore.NewMockStreamingNodeCataLog(t)),
 	)
-	Done()
-
 	assert.NotNil(t, Resource().TSOAllocator())
 	assert.NotNil(t, Resource().ETCD())
-	assert.NotNil(t, Resource().RootCoordClient())
+	assert.NotNil(t, Resource().MixCoordClient())
 	Release()
 }
 

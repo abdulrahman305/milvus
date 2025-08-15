@@ -17,6 +17,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "common/common_type_c.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,11 +29,9 @@ enum SegmentType {
     Growing = 1,
     Sealed = 2,
     Indexing = 3,
-    ChunkedSealed = 4,
 };
 
 typedef enum SegmentType SegmentType;
-
 // pure C don't support that we use schemapb.DataType directly.
 // Note: the value of all enumerations must match the corresponding schemapb.DataType.
 // TODO: what if there are increments in schemapb.DataType.
@@ -60,11 +59,6 @@ enum CDataType {
 typedef enum CDataType CDataType;
 
 typedef void* CSegmentInterface;
-
-typedef struct CStatus {
-    int error_code;
-    const char* error_msg;
-} CStatus;
 
 typedef struct CProto {
     const void* proto_blob;
@@ -105,6 +99,9 @@ typedef struct CMmapConfig {
     uint64_t fix_file_size;
     bool growing_enable_mmap;
     bool scalar_index_enable_mmap;
+    bool scalar_field_enable_mmap;
+    bool vector_index_enable_mmap;
+    bool vector_field_enable_mmap;
 } CMmapConfig;
 
 typedef struct CTraceConfig {
@@ -113,6 +110,7 @@ typedef struct CTraceConfig {
     const char* jaegerURL;
     const char* otlpEndpoint;
     const char* otlpMethod;
+    const char* otlpHeaders;
     bool oltpSecure;
 
     int nodeID;

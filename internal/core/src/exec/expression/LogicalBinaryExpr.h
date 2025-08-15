@@ -41,7 +41,7 @@ struct LogicalElementFunc {
             } else if constexpr (op == LogicalOpType::Or) {
                 left[i] |= right[i];
             } else {
-                PanicInfo(
+                ThrowInfo(
                     OpTypeInvalid, "unsupported logical operator: {}", op);
             }
         }
@@ -56,7 +56,7 @@ struct LogicalElementFunc {
         } else if constexpr (op == LogicalOpType::Minus) {
             left.inplace_sub(right, n);
         } else {
-            PanicInfo(OpTypeInvalid, "unsupported logical operator: {}", op);
+            ThrowInfo(OpTypeInvalid, "unsupported logical operator: {}", op);
         }
     }
 };
@@ -85,6 +85,21 @@ class PhyLogicalBinaryExpr : public Expr {
     SupportOffsetInput() override {
         return inputs_[0]->SupportOffsetInput() &&
                inputs_[1]->SupportOffsetInput();
+    }
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return false;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
     }
 
  private:

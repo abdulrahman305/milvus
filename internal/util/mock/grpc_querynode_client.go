@@ -134,6 +134,14 @@ func (m *GrpcQueryNodeClient) DeleteBatch(ctx context.Context, in *querypb.Delet
 	return &querypb.DeleteBatchResponse{}, m.Err
 }
 
+func (m *GrpcQueryNodeClient) UpdateSchema(ctx context.Context, in *querypb.UpdateSchemaRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) RunAnalyzer(ctx context.Context, in *querypb.RunAnalyzerRequest, opts ...grpc.CallOption) (*milvuspb.RunAnalyzerResponse, error) {
+	return &milvuspb.RunAnalyzerResponse{}, m.Err
+}
+
 func (m *GrpcQueryNodeClient) Close() error {
 	return m.Err
 }

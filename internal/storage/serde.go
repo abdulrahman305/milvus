@@ -17,10 +17,11 @@
 package storage
 
 import (
-	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -39,11 +41,11 @@ type Record interface {
 	Len() int
 	Release()
 	Retain()
-	Slice(start, end int) Record
 }
 
 type RecordReader interface {
 	Next() (Record, error)
+	SetNeededFields(fields typeutil.Set[int64])
 	Close() error
 }
 
@@ -74,10 +76,7 @@ func (r *compositeRecord) Column(i FieldID) arrow.Array {
 }
 
 func (r *compositeRecord) Len() int {
-	for _, rec := range r.recs {
-		return rec.Len()
-	}
-	return 0
+	return r.recs[0].Len()
 }
 
 func (r *compositeRecord) Release() {
@@ -92,24 +91,13 @@ func (r *compositeRecord) Retain() {
 	}
 }
 
-func (r *compositeRecord) Slice(start, end int) Record {
-	slices := make([]arrow.Array, len(r.recs))
-	for i, rec := range r.recs {
-		d := array.NewSliceData(rec.Data(), int64(start), int64(end))
-		slices[i] = array.MakeFromData(d)
-	}
-	return &compositeRecord{
-		index: r.index,
-		recs:  slices,
-	}
-}
-
 type serdeEntry struct {
 	// arrowType returns the arrow type for the given dimension
 	arrowType func(int) arrow.DataType
 	// deserialize deserializes the i-th element in the array, returns the value and ok.
 	//	null is deserialized to nil without checking the type nullability.
-	deserialize func(arrow.Array, int) (any, bool)
+	//	if shouldCopy is true, the returned value is copied rather than referenced from arrow array.
+	deserialize func(arrow.Array, int, bool) (any, bool)
 	// serialize serializes the value to the builder, returns ok.
 	// 	nil is serialized to null without checking the type nullability.
 	serialize func(array.Builder, any) bool
@@ -118,10 +106,10 @@ type serdeEntry struct {
 var serdeMap = func() map[schemapb.DataType]serdeEntry {
 	m := make(map[schemapb.DataType]serdeEntry)
 	m[schemapb.DataType_Bool] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.FixedWidthTypes.Boolean
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -130,7 +118,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -145,10 +133,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Int8] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Int8
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -157,7 +145,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -172,10 +160,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Int16] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Int16
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -184,7 +172,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -199,10 +187,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Int32] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Int32
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -211,7 +199,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -226,10 +214,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Int64] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Int64
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -238,7 +226,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -253,10 +241,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Float] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Float32
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -265,7 +253,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -280,10 +268,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	m[schemapb.DataType_Double] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.PrimitiveTypes.Float64
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -292,7 +280,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -307,19 +295,23 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 		},
 	}
 	stringEntry := serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.BinaryTypes.String
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
 			if arr, ok := a.(*array.String); ok && i < arr.Len() {
-				return arr.Value(i), true
+				value := arr.Value(i)
+				if shouldCopy {
+					return strings.Clone(value), true
+				}
+				return value, true
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -341,10 +333,10 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 	// We're not using the deserialized data in go, so we can skip the heavy pb serde.
 	// If there is need in the future, just assign it to m[schemapb.DataType_Array]
 	eagerArrayEntry := serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.BinaryTypes.Binary
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
@@ -356,7 +348,7 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -375,19 +367,25 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 	_ = eagerArrayEntry
 
 	byteEntry := serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return arrow.BinaryTypes.Binary
 		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
 			if arr, ok := a.(*array.Binary); ok && i < arr.Len() {
-				return arr.Value(i), true
+				value := arr.Value(i)
+				if shouldCopy {
+					result := make([]byte, len(value))
+					copy(result, value)
+					return result, true
+				}
+				return value, true
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -403,20 +401,33 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 						return true
 					}
 				}
+				if vv, ok := v.(*schemapb.VectorField); ok {
+					if bytes, err := proto.Marshal(vv); err == nil {
+						builder.Append(bytes)
+						return true
+					}
+				}
 			}
 			return false
 		},
 	}
 
-	m[schemapb.DataType_Array] = byteEntry
+	m[schemapb.DataType_Array] = eagerArrayEntry
 	m[schemapb.DataType_JSON] = byteEntry
+	m[schemapb.DataType_ArrayOfVector] = byteEntry
 
-	fixedSizeDeserializer := func(a arrow.Array, i int) (any, bool) {
+	fixedSizeDeserializer := func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 		if a.IsNull(i) {
 			return nil, true
 		}
 		if arr, ok := a.(*array.FixedSizeBinary); ok && i < arr.Len() {
-			return arr.Value(i), true
+			value := arr.Value(i)
+			if shouldCopy {
+				result := make([]byte, len(value))
+				copy(result, value)
+				return result, true
+			}
+			return value, true
 		}
 		return nil, false
 	}
@@ -435,47 +446,82 @@ var serdeMap = func() map[schemapb.DataType]serdeEntry {
 	}
 
 	m[schemapb.DataType_BinaryVector] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return &arrow.FixedSizeBinaryType{ByteWidth: (i + 7) / 8}
 		},
-		fixedSizeDeserializer,
-		fixedSizeSerializer,
+		deserialize: fixedSizeDeserializer,
+		serialize:   fixedSizeSerializer,
 	}
 	m[schemapb.DataType_Float16Vector] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return &arrow.FixedSizeBinaryType{ByteWidth: i * 2}
 		},
-		fixedSizeDeserializer,
-		fixedSizeSerializer,
+		deserialize: fixedSizeDeserializer,
+		serialize:   fixedSizeSerializer,
 	}
 	m[schemapb.DataType_BFloat16Vector] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return &arrow.FixedSizeBinaryType{ByteWidth: i * 2}
 		},
-		fixedSizeDeserializer,
-		fixedSizeSerializer,
+		deserialize: fixedSizeDeserializer,
+		serialize:   fixedSizeSerializer,
 	}
 	m[schemapb.DataType_Int8Vector] = serdeEntry{
-		func(i int) arrow.DataType {
+		arrowType: func(i int) arrow.DataType {
 			return &arrow.FixedSizeBinaryType{ByteWidth: i}
 		},
-		fixedSizeDeserializer,
-		fixedSizeSerializer,
-	}
-	m[schemapb.DataType_FloatVector] = serdeEntry{
-		func(i int) arrow.DataType {
-			return &arrow.FixedSizeBinaryType{ByteWidth: i * 4}
-		},
-		func(a arrow.Array, i int) (any, bool) {
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
 			if a.IsNull(i) {
 				return nil, true
 			}
 			if arr, ok := a.(*array.FixedSizeBinary); ok && i < arr.Len() {
-				return arrow.Float32Traits.CastFromBytes(arr.Value(i)), true
+				// convert to []int8
+				bytes := arr.Value(i)
+				int8s := make([]int8, len(bytes))
+				for i, b := range bytes {
+					int8s[i] = int8(b)
+				}
+				return int8s, true
 			}
 			return nil, false
 		},
-		func(b array.Builder, v any) bool {
+		serialize: func(b array.Builder, v any) bool {
+			if v == nil {
+				b.AppendNull()
+				return true
+			}
+			if builder, ok := b.(*array.FixedSizeBinaryBuilder); ok {
+				if vv, ok := v.([]byte); ok {
+					builder.Append(vv)
+					return true
+				} else if vv, ok := v.([]int8); ok {
+					builder.Append(arrow.Int8Traits.CastToBytes(vv))
+					return true
+				}
+			}
+			return false
+		},
+	}
+	m[schemapb.DataType_FloatVector] = serdeEntry{
+		arrowType: func(i int) arrow.DataType {
+			return &arrow.FixedSizeBinaryType{ByteWidth: i * 4}
+		},
+		deserialize: func(a arrow.Array, i int, shouldCopy bool) (any, bool) {
+			if a.IsNull(i) {
+				return nil, true
+			}
+			if arr, ok := a.(*array.FixedSizeBinary); ok && i < arr.Len() {
+				vector := arrow.Float32Traits.CastFromBytes(arr.Value(i))
+				if shouldCopy {
+					vectorCopy := make([]float32, len(vector))
+					copy(vectorCopy, vector)
+					return vectorCopy, true
+				}
+				return vector, true
+			}
+			return nil, false
+		},
+		serialize: func(b array.Builder, v any) bool {
 			if v == nil {
 				b.AppendNull()
 				return true
@@ -532,7 +578,7 @@ type DeserializeReaderImpl[T any] struct {
 
 // Iterate to next value, return error or EOF if no more value.
 func (deser *DeserializeReaderImpl[T]) NextValue() (*T, error) {
-	if deser.rec == nil || deser.pos >= deser.rec.Len()-1 {
+	if deser.pos == 0 || deser.pos >= len(deser.values) {
 		r, err := deser.rr.Next()
 		if err != nil {
 			return nil, err
@@ -545,11 +591,10 @@ func (deser *DeserializeReaderImpl[T]) NextValue() (*T, error) {
 		if err := deser.deserializer(deser.rec, deser.values); err != nil {
 			return nil, err
 		}
-	} else {
-		deser.pos++
 	}
-
-	return &deser.values[deser.pos], nil
+	ret := &deser.values[deser.pos]
+	deser.pos++
+	return ret, nil
 }
 
 func (deser *DeserializeReaderImpl[T]) Close() error {
@@ -588,56 +633,6 @@ func (r *selectiveRecord) Release() {
 
 func (r *selectiveRecord) Retain() {
 	// do nothing
-}
-
-func (r *selectiveRecord) Slice(start, end int) Record {
-	panic("not implemented")
-}
-
-func calculateArraySize(a arrow.Array) int {
-	if a == nil || a.Data() == nil || a.Data().Buffers() == nil {
-		return 0
-	}
-
-	var totalSize int
-	offset := a.Data().Offset()
-	length := a.Len()
-
-	if len(a.NullBitmapBytes()) > 0 {
-		totalSize += (length + 7) / 8
-	}
-
-	for i, buf := range a.Data().Buffers() {
-		if buf == nil {
-			continue
-		}
-
-		switch i {
-		case 0:
-			// Handle bitmap buffer, already handled
-		case 1:
-			switch a.DataType().ID() {
-			case arrow.STRING, arrow.BINARY:
-				// Handle variable-length types like STRING/BINARY
-				startOffset := int(binary.LittleEndian.Uint32(buf.Bytes()[offset*4:]))
-				endOffset := int(binary.LittleEndian.Uint32(buf.Bytes()[(offset+length)*4:]))
-				totalSize += endOffset - startOffset
-			case arrow.LIST:
-				// Handle nest types like list
-				for i := 0; i < length; i++ {
-					startOffset := int(binary.LittleEndian.Uint32(buf.Bytes()[(offset+i)*4:]))
-					endOffset := int(binary.LittleEndian.Uint32(buf.Bytes()[(offset+i+1)*4:]))
-					elementSize := a.DataType().(*arrow.ListType).Elem().(arrow.FixedWidthDataType).Bytes()
-					totalSize += (endOffset - startOffset) * elementSize
-				}
-			default:
-				// Handle fixed-length types
-				elementSize := a.DataType().(arrow.FixedWidthDataType).Bytes()
-				totalSize += elementSize * length
-			}
-		}
-	}
-	return totalSize
 }
 
 func newSelectiveRecord(r Record, selectedFieldId FieldID) Record {
@@ -715,7 +710,7 @@ func (sfw *singleFieldRecordWriter) Write(r Record) error {
 	sfw.numRows += r.Len()
 	a := r.Column(sfw.fieldId)
 
-	sfw.writtenUncompressed += uint64(calculateArraySize(a))
+	sfw.writtenUncompressed += a.Data().SizeInBytes()
 	rec := array.NewRecord(sfw.schema, []arrow.Array{a}, int64(r.Len()))
 	defer rec.Release()
 	return sfw.fw.WriteBuffered(rec)
@@ -777,7 +772,7 @@ var _ RecordWriter = (*multiFieldRecordWriter)(nil)
 
 type multiFieldRecordWriter struct {
 	fw       *pqarrow.FileWriter
-	fieldIds []FieldID
+	fieldIDs []FieldID
 	schema   *arrow.Schema
 
 	numRows             int
@@ -786,10 +781,10 @@ type multiFieldRecordWriter struct {
 
 func (mfw *multiFieldRecordWriter) Write(r Record) error {
 	mfw.numRows += r.Len()
-	columns := make([]arrow.Array, len(mfw.fieldIds))
-	for i, fieldId := range mfw.fieldIds {
+	columns := make([]arrow.Array, len(mfw.fieldIDs))
+	for i, fieldId := range mfw.fieldIDs {
 		columns[i] = r.Column(fieldId)
-		mfw.writtenUncompressed += uint64(calculateArraySize(columns[i]))
+		mfw.writtenUncompressed += columns[i].Data().SizeInBytes()
 	}
 	rec := array.NewRecord(mfw.schema, columns, int64(r.Len()))
 	defer rec.Release()
@@ -804,7 +799,7 @@ func (mfw *multiFieldRecordWriter) Close() error {
 	return mfw.fw.Close()
 }
 
-func newMultiFieldRecordWriter(fieldIds []FieldID, fields []arrow.Field, writer io.Writer) (*multiFieldRecordWriter, error) {
+func newMultiFieldRecordWriter(fieldIDs []FieldID, fields []arrow.Field, writer io.Writer) (*multiFieldRecordWriter, error) {
 	schema := arrow.NewSchema(fields, nil)
 	fw, err := pqarrow.NewFileWriter(schema, writer,
 		parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(math.MaxInt64)), // No additional grouping for now.
@@ -814,7 +809,7 @@ func newMultiFieldRecordWriter(fieldIds []FieldID, fields []arrow.Field, writer 
 	}
 	return &multiFieldRecordWriter{
 		fw:       fw,
-		fieldIds: fieldIds,
+		fieldIDs: fieldIDs,
 		schema:   schema,
 	}, nil
 }
@@ -891,7 +886,7 @@ var _ Record = (*simpleArrowRecord)(nil)
 func (sr *simpleArrowRecord) Column(i FieldID) arrow.Array {
 	colIdx, ok := sr.field2Col[i]
 	if !ok {
-		panic("no such field")
+		panic(fmt.Sprintf("no such field: %d, having %v", i, sr.field2Col))
 	}
 	return sr.r.Column(colIdx)
 }
@@ -912,14 +907,53 @@ func (sr *simpleArrowRecord) ArrowSchema() *arrow.Schema {
 	return sr.r.Schema()
 }
 
-func (sr *simpleArrowRecord) Slice(start, end int) Record {
-	s := sr.r.NewSlice(int64(start), int64(end))
-	return NewSimpleArrowRecord(s, sr.field2Col)
-}
-
 func NewSimpleArrowRecord(r arrow.Record, field2Col map[FieldID]int) *simpleArrowRecord {
 	return &simpleArrowRecord{
 		r:         r,
 		field2Col: field2Col,
 	}
+}
+
+func BuildRecord(b *array.RecordBuilder, data *InsertData, schema *schemapb.CollectionSchema) error {
+	if data == nil {
+		return nil
+	}
+	idx := 0
+	serializeField := func(field *schemapb.FieldSchema) error {
+		fBuilder := b.Field(idx)
+		idx++
+		typeEntry, ok := serdeMap[field.DataType]
+		if !ok {
+			panic("unknown type")
+		}
+		fieldData, exists := data.Data[field.FieldID]
+		if !exists {
+			return merr.WrapErrFieldNotFound(field.FieldID, fmt.Sprintf("field %s not found", field.Name))
+		}
+
+		if fieldData.RowNum() == 0 {
+			return merr.WrapErrServiceInternal(fmt.Sprintf("row num is 0 for field %s", field.Name))
+		}
+
+		for j := 0; j < fieldData.RowNum(); j++ {
+			ok = typeEntry.serialize(fBuilder, fieldData.GetRow(j))
+			if !ok {
+				return merr.WrapErrServiceInternal(fmt.Sprintf("serialize error on type %s", field.DataType.String()))
+			}
+		}
+		return nil
+	}
+	for _, field := range schema.GetFields() {
+		if err := serializeField(field); err != nil {
+			return err
+		}
+	}
+	for _, structField := range schema.GetStructArrayFields() {
+		for _, field := range structField.GetFields() {
+			if err := serializeField(field); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

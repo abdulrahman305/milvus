@@ -19,8 +19,8 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
-	"time"
 
 	"github.com/samber/lo"
 	"go.uber.org/zap"
@@ -30,7 +30,6 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
-	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	pkgcommon "github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -52,123 +51,6 @@ func (s *Server) serverID() int64 {
 	}
 	// return 0 if no session exist, only for UT
 	return 0
-}
-
-func (s *Server) startIndexService(ctx context.Context) {
-	s.serverLoopWg.Add(1)
-	go s.createIndexForSegmentLoop(ctx)
-}
-
-func (s *Server) createIndexForSegment(ctx context.Context, segment *SegmentInfo, indexID UniqueID) error {
-	if !segment.GetIsSorted() && Params.DataCoordCfg.EnableStatsTask.GetAsBool() && !segment.GetIsImporting() && segment.Level != datapb.SegmentLevel_L0 {
-		log.Info("segment not sorted, skip create index", zap.Int64("segmentID", segment.GetID()))
-		return nil
-	}
-	log.Info("create index for segment", zap.Int64("segmentID", segment.ID), zap.Int64("indexID", indexID))
-	buildID, err := s.allocator.AllocID(context.Background())
-	if err != nil {
-		return err
-	}
-	segIndex := &model.SegmentIndex{
-		SegmentID:      segment.ID,
-		CollectionID:   segment.CollectionID,
-		PartitionID:    segment.PartitionID,
-		NumRows:        segment.NumOfRows,
-		IndexID:        indexID,
-		BuildID:        buildID,
-		CreatedUTCTime: uint64(time.Now().Unix()),
-		WriteHandoff:   false,
-	}
-	if err = s.meta.indexMeta.AddSegmentIndex(ctx, segIndex); err != nil {
-		return err
-	}
-	s.taskScheduler.enqueue(newIndexBuildTask(buildID))
-	return nil
-}
-
-func (s *Server) createIndexesForSegment(ctx context.Context, segment *SegmentInfo) error {
-	if Params.DataCoordCfg.EnableStatsTask.GetAsBool() && !segment.GetIsSorted() && !segment.GetIsImporting() {
-		log.Ctx(ctx).Debug("segment is not sorted by pk, skip create indexes", zap.Int64("segmentID", segment.GetID()))
-		return nil
-	}
-	if segment.GetLevel() == datapb.SegmentLevel_L0 {
-		log.Ctx(ctx).Debug("segment is level zero, skip create indexes", zap.Int64("segmentID", segment.GetID()))
-		return nil
-	}
-
-	indexes := s.meta.indexMeta.GetIndexesForCollection(segment.CollectionID, "")
-	indexIDToSegIndexes := s.meta.indexMeta.GetSegmentIndexes(segment.CollectionID, segment.ID)
-	for _, index := range indexes {
-		if _, ok := indexIDToSegIndexes[index.IndexID]; !ok {
-			if err := s.createIndexForSegment(ctx, segment, index.IndexID); err != nil {
-				log.Ctx(ctx).Warn("create index for segment fail", zap.Int64("segmentID", segment.ID),
-					zap.Int64("indexID", index.IndexID))
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *Server) getUnIndexTaskSegments(ctx context.Context) []*SegmentInfo {
-	flushedSegments := s.meta.SelectSegments(ctx, SegmentFilterFunc(func(seg *SegmentInfo) bool {
-		return isFlush(seg)
-	}))
-
-	unindexedSegments := make([]*SegmentInfo, 0)
-	for _, segment := range flushedSegments {
-		if s.meta.indexMeta.IsUnIndexedSegment(segment.CollectionID, segment.GetID()) {
-			unindexedSegments = append(unindexedSegments, segment)
-		}
-	}
-	return unindexedSegments
-}
-
-func (s *Server) createIndexForSegmentLoop(ctx context.Context) {
-	log := log.Ctx(ctx)
-	log.Info("start create index for segment loop...",
-		zap.Int64("TaskCheckInterval", Params.DataCoordCfg.TaskCheckInterval.GetAsInt64()))
-	defer s.serverLoopWg.Done()
-
-	ticker := time.NewTicker(Params.DataCoordCfg.TaskCheckInterval.GetAsDuration(time.Second))
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Warn("DataCoord context done, exit...")
-			return
-		case <-ticker.C:
-			segments := s.getUnIndexTaskSegments(ctx)
-			for _, segment := range segments {
-				if err := s.createIndexesForSegment(ctx, segment); err != nil {
-					log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-					continue
-				}
-			}
-		case collectionID := <-s.notifyIndexChan:
-			log.Info("receive create index notify", zap.Int64("collectionID", collectionID))
-			segments := s.meta.SelectSegments(ctx, WithCollection(collectionID), SegmentFilterFunc(func(info *SegmentInfo) bool {
-				return isFlush(info) && (!Params.DataCoordCfg.EnableStatsTask.GetAsBool() || info.GetIsSorted())
-			}))
-			for _, segment := range segments {
-				if err := s.createIndexesForSegment(ctx, segment); err != nil {
-					log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-					continue
-				}
-			}
-		case segID := <-getBuildIndexChSingleton():
-			log.Info("receive new flushed segment", zap.Int64("segmentID", segID))
-			segment := s.meta.GetSegment(ctx, segID)
-			if segment == nil {
-				log.Warn("segment is not exist, no need to build index", zap.Int64("segmentID", segID))
-				continue
-			}
-			if err := s.createIndexesForSegment(ctx, segment); err != nil {
-				log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-				continue
-			}
-		}
-	}
 }
 
 func (s *Server) getFieldNameByID(schema *schemapb.CollectionSchema, fieldID int64) (string, error) {
@@ -229,7 +111,7 @@ func (s *Server) parseAndVerifyNestedPath(identifier string, schema *schemapb.Co
 		return "", err
 	}
 	if identifierExpr.GetColumnExpr().GetInfo().GetFieldId() != fieldID {
-		return "", fmt.Errorf("fieldID not match with field name")
+		return "", fmt.Errorf("field parsed from json path (%v) not match with field specified in request (%v)", identifierExpr.GetColumnExpr().GetInfo().GetFieldId(), fieldID)
 	}
 
 	nestedPath := identifierExpr.GetColumnExpr().GetInfo().GetNestedPath()
@@ -278,16 +160,24 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 	}
 
 	if isJson {
+		// check json_path and json_cast_type exist
 		jsonPath, err := getIndexParam(req.GetIndexParams(), common.JSONPathKey)
 		if err != nil {
-			log.Error("get json path from index params failed", zap.Error(err))
+			log.Warn("get json path failed", zap.Error(err))
 			return merr.Status(err), nil
 		}
+		_, err = getIndexParam(req.GetIndexParams(), common.JSONCastTypeKey)
+		if err != nil {
+			log.Warn("get json cast type failed", zap.Error(err))
+			return merr.Status(err), nil
+		}
+
 		nestedPath, err := s.parseAndVerifyNestedPath(jsonPath, schema, req.GetFieldID())
 		if err != nil {
 			log.Error("parse nested path failed", zap.Error(err))
 			return merr.Status(err), nil
 		}
+		// set nested path as json path
 		setIndexParam(req.GetIndexParams(), common.JSONPathKey, nestedPath)
 	}
 
@@ -300,19 +190,17 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 		}
 		defaultIndexName := fieldName
 		if isJson {
-			jsonPath, err := getIndexParam(req.GetIndexParams(), common.JSONPathKey)
-			if err != nil {
-				return merr.Status(err), nil
-			}
-
+			// ignore error, because it's already checked in getIndexParam before
+			jsonPath, _ := getIndexParam(req.GetIndexParams(), common.JSONPathKey)
+			// filter indexes by json path, the length of indexes should not be larger than 1
+			// this is guaranteed by CanCreateIndex
 			indexes = lo.Filter(indexes, func(index *model.Index, i int) bool {
-				path, err := getIndexParam(index.IndexParams, common.JSONPathKey)
-				return err == nil && path == jsonPath
+				path, _ := getIndexParam(index.IndexParams, common.JSONPathKey)
+				return path == jsonPath
 			})
 
 			defaultIndexName += jsonPath
 		}
-
 		if len(indexes) == 0 {
 			req.IndexName = defaultIndexName
 		} else if len(indexes) == 1 {
@@ -320,56 +208,15 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 		}
 	}
 
-	indexID, err := s.meta.indexMeta.CanCreateIndex(req, isJson)
+	allocateIndexID, err := s.allocator.AllocID(ctx)
 	if err != nil {
-		metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-		return merr.Status(err), nil
-	}
-
-	// merge with previous params because create index would not pass mmap params
-	indexes := s.meta.indexMeta.GetFieldIndexes(req.GetCollectionID(), req.GetFieldID(), req.GetIndexName())
-	if len(indexes) == 1 {
-		req.UserIndexParams = UpdateParams(indexes[0], indexes[0].UserIndexParams, req.GetUserIndexParams())
-		req.IndexParams = UpdateParams(indexes[0], indexes[0].IndexParams, req.GetIndexParams())
-	}
-
-	if indexID == 0 {
-		indexID, err = s.allocator.AllocID(ctx)
-		if err != nil {
-			log.Warn("failed to alloc indexID", zap.Error(err))
-			metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-			return merr.Status(err), nil
-		}
-		if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(GetIndexType(req.IndexParams)) && !s.indexNodeManager.ClientSupportDisk() {
-			errMsg := "all DataNodes do not support disk indexes, please verify"
-			log.Warn(errMsg)
-			err = merr.WrapErrIndexNotSupported(GetIndexType(req.IndexParams))
-			metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-			return merr.Status(err), nil
-		}
-	}
-	// exclude the mmap.enable param, because it will be conflict with the index's mmap.enable param
-	typeParams := DeleteParams(req.GetTypeParams(), []string{common.MmapEnabledKey})
-
-	index := &model.Index{
-		CollectionID:    req.GetCollectionID(),
-		FieldID:         req.GetFieldID(),
-		IndexID:         indexID,
-		IndexName:       req.GetIndexName(),
-		TypeParams:      typeParams,
-		IndexParams:     req.GetIndexParams(),
-		CreateTime:      req.GetTimestamp(),
-		IsAutoIndex:     req.GetIsAutoIndex(),
-		UserIndexParams: req.GetUserIndexParams(),
-	}
-
-	if err := ValidateIndexParams(index); err != nil {
+		log.Warn("failed to alloc indexID", zap.Error(err))
 		metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
 
 	// Get flushed segments and create index
-	err = s.meta.indexMeta.CreateIndex(ctx, index)
+	indexID, err := s.meta.indexMeta.CreateIndex(ctx, req, allocateIndexID, isJson)
 	if err != nil {
 		log.Error("CreateIndex fail",
 			zap.Int64("fieldID", req.GetFieldID()), zap.String("indexName", req.GetIndexName()), zap.Error(err))
@@ -749,6 +596,9 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 		pendingIndexRows = int64(0)
 	)
 
+	minIndexVersion := int32(math.MaxInt32)
+	maxIndexVersion := int32(math.MinInt32)
+
 	for segID, seg := range segments {
 		if seg.state != commonpb.SegmentState_Flushed && seg.state != commonpb.SegmentState_Flushing {
 			continue
@@ -785,6 +635,12 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 		case commonpb.IndexState_Finished:
 			cntFinished++
 			indexedRows += seg.numRows
+			if segIdx.IndexVersion < minIndexVersion {
+				minIndexVersion = segIdx.IndexVersion
+			}
+			if segIdx.IndexVersion > maxIndexVersion {
+				maxIndexVersion = segIdx.IndexVersion
+			}
 		case commonpb.IndexState_Failed:
 			cntFailed++
 			failReason += fmt.Sprintf("%d: %s;", segID, segIdx.FailReason)
@@ -798,6 +654,8 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 	}
 	indexInfo.TotalRows = totalRows
 	indexInfo.PendingIndexRows = pendingIndexRows
+	indexInfo.MinIndexVersion = minIndexVersion
+	indexInfo.MaxIndexVersion = maxIndexVersion
 	switch {
 	case cntFailed > 0:
 		indexInfo.State = commonpb.IndexState_Failed
@@ -813,7 +671,8 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 	log.RatedInfo(60, "completeIndexInfo success", zap.Int64("collectionID", index.CollectionID), zap.Int64("indexID", index.IndexID),
 		zap.Int64("totalRows", indexInfo.TotalRows), zap.Int64("indexRows", indexInfo.IndexedRows),
 		zap.Int64("pendingIndexRows", indexInfo.PendingIndexRows),
-		zap.String("state", indexInfo.State.String()), zap.String("failReason", indexInfo.IndexStateFailReason))
+		zap.String("state", indexInfo.State.String()), zap.String("failReason", indexInfo.IndexStateFailReason),
+		zap.Int32("minIndexVersion", indexInfo.MinIndexVersion), zap.Int32("maxIndexVersion", indexInfo.MaxIndexVersion))
 }
 
 // GetIndexBuildProgress get the index building progress by num rows.

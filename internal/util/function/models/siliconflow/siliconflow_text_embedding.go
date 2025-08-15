@@ -24,6 +24,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cockroachdb/errors"
+
 	"github.com/milvus-io/milvus/internal/util/function/models/utils"
 )
 
@@ -89,11 +91,11 @@ func NewSiliconflowEmbeddingClient(apiKey string, url string) *SiliconflowEmbedd
 
 func (c *SiliconflowEmbedding) Check() error {
 	if c.apiKey == "" {
-		return fmt.Errorf("api key is empty")
+		return errors.New("api key is empty")
 	}
 
 	if c.url == "" {
-		return fmt.Errorf("url is empty")
+		return errors.New("url is empty")
 	}
 	return nil
 }
@@ -119,7 +121,7 @@ func (c *SiliconflowEmbedding) Embedding(modelName string, texts []string, encod
 		"Content-Type":  "application/json",
 		"Authorization": fmt.Sprintf("Bearer %s", c.apiKey),
 	}
-	body, err := utils.RetrySend(ctx, data, http.MethodPost, c.url, headers, 3, 1)
+	body, err := utils.RetrySend(ctx, data, http.MethodPost, c.url, headers, 3)
 	if err != nil {
 		return nil, err
 	}

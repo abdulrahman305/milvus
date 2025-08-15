@@ -23,6 +23,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -41,6 +42,7 @@ type PackWriter interface {
 
 type BulkPackWriter struct {
 	metaCache      metacache.MetaCache
+	schema         *schemapb.CollectionSchema
 	chunkManager   storage.ChunkManager
 	allocator      allocator.Interface
 	writeRetryOpts []retry.Option
@@ -50,11 +52,14 @@ type BulkPackWriter struct {
 	sizeWritten int64
 }
 
-func NewBulkPackWriter(metaCache metacache.MetaCache, chunkManager storage.ChunkManager,
+func NewBulkPackWriter(metaCache metacache.MetaCache,
+	schema *schemapb.CollectionSchema,
+	chunkManager storage.ChunkManager,
 	allocator allocator.Interface, writeRetryOpts ...retry.Option,
 ) *BulkPackWriter {
 	return &BulkPackWriter{
 		metaCache:      metaCache,
+		schema:         schema,
 		chunkManager:   chunkManager,
 		allocator:      allocator,
 		writeRetryOpts: writeRetryOpts,
@@ -163,7 +168,7 @@ func (bw *BulkPackWriter) writeInserts(ctx context.Context, pack *SyncPack) (map
 		return make(map[int64]*datapb.FieldBinlog), nil
 	}
 
-	serializer, err := NewStorageSerializer(bw.metaCache)
+	serializer, err := NewStorageSerializer(bw.metaCache, bw.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -190,9 +195,11 @@ func (bw *BulkPackWriter) writeInserts(ctx context.Context, pack *SyncPack) (map
 
 func (bw *BulkPackWriter) writeStats(ctx context.Context, pack *SyncPack) (map[int64]*datapb.FieldBinlog, error) {
 	if len(pack.insertData) == 0 {
+		// TODO: we should not skip here, if the flush operation don't carry any insert data,
+		// the merge stats operation will be skipped, which is a bad case.
 		return make(map[int64]*datapb.FieldBinlog), nil
 	}
-	serializer, err := NewStorageSerializer(bw.metaCache)
+	serializer, err := NewStorageSerializer(bw.metaCache, bw.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -237,10 +244,12 @@ func (bw *BulkPackWriter) writeStats(ctx context.Context, pack *SyncPack) (map[i
 
 func (bw *BulkPackWriter) writeBM25Stasts(ctx context.Context, pack *SyncPack) (map[int64]*datapb.FieldBinlog, error) {
 	if len(pack.bm25Stats) == 0 {
+		// TODO: we should not skip here, if the flush operation don't carry any insert data,
+		// the merge stats operation will be skipped, which is a bad case.
 		return make(map[int64]*datapb.FieldBinlog), nil
 	}
 
-	serializer, err := NewStorageSerializer(bw.metaCache)
+	serializer, err := NewStorageSerializer(bw.metaCache, bw.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +276,7 @@ func (bw *BulkPackWriter) writeBM25Stasts(ctx context.Context, pack *SyncPack) (
 
 	if pack.isFlush {
 		if pack.level != datapb.SegmentLevel_L0 {
-			if hasBM25Function(bw.metaCache.Schema()) {
+			if hasBM25Function(bw.schema) {
 				mergedBM25Blob, err := serializer.serializeMergedBM25Stats(pack)
 				if err != nil {
 					return nil, err
@@ -297,7 +306,7 @@ func (bw *BulkPackWriter) writeDelta(ctx context.Context, pack *SyncPack) (*data
 	if pack.deltaData == nil {
 		return &datapb.FieldBinlog{}, nil
 	}
-	s, err := NewStorageSerializer(bw.metaCache)
+	s, err := NewStorageSerializer(bw.metaCache, bw.schema)
 	if err != nil {
 		return nil, err
 	}

@@ -14,7 +14,7 @@ PWD 	  := $(shell pwd)
 GOPATH	:= $(shell $(GO) env GOPATH)
 SHELL 	:= /bin/bash
 OBJPREFIX := "github.com/milvus-io/milvus/cmd/milvus"
-MILVUS_GO_BUILD_TAGS := "dynamic,sonic"
+MILVUS_GO_BUILD_TAGS := "dynamic,sonic,with_jemalloc"
 
 INSTALL_PATH := $(PWD)/bin
 LIBRARY_PATH := $(PWD)/lib
@@ -40,6 +40,11 @@ ifdef USE_DYNAMIC_SIMD
 	use_dynamic_simd = ${USE_DYNAMIC_SIMD}
 endif
 
+tantivy_features = ""
+ifdef TANTIVY_FEATURES
+	tantivy_features = ${TANTIVY_FEATURES}
+endif
+
 use_opendal = OFF
 ifdef USE_OPENDAL
 	use_opendal = ${USE_OPENDAL}
@@ -49,7 +54,7 @@ GOLANGCI_LINT_VERSION := 1.64.7
 GOLANGCI_LINT_OUTPUT := $(shell $(INSTALL_PATH)/golangci-lint --version 2>/dev/null)
 INSTALL_GOLANGCI_LINT := $(findstring $(GOLANGCI_LINT_VERSION), $(GOLANGCI_LINT_OUTPUT))
 # mockery
-MOCKERY_VERSION := 2.46.0
+MOCKERY_VERSION := 2.53.3
 MOCKERY_OUTPUT := $(shell $(INSTALL_PATH)/mockery --version 2>/dev/null)
 INSTALL_MOCKERY := $(findstring $(MOCKERY_VERSION),$(MOCKERY_OUTPUT))
 # gci
@@ -140,6 +145,13 @@ cppcheck:
 	@#(env bash ${PWD}/scripts/core_build.sh -l)
 	@(env bash ${PWD}/scripts/check_cpp_fmt.sh)
 
+rustfmt:
+	@echo  "Running cargo format"
+	@env bash ${PWD}/scripts/run_cargo_format.sh ${PWD}/internal/core/thirdparty/tantivy/tantivy-binding/
+
+rustcheck:
+	@echo  "Running cargo check"
+	@env bash ${PWD}/scripts/run_cargo_format.sh ${PWD}/internal/core/thirdparty/tantivy/tantivy-binding/ --check
 
 fmt:
 ifdef GO_DIFF_FILES
@@ -196,7 +208,7 @@ static-check: getdeps
 	@echo "Start check go_client e2e package"
 	@source $(PWD)/scripts/setenv.sh && cd tests/go_client && GO111MODULE=on GOFLAGS=-buildvcs=false $(INSTALL_PATH)/golangci-lint run --build-tags L0,L1,L2,test --timeout=30m --config $(PWD)/tests/go_client/.golangci.yml
 
-verifiers: build-cpp getdeps cppcheck fmt static-check
+verifiers: build-cpp getdeps cppcheck rustcheck fmt static-check
 
 # Build various components locally.
 binlog:
@@ -248,7 +260,7 @@ download-milvus-proto:
 
 build-3rdparty:
 	@echo "Build 3rdparty ..."
-	@(env bash $(PWD)/scripts/3rdparty_build.sh -o ${use_opendal})
+	@(env bash $(PWD)/scripts/3rdparty_build.sh -o ${use_opendal} -t ${mode})
 
 generated-proto-without-cpp: download-milvus-proto get-proto-deps
 	@echo "Generate proto ..."
@@ -260,19 +272,19 @@ generated-proto: download-milvus-proto build-3rdparty get-proto-deps
 
 build-cpp: generated-proto
 	@echo "Building Milvus cpp library ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal})
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
 
 build-cpp-gpu: generated-proto
 	@echo "Building Milvus cpp gpu library ... "
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -g -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal})
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -g -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
 
 build-cpp-with-unittest: generated-proto
 	@echo "Building Milvus cpp library with unittest ... "
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal})
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
 
 build-cpp-with-coverage: generated-proto
 	@echo "Building Milvus cpp library with coverage and unittest ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -c -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal})
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -c -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
 
 check-proto-product: generated-proto
 	 @(env bash $(PWD)/scripts/check_proto_product.sh)
@@ -345,6 +357,10 @@ test-streaming:
 	@echo "Running go unittests..."
 	@(env bash $(PWD)/scripts/run_go_unittest.sh -t streaming)
 
+test-mixcoord:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t mixcoord)
+
 test-go: build-cpp-with-unittest
 	@echo "Running go unittests..."
 	@(env bash $(PWD)/scripts/run_go_unittest.sh)
@@ -400,7 +416,7 @@ milvus-tools: print-build-info
 	@echo "Building tools ..."
 	@. $(PWD)/scripts/setenv.sh && mkdir -p $(INSTALL_PATH)/tools && go env -w CGO_ENABLED="1" && GO111MODULE=on $(GO) build \
 		-pgo=$(PGO_PATH)/default.pgo -ldflags="-X 'main.BuildTags=$(BUILD_TAGS)' -X 'main.BuildTime=$(BUILD_TIME)' -X 'main.GitCommit=$(GIT_COMMIT)' -X 'main.GoVersion=$(GO_VERSION)'" \
-		-o $(INSTALL_PATH)/tools $(PWD)/cmd/tools/* 1>/dev/null
+		-o $(INSTALL_PATH)/tools $(PWD)/cmd/tools/binlog $(PWD)/cmd/tools/config $(PWD)/cmd/tools/datameta $(PWD)/cmd/tools/config-docs-generator $(PWD)/cmd/tools/migration 1>/dev/null
 
 rpm-setup:
 	@echo "Setuping rpm env ...;"
@@ -422,20 +438,23 @@ rpm: install
 	@QA_RPATHS="$$[ 0x001|0x0002|0x0020 ]" rpmbuild -ba ./build/rpm/milvus.spec
 
 generate-mockery-types: getdeps
-	# RootCoord
-	$(INSTALL_PATH)/mockery --name=RootCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_rootcoord.go --with-expecter --structname=RootCoord
+	# MixCoord
+	$(INSTALL_PATH)/mockery --name=MixCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_mixcoord.go --with-expecter --structname=MixCoord
 	# Proxy
 	$(INSTALL_PATH)/mockery --name=ProxyComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_proxy.go --with-expecter --structname=MockProxy
-	# QueryCoord
-	$(INSTALL_PATH)/mockery --name=QueryCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_querycoord.go --with-expecter --structname=MockQueryCoord
 	# QueryNode
 	$(INSTALL_PATH)/mockery --name=QueryNodeComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_querynode.go --with-expecter --structname=MockQueryNode
-	# DataCoord
-	$(INSTALL_PATH)/mockery --name=DataCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_datacoord.go --with-expecter --structname=MockDataCoord
 	# DataNode
 	$(INSTALL_PATH)/mockery --name=DataNodeComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_datanode.go --with-expecter --structname=MockDataNode
+	# RootCoord
+	$(INSTALL_PATH)/mockery --name=RootCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_rootcoord.go --with-expecter --structname=MockRootCoord
+	# QueryCoord
+	$(INSTALL_PATH)/mockery --name=QueryCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_querycoord.go --with-expecter --structname=MockQueryCoord
+	# DataCoord
+	$(INSTALL_PATH)/mockery --name=DataCoordComponent --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_datacoord.go --with-expecter --structname=MockDataCoord
 
 	# Clients
+	$(INSTALL_PATH)/mockery --name=MixCoordClient --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_mixcoord_client.go --with-expecter --structname=MockMixCoordClient
 	$(INSTALL_PATH)/mockery --name=RootCoordClient --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_rootcoord_client.go --with-expecter --structname=MockRootCoordClient
 	$(INSTALL_PATH)/mockery --name=QueryCoordClient --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_querycoord_client.go --with-expecter --structname=MockQueryCoordClient
 	$(INSTALL_PATH)/mockery --name=DataCoordClient --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_datacoord_client.go --with-expecter --structname=MockDataCoordClient

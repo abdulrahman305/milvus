@@ -25,22 +25,38 @@ extern "C" {
 #include "common/type_c.h"
 
 void
-InitIndexSliceSize(const int64_t);
-
-void
-InitHighPriorityThreadCoreCoefficient(const int64_t);
-
-void
-InitMiddlePriorityThreadCoreCoefficient(const int64_t);
-
-void
-InitLowPriorityThreadCoreCoefficient(const int64_t);
-
-void
-InitDefaultExprEvalBatchSize(int64_t val);
-
-void
 InitCpuNum(const int);
+
+void
+SetIndexSliceSize(const int64_t);
+
+void
+SetHighPriorityThreadCoreCoefficient(const float);
+
+void
+SetMiddlePriorityThreadCoreCoefficient(const float);
+
+void
+SetLowPriorityThreadCoreCoefficient(const float);
+
+void
+SetDefaultExprEvalBatchSize(int64_t val);
+
+void
+SetDefaultOptimizeExprEnable(bool val);
+
+void
+SetDefaultJSONKeyStatsCommitInterval(int64_t val);
+
+void
+SetDefaultGrowingJSONKeyStatsEnable(bool val);
+
+void
+SetDefaultConfigParamTypeCheck(bool val);
+
+// dynamic update segcore params
+void
+SetLogLevel(const char* level);
 
 void
 InitTrace(CTraceConfig* config);

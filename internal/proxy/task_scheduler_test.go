@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
@@ -491,9 +492,8 @@ func TestTaskScheduler(t *testing.T) {
 
 	ctx := context.Background()
 	tsoAllocatorIns := newMockTsoAllocator()
-	factory := newSimpleMockMsgStreamFactory()
 
-	sched, err := newTaskScheduler(ctx, tsoAllocatorIns, factory)
+	sched, err := newTaskScheduler(ctx, tsoAllocatorIns)
 	assert.NoError(t, err)
 	assert.NotNil(t, sched)
 
@@ -571,8 +571,7 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 	).Return(collectionID, nil)
 	globalMetaCache = cache
 	tsoAllocatorIns := newMockTsoAllocator()
-	factory := newSimpleMockMsgStreamFactory()
-	scheduler, err := newTaskScheduler(context.Background(), tsoAllocatorIns, factory)
+	scheduler, err := newTaskScheduler(context.Background(), tsoAllocatorIns)
 	assert.NoError(t, err)
 
 	run := func(wg *sync.WaitGroup) {
@@ -593,7 +592,7 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 		assert.NoError(t, err)
 		task := scheduler.scheduleDmTask()
 		scheduler.dmQueue.AddActiveTask(task)
-		chMgr.EXPECT().getChannels(mock.Anything).Return(nil, fmt.Errorf("mock err"))
+		chMgr.EXPECT().getChannels(mock.Anything).Return(nil, errors.New("mock err"))
 		scheduler.dmQueue.PopActiveTask(task.ID()) // assert no panic
 	}
 
@@ -659,7 +658,7 @@ func TestTaskScheduler_SkipAllocTimestamp(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(0, fmt.Errorf("mock error")).Once()
+	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(0, errors.New("mock error")).Once()
 	t.Run("failed", func(t *testing.T) {
 		st := &searchTask{
 			SearchRequest: &internalpb.SearchRequest{

@@ -27,14 +27,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/common"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgdispatcher"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/adaptor"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
@@ -67,7 +63,11 @@ func (p *streamPipeline) work() {
 		case <-p.closeCh:
 			log.Ctx(context.TODO()).Debug("stream pipeline input closed")
 			return
-		case msg := <-p.input:
+		case msg, ok := <-p.input:
+			if !ok {
+				log.Ctx(context.TODO()).Debug("stream pipeline input closed")
+				return
+			}
 			p.lastAccessTime.Store(time.Now())
 			log.Ctx(context.TODO()).RatedDebug(10, "stream pipeline fetch msg", zap.Int("sum", len(msg.Msgs)))
 			p.pipeline.inputChannel <- msg
@@ -92,30 +92,6 @@ func (p *streamPipeline) ConsumeMsgStream(ctx context.Context, position *msgpb.M
 	if position == nil {
 		log.Error("seek stream to nil position")
 		return ErrNilPosition
-	}
-
-	if streamingutil.IsStreamingServiceEnabled() {
-		startFrom := adaptor.MustGetMessageIDFromMQWrapperIDBytes(streaming.WAL().WALName(), position.GetMsgID())
-		log.Info(
-			"stream pipeline seeks from position with scanner",
-			zap.String("channel", position.GetChannelName()),
-			zap.Any("startFromMessageID", startFrom),
-			zap.Uint64("timestamp", position.GetTimestamp()),
-		)
-		handler := adaptor.NewMsgPackAdaptorHandler()
-		p.scanner = streaming.WAL().Read(ctx, streaming.ReadOption{
-			VChannel:      position.GetChannelName(),
-			DeliverPolicy: options.DeliverPolicyStartFrom(startFrom),
-			DeliverFilters: []options.DeliverFilter{
-				// only consume messages with timestamp >= position timestamp
-				options.DeliverFilterTimeTickGTE(position.GetTimestamp()),
-				// only consume insert and delete messages
-				options.DeliverFilterMessageType(message.MessageTypeInsert, message.MessageTypeDelete),
-			},
-			MessageHandler: handler,
-		})
-		p.input = handler.Chan()
-		return nil
 	}
 
 	start := time.Now()
@@ -158,12 +134,15 @@ func (p *streamPipeline) Start() error {
 
 func (p *streamPipeline) Close() {
 	p.closeOnce.Do(func() {
+		// close datasource first
+		p.dispatcher.Deregister(p.vChannel)
+		// close stream input
 		close(p.closeCh)
 		p.closeWg.Wait()
 		if p.scanner != nil {
 			p.scanner.Close()
 		}
-		p.dispatcher.Deregister(p.vChannel)
+		// close the underline pipeline
 		p.pipeline.Close()
 	})
 }

@@ -7,13 +7,11 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/streamingcoord/client/assignment"
 	"github.com/milvus-io/milvus/internal/streamingcoord/client/broadcast"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
 	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
@@ -43,9 +41,6 @@ type BroadcastService interface {
 
 	// Ack sends a broadcast ack to the streaming service.
 	Ack(ctx context.Context, req types.BroadcastAckRequest) error
-
-	// Close closes the broadcast service.
-	Close()
 }
 
 // Client is the interface of log service client.
@@ -67,8 +62,8 @@ type Client interface {
 // NewClient creates a new client.
 func NewClient(etcdCli *clientv3.Client) Client {
 	// StreamingCoord is deployed on DataCoord node.
-	role := sessionutil.GetSessionPrefixByRole(typeutil.RootCoordRole)
-	rb := resolver.NewSessionExclusiveBuilder(etcdCli, role)
+	role := sessionutil.GetSessionPrefixByRole(typeutil.MixCoordRole)
+	rb := resolver.NewSessionExclusiveBuilder(etcdCli, role, ">=2.6.0-dev")
 	dialTimeout := paramtable.Get().StreamingCoordGrpcClientCfg.DialTimeout.GetAsDuration(time.Millisecond)
 	dialOptions := getDialOptions(rb)
 	conn := lazygrpc.NewConn(func(ctx context.Context) (*grpc.ClientConn, error) {
@@ -76,15 +71,12 @@ func NewClient(etcdCli *clientv3.Client) Client {
 		defer cancel()
 		return grpc.DialContext(
 			ctx,
-			resolver.SessionResolverScheme+":///"+typeutil.RootCoordRole,
+			resolver.SessionResolverScheme+":///"+typeutil.MixCoordRole,
 			dialOptions...,
 		)
 	})
-	var assignmentServiceImpl *assignment.AssignmentServiceImpl
-	if streamingutil.IsStreamingServiceEnabled() {
-		assignmentService := lazygrpc.WithServiceCreator(conn, streamingpb.NewStreamingCoordAssignmentServiceClient)
-		assignmentServiceImpl = assignment.NewAssignmentService(assignmentService)
-	}
+	assignmentService := lazygrpc.WithServiceCreator(conn, streamingpb.NewStreamingCoordAssignmentServiceClient)
+	assignmentServiceImpl := assignment.NewAssignmentService(assignmentService)
 	broadcastService := lazygrpc.WithServiceCreator(conn, streamingpb.NewStreamingCoordBroadcastServiceClient)
 	return &clientImpl{
 		conn:              conn,
@@ -97,6 +89,7 @@ func NewClient(etcdCli *clientv3.Client) Client {
 // getDialOptions returns grpc dial options.
 func getDialOptions(rb resolver.Builder) []grpc.DialOption {
 	cfg := &paramtable.Get().StreamingCoordGrpcClientCfg
+	tlsCfg := &paramtable.Get().InternalTLSCfg
 	retryPolicy := cfg.GetDefaultRetryPolicy()
 	retryPolicy["retryableStatusCodes"] = []string{"UNAVAILABLE"}
 	defaultServiceConfig := map[string]interface{}{
@@ -117,11 +110,15 @@ func getDialOptions(rb resolver.Builder) []grpc.DialOption {
 	if err != nil {
 		panic(err)
 	}
+	creds, err := tlsCfg.GetClientCreds(context.Background())
+	if err != nil {
+		panic(err)
+	}
 	dialOptions := cfg.GetDialOptionsFromConfig()
 	dialOptions = append(dialOptions,
 		grpc.WithBlock(),
 		grpc.WithResolvers(rb),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithChainUnaryInterceptor(
 			otelgrpc.UnaryClientInterceptor(tracer.GetInterceptorOpts()...),
 			interceptor.ClusterInjectionUnaryClientInterceptor(),

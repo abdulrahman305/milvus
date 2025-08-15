@@ -34,7 +34,7 @@
 #include "storage/AliyunCredentialsProvider.h"
 #include "storage/TencentCloudSTSClient.h"
 #include "storage/TencentCloudCredentialsProvider.h"
-#include "monitor/prometheus_client.h"
+#include "monitor/Monitor.h"
 #include "common/EasyAssert.h"
 #include "log/Log.h"
 #include "signal.h"
@@ -367,7 +367,7 @@ MinioChunkManager::MinioChunkManager(const StorageConfig& storage_config)
 
 MinioChunkManager::~MinioChunkManager() {
     client_.reset();
-    ShutdownSDKAPI();
+    // ShutdownSDKAPI();
 }
 
 uint64_t

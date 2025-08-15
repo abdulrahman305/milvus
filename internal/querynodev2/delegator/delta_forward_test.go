@@ -151,11 +151,7 @@ func (s *StreamingForwardSuite) SetupTest() {
 	chunkManagerFactory := storage.NewTestChunkManagerFactory(paramtable.Get(), s.rootPath)
 	s.chunkManager, _ = chunkManagerFactory.NewPersistentStorageChunkManager(context.Background())
 
-	delegator, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.loader, &msgstream.MockMqFactory{
-		NewMsgStreamFunc: func(_ context.Context) (msgstream.MsgStream, error) {
-			return s.mq, nil
-		},
-	}, 10000, nil, s.chunkManager)
+	delegator, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.loader, 10000, nil, s.chunkManager, NewChannelQueryView(nil, nil, nil, initialTargetVersion))
 	s.Require().NoError(err)
 
 	sd, ok := delegator.(*shardDelegator)
@@ -185,7 +181,13 @@ func (s *StreamingForwardSuite) TestBFStreamingForward() {
 		PartitionID: 1,
 		SegmentID:   102,
 	})
-	delegator.distribution.SyncTargetVersion(1, []int64{1}, []int64{100}, []int64{101, 102}, nil)
+	delegator.distribution.SyncTargetVersion(&querypb.SyncAction{
+		TargetVersion:   1,
+		GrowingInTarget: []int64{100},
+		SealedInTarget:  []int64{101, 102},
+		DroppedInTarget: nil,
+		Checkpoint:      nil,
+	}, []int64{1})
 
 	// Setup pk oracle
 	// empty bfs will not match
@@ -238,7 +240,13 @@ func (s *StreamingForwardSuite) TestDirectStreamingForward() {
 		PartitionID: 1,
 		SegmentID:   102,
 	})
-	delegator.distribution.SyncTargetVersion(1, []int64{1}, []int64{100}, []int64{101, 102}, nil)
+	delegator.distribution.SyncTargetVersion(&querypb.SyncAction{
+		TargetVersion:   1,
+		GrowingInTarget: []int64{100},
+		SealedInTarget:  []int64{101, 102},
+		DroppedInTarget: nil,
+		Checkpoint:      nil,
+	}, []int64{1})
 
 	// Setup pk oracle
 	// empty bfs will not match
@@ -382,11 +390,7 @@ func (s *GrowingMergeL0Suite) SetupTest() {
 	chunkManagerFactory := storage.NewTestChunkManagerFactory(paramtable.Get(), s.rootPath)
 	s.chunkManager, _ = chunkManagerFactory.NewPersistentStorageChunkManager(context.Background())
 
-	delegator, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.loader, &msgstream.MockMqFactory{
-		NewMsgStreamFunc: func(_ context.Context) (msgstream.MsgStream, error) {
-			return s.mq, nil
-		},
-	}, 10000, nil, s.chunkManager)
+	delegator, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.loader, 10000, nil, s.chunkManager, NewChannelQueryView(nil, nil, nil, initialTargetVersion))
 	s.Require().NoError(err)
 
 	sd, ok := delegator.(*shardDelegator)
@@ -418,6 +422,7 @@ func (s *GrowingMergeL0Suite) TestAddL0ForGrowingBF() {
 	s.Require().NoError(err)
 	s.delegator.deleteBuffer.RegisterL0(l0Segment)
 
+	seg.EXPECT().ID().Return(1)
 	seg.EXPECT().Partition().Return(100)
 	seg.EXPECT().BatchPkExist(mock.Anything).Return(lo.RepeatBy(n, func(i int) bool { return true }))
 	seg.EXPECT().Delete(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, pk storage.PrimaryKeys, u []uint64) error {

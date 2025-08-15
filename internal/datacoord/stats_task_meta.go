@@ -19,9 +19,10 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"strconv"
+
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
-	"strconv"
 
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -73,6 +74,16 @@ func (stm *statsTaskMeta) reloadFromKV() error {
 		return err
 	}
 	for _, t := range statsTasks {
+		// sort stats task no need to reload
+		if t.GetSubJobType() == indexpb.StatsSubJob_Sort {
+			if err := stm.catalog.DropStatsTask(stm.ctx, t.GetTaskID()); err != nil {
+				log.Warn("drop stats task failed",
+					zap.Int64("taskID", t.GetTaskID()),
+					zap.Int64("segmentID", t.GetSegmentID()),
+					zap.Error(err))
+			}
+			continue
+		}
 		stm.tasks.Insert(t.GetTaskID(), t)
 
 		secondaryKey := createSecondaryIndexKey(t.GetSegmentID(), t.GetSubJobType().String())
@@ -98,7 +109,7 @@ func (stm *statsTaskMeta) updateMetrics() {
 
 	jobType := indexpb.JobType_JobTypeStatsJob.String()
 	for k, v := range taskMetrics {
-		metrics.TaskNum.WithLabelValues(jobType, k.String()).Set(float64(v))
+		metrics.IndexStatsTaskNum.WithLabelValues(jobType, k.String()).Set(float64(v))
 	}
 }
 
@@ -138,21 +149,21 @@ func (stm *statsTaskMeta) AddStatsTask(t *indexpb.StatsTask) error {
 	return nil
 }
 
-func (stm *statsTaskMeta) DropStatsTask(taskID int64) error {
+func (stm *statsTaskMeta) DropStatsTask(ctx context.Context, taskID int64) error {
 	stm.keyLock.Lock(taskID)
 	defer stm.keyLock.Unlock(taskID)
 
-	log.Info("drop stats task by taskID", zap.Int64("taskID", taskID))
+	log.Ctx(ctx).Info("drop stats task by taskID", zap.Int64("taskID", taskID))
 
 	t, ok := stm.tasks.Get(taskID)
 	if !ok {
 		log.Info("remove stats task success, task already not exist", zap.Int64("taskID", taskID))
 		return nil
 	}
-	if err := stm.catalog.DropStatsTask(stm.ctx, taskID); err != nil {
+	if err := stm.catalog.DropStatsTask(ctx, taskID); err != nil {
 		log.Warn("drop stats task failed",
 			zap.Int64("taskID", taskID),
-			zap.Int64("segmentID", taskID),
+			zap.Int64("segmentID", t.GetSegmentID()),
 			zap.Error(err))
 		return err
 	}
@@ -192,6 +203,33 @@ func (stm *statsTaskMeta) UpdateVersion(taskID, nodeID int64) error {
 	stm.segmentID2Tasks.Insert(secondaryKey, cloneT)
 	log.Info("update stats task version success", zap.Int64("taskID", taskID), zap.Int64("nodeID", nodeID),
 		zap.Int64("newVersion", cloneT.GetVersion()))
+	return nil
+}
+
+func (stm *statsTaskMeta) UpdateTaskState(taskID int64, state indexpb.JobState, failReason string) error {
+	stm.keyLock.Lock(taskID)
+	defer stm.keyLock.Unlock(taskID)
+
+	t, ok := stm.tasks.Get(taskID)
+	if !ok {
+		return fmt.Errorf("task %d not found", taskID)
+	}
+
+	cloneT := proto.Clone(t).(*indexpb.StatsTask)
+	cloneT.State = state
+	cloneT.FailReason = failReason
+
+	if err := stm.catalog.SaveStatsTask(stm.ctx, cloneT); err != nil {
+		log.Warn("update stats task state failed",
+			zap.Int64("taskID", t.GetTaskID()),
+			zap.Error(err))
+		return err
+	}
+
+	stm.tasks.Insert(taskID, cloneT)
+	secondaryKey := createSecondaryIndexKey(t.GetSegmentID(), t.GetSubJobType().String())
+	stm.segmentID2Tasks.Insert(secondaryKey, cloneT)
+
 	return nil
 }
 

@@ -38,6 +38,7 @@
 #include "index/Index.h"
 #include "marisa/base.h"
 #include "storage/Util.h"
+#include "storage/FileWriter.h"
 
 namespace milvus::index {
 
@@ -63,15 +64,10 @@ valid_str_id(size_t str_id) {
 void
 StringIndexMarisa::Build(const Config& config) {
     if (built_) {
-        PanicInfo(IndexAlreadyBuild, "index has been built");
+        ThrowInfo(IndexAlreadyBuild, "index has been built");
     }
-
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build index");
     auto field_datas =
-        file_manager_->CacheRawDataToMemory(insert_files.value());
+        storage::CacheRawDataAndFillMissing(file_manager_, config);
 
     BuildWithFieldData(field_datas);
 }
@@ -123,7 +119,7 @@ StringIndexMarisa::Build(size_t n,
                          const std::string* values,
                          const bool* valid_data) {
     if (built_) {
-        PanicInfo(IndexAlreadyBuild, "index has been built");
+        ThrowInfo(IndexAlreadyBuild, "index has been built");
     }
 
     marisa::Keyset keyset;
@@ -194,23 +190,19 @@ StringIndexMarisa::LoadWithoutAssemble(const BinarySet& set,
     auto index = set.GetByName(MARISA_TRIE_INDEX);
     auto len = index->size;
 
-    auto file = File::Open(file_name, O_RDWR | O_CREAT | O_EXCL);
-    auto written = file.Write(index->data.get(), len);
-    if (written != len) {
-        file.Close();
-        remove(file_name.c_str());
-        PanicInfo(ErrorCode::UnistdError,
-                  fmt::format("write index to fd error: {}", strerror(errno)));
+    {
+        auto file_writer = storage::FileWriter(file_name);
+        file_writer.Write(index->data.get(), len);
+        file_writer.Finish();
     }
 
-    file.Seek(0, SEEK_SET);
     if (config.contains(MMAP_FILE_PATH)) {
         trie_.mmap(file_name.c_str());
     } else {
+        auto file = File::Open(file_name, O_RDONLY);
         trie_.read(file.Descriptor());
     }
-    // make sure the file would be removed after we unmap & close it
-    unlink(file_name.c_str());
+    mmap_file_raii_ = std::make_unique<MmapFileRAII>(file_name);
 
     auto str_ids = set.GetByName(MARISA_STR_IDS);
     auto str_ids_len = str_ids->size;
@@ -233,17 +225,12 @@ StringIndexMarisa::Load(milvus::tracer::TraceContext ctx,
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load index");
-    auto index_datas = file_manager_->LoadIndexToMemory(index_files.value());
-    AssembleIndexDatas(index_datas);
+    auto index_datas = file_manager_->LoadIndexToMemory(
+        index_files.value(), config[milvus::LOAD_PRIORITY]);
     BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        auto size = data->DataSize();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        binary_set.Append(key, buf, size);
-    }
-
+    AssembleIndexDatas(index_datas, binary_set);
+    // clear index_datas to free memory early
+    index_datas.clear();
     LoadWithoutAssemble(binary_set, config);
 }
 
@@ -277,31 +264,43 @@ StringIndexMarisa::NotIn(size_t n, const std::string* values) {
         }
     }
     // NotIn(null) and In(null) is both false, need to mask with IsNotNull operate
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.reset(offsets[i]);
-    }
+    ResetNull(bitset);
     return bitset;
 }
 
 const TargetBitmap
 StringIndexMarisa::IsNull() {
     TargetBitmap bitset(str_ids_.size());
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.set(offsets[i]);
-    }
+    SetNull(bitset);
     return bitset;
+}
+
+void
+StringIndexMarisa::SetNull(TargetBitmap& bitset) {
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.set(i);
+        }
+    }
+}
+
+void
+StringIndexMarisa::ResetNull(TargetBitmap& bitset) {
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.reset(i);
+        }
+    }
 }
 
 const TargetBitmap
 StringIndexMarisa::IsNotNull() {
     TargetBitmap bitset(str_ids_.size());
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.set(offsets[i]);
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] != MARISA_NULL_KEY_ID) {
+            bitset.set(i);
+        }
     }
-    bitset.flip();
     return bitset;
 }
 
@@ -410,7 +409,7 @@ StringIndexMarisa::Range(std::string value, OpType op) {
             break;
         }
         default:
-            PanicInfo(
+            ThrowInfo(
                 OpTypeInvalid,
                 fmt::format("Invalid OperatorType: {}", static_cast<int>(op)));
     }

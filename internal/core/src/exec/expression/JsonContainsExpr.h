@@ -36,55 +36,96 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
                       expr->column_.field_id_,
                       expr->column_.nested_path_,
-                      DataType::NONE,
+                      expr->vals_.empty()
+                          ? DataType::NONE
+                          : FromValCase(expr->vals_[0].val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level,
+                      false,
+                      true),
           expr_(expr) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
+
  private:
     VectorPtr
-    EvalJsonContainsForDataSegment(OffsetVector* input = nullptr);
+    EvalJsonContainsForDataSegment(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecJsonContains(OffsetVector* input = nullptr);
+    ExecJsonContains(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecArrayContains(OffsetVector* input = nullptr);
+    ExecJsonContainsByKeyIndex();
 
     template <typename ExprValueType>
     VectorPtr
-    ExecJsonContainsAll(OffsetVector* input = nullptr);
+    ExecArrayContains(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecArrayContainsAll(OffsetVector* input = nullptr);
+    ExecJsonContainsAll(EvalCtx& context);
+
+    template <typename ExprValueType>
+    VectorPtr
+    ExecJsonContainsAllByKeyIndex();
+
+    template <typename ExprValueType>
+    VectorPtr
+    ExecArrayContainsAll(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsArray(OffsetVector* input = nullptr);
+    ExecJsonContainsArray(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsAllArray(OffsetVector* input = nullptr);
+    ExecJsonContainsArrayByKeyIndex();
 
     VectorPtr
-    ExecJsonContainsAllWithDiffType(OffsetVector* input = nullptr);
+    ExecJsonContainsAllArray(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsWithDiffType(OffsetVector* input = nullptr);
+    ExecJsonContainsAllArrayByKeyIndex();
 
     VectorPtr
-    EvalArrayContainsForIndexSegment();
+    ExecJsonContainsAllWithDiffType(EvalCtx& context);
+
+    VectorPtr
+    ExecJsonContainsAllWithDiffTypeByKeyIndex();
+
+    VectorPtr
+    ExecJsonContainsWithDiffType(EvalCtx& context);
+
+    VectorPtr
+    ExecJsonContainsWithDiffTypeByKeyIndex();
+
+    VectorPtr
+    EvalArrayContainsForIndexSegment(DataType data_type);
 
     template <typename ExprValueType>
     VectorPtr

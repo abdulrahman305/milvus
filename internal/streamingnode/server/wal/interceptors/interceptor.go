@@ -4,8 +4,13 @@ import (
 	"context"
 
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/shards"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/timetick/mvcc"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/txn"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/wab"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 )
 
@@ -14,9 +19,26 @@ type (
 	Append = func(ctx context.Context, msg message.MutableMessage) (message.MessageID, error)
 )
 
+// InterceptorBuildParam is the parameter to build a interceptor.
 type InterceptorBuildParam struct {
-	WALImpls walimpls.WALImpls         // The underlying walimpls implementation, can be used anytime.
-	WAL      *syncutil.Future[wal.WAL] // The wal final object, can be used after interceptor is ready.
+	ChannelInfo            types.PChannelInfo
+	WAL                    *syncutil.Future[wal.WAL]  // The wal final object, can be used after interceptor is ready.
+	LastTimeTickMessage    message.ImmutableMessage   // The last time tick message in wal.
+	WriteAheadBuffer       *wab.WriteAheadBuffer      // The write ahead buffer for the wal, used to erase the subscription of underlying wal.
+	MVCCManager            *mvcc.MVCCManager          // The MVCC manager for the wal, can be used to get the latest mvcc timetick.
+	InitialRecoverSnapshot *recovery.RecoverySnapshot // The initial recover snapshot for the wal, used to recover the wal state.
+	TxnManager             *txn.TxnManager            // The transaction manager for the wal, used to manage the transactions.
+	ShardManager           shards.ShardManager        // The shard manager for the wal, used to manage the shards, segment assignment, partition.
+}
+
+// Clear release the resources in the interceptor build param.
+func (p *InterceptorBuildParam) Clear() {
+	if p.WriteAheadBuffer != nil {
+		p.WriteAheadBuffer.Close()
+	}
+	if p.ShardManager != nil {
+		p.ShardManager.Close()
+	}
 }
 
 // InterceptorBuilder is the interface to build a interceptor.
@@ -25,7 +47,7 @@ type InterceptorBuildParam struct {
 type InterceptorBuilder interface {
 	// Build build a interceptor with wal that interceptor will work on.
 	// the wal object will be sent to the interceptor builder when the wal is constructed with all interceptors.
-	Build(param InterceptorBuildParam) Interceptor
+	Build(param *InterceptorBuildParam) Interceptor
 }
 
 type Interceptor interface {

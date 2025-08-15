@@ -20,7 +20,6 @@
 #include "knowhere/index/index_node.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/SegmentGrowingImpl.h"
-#include "segcore/SegmentSealedImpl.h"
 #include "segcore/ConcurrentVector.h"
 #include "common/Span.h"
 #include "query/Utils.h"
@@ -66,7 +65,7 @@ PrepareVectorIteratorsFromIndex(const SearchInfo& search_info,
                     "inside, terminate {} operation:{}",
                     operator_type,
                     knowhere::Status2String(iterators_val.error()));
-                PanicInfo(
+                ThrowInfo(
                     ErrorCode::Unsupported,
                     fmt::format(
                         "Returned knowhere iterator has non-ready iterators "
@@ -88,7 +87,7 @@ PrepareVectorIteratorsFromIndex(const SearchInfo& search_info,
                 "operation will be terminated",
                 e.what(),
                 operator_type);
-            PanicInfo(ErrorCode::Unsupported,
+            ThrowInfo(ErrorCode::Unsupported,
                       fmt::format("Failed to {}, current index:" +
                                       index.GetIndexType() + " doesn't support",
                                   operator_type));

@@ -26,6 +26,8 @@
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
 #include "storage/ChunkManager.h"
+#include "storage/Types.h"
+#include "milvus-storage/filesystem/fs.h"
 
 namespace milvus::storage {
 
@@ -51,11 +53,12 @@ class MemFileManagerImpl : public FileManagerImpl {
         return "MemIndexFileManagerImpl";
     }
 
-    std::map<std::string, FieldDataPtr>
-    LoadIndexToMemory(const std::vector<std::string>& remote_files);
+    std::map<std::string, std::unique_ptr<DataCodec>>
+    LoadIndexToMemory(const std::vector<std::string>& remote_files,
+                      milvus::proto::common::LoadPriority priority);
 
     std::vector<FieldDataPtr>
-    CacheRawDataToMemory(std::vector<std::string> remote_files);
+    CacheRawDataToMemory(const Config& config);
 
     bool
     AddFile(const BinarySet& binary_set);
@@ -74,11 +77,23 @@ class MemFileManagerImpl : public FileManagerImpl {
     }
 
     std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
-    CacheOptFieldToMemory(OptFieldT& fields_map);
+    CacheOptFieldToMemory(const Config& config);
 
  private:
     bool
     AddBinarySet(const BinarySet& binary_set, const std::string& prefix);
+
+    std::vector<FieldDataPtr>
+    cache_raw_data_to_memory_internal(const Config& config);
+
+    std::vector<FieldDataPtr>
+    cache_raw_data_to_memory_storage_v2(const Config& config);
+
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+    cache_opt_field_memory(const Config& config);
+
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+    cache_opt_field_memory_v2(const Config& config);
 
  private:
     // remote file path

@@ -23,6 +23,7 @@
 
 #include "Types.h"
 #include "VectorTrait.h"
+#include "TypeTraits.h"
 
 namespace milvus {
 // type erasure to work around virtual restriction
@@ -127,7 +128,7 @@ class Span<T,
  private:
     const T* data_;
     const bool* valid_data_;
-    const int64_t row_count_;
+    int64_t row_count_;
 };
 
 template <typename VectorType>
@@ -168,7 +169,7 @@ class Span<
 
  private:
     const embedded_type* data_;
-    const int64_t row_count_;
-    const int64_t element_sizeof_;
+    int64_t row_count_;
+    int64_t element_sizeof_;
 };
 }  // namespace milvus

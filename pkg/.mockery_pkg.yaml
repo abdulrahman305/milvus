@@ -14,7 +14,7 @@ packages:
       ImmutableMessage:
       ImmutableTxnMessage:
       MutableMessage:
-      RProperties:
+      BroadcastMutableMessage:
   github.com/milvus-io/milvus/pkg/v2/streaming/walimpls:
     interfaces:
       OpenerBuilderImpls:
@@ -42,3 +42,8 @@ packages:
       StreamingCoordBroadcastService_WatchServer:
       StreamingCoordBroadcastServiceClient:
       StreamingCoordBroadcastService_WatchClient:
+  github.com/milvus-io/milvus-proto/go-api/v2/hook:
+    interfaces:
+      Cipher:
+      Encryptor:
+      Decryptor:

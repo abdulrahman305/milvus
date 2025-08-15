@@ -20,16 +20,16 @@ package function
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 	"github.com/milvus-io/milvus/internal/util/function/models/ali"
 )
 
@@ -70,16 +70,15 @@ func createAliProvider(url string, schema *schemapb.FieldSchema, providerName st
 		OutputFieldIds:   []int64{102},
 		Params: []*commonpb.KeyValuePair{
 			{Key: modelNameParamKey, Value: TestModel},
-			{Key: embeddingURLParamKey, Value: url},
-			{Key: apiKeyParamKey, Value: "mock"},
+			{Key: credentialParamKey, Value: "mock"},
 			{Key: dimParamKey, Value: "4"},
 		},
 	}
 	switch providerName {
 	case aliDashScopeProvider:
-		return NewAliDashScopeEmbeddingProvider(schema, functionSchema)
+		return NewAliDashScopeEmbeddingProvider(schema, functionSchema, map[string]string{embeddingURLParamKey: url}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	default:
-		return nil, fmt.Errorf("Unknow provider")
+		return nil, errors.New("Unknow provider")
 	}
 }
 
@@ -170,11 +169,6 @@ func (s *AliTextEmbeddingProviderSuite) TestEmbeddingNumberNotMatch() {
 func (s *AliTextEmbeddingProviderSuite) TestCreateAliEmbeddingClient() {
 	_, err := createAliEmbeddingClient("", "")
 	s.Error(err)
-
-	os.Setenv(dashscopeAKEnvStr, "mock_key")
-	defer os.Unsetenv(dashscopeAKEnvStr)
-	_, err = createAliEmbeddingClient("", "")
-	s.NoError(err)
 }
 
 func (s *AliTextEmbeddingProviderSuite) TestNewAliDashScopeEmbeddingProvider() {
@@ -187,12 +181,11 @@ func (s *AliTextEmbeddingProviderSuite) TestNewAliDashScopeEmbeddingProvider() {
 		OutputFieldIds:   []int64{102},
 		Params: []*commonpb.KeyValuePair{
 			{Key: modelNameParamKey, Value: TestModel},
-			{Key: apiKeyParamKey, Value: "mock"},
 			{Key: dimParamKey, Value: "4"},
 		},
 	}
 	// invalid dim
-	functionSchema.Params[2] = &commonpb.KeyValuePair{Key: dimParamKey, Value: "Invalid"}
-	_, err := NewAliDashScopeEmbeddingProvider(s.schema.Fields[2], functionSchema)
+	functionSchema.Params[1] = &commonpb.KeyValuePair{Key: dimParamKey, Value: "Invalid"}
+	_, err := NewAliDashScopeEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	s.Error(err)
 }

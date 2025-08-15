@@ -21,14 +21,12 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/google/uuid"
 	"github.com/hashicorp/golang-lru/v2/expirable"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
@@ -40,19 +38,15 @@ import (
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/logutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/ratelimitutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/resource"
-	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -87,32 +81,22 @@ type Proxy struct {
 
 	stateCode atomic.Int32
 
-	etcdCli    *clientv3.Client
-	address    string
-	rootCoord  types.RootCoordClient
-	dataCoord  types.DataCoordClient
-	queryCoord types.QueryCoordClient
+	address  string
+	mixCoord types.MixCoordClient
 
 	simpleLimiter *SimpleLimiter
 
 	chMgr channelsMgr
 
-	replicateMsgStream msgstream.MsgStream
-
 	sched *taskScheduler
-
-	chTicker channelsTimeTicker
 
 	rowIDAllocator *allocator.IDAllocator
 	tsoAllocator   *timestampAllocator
-	segAssigner    *segIDAssigner
 
 	metricsCacheManager *metricsinfo.MetricsCacheManager
 
 	session  *sessionutil.Session
 	shardMgr shardClientMgr
-
-	factory dependency.Factory
 
 	searchResultCh chan *internalpb.SearchResults
 
@@ -124,8 +108,7 @@ type Proxy struct {
 	lbPolicy LBPolicy
 
 	// resource manager
-	resourceManager        resource.Manager
-	replicateStreamManager *ReplicateStreamManager
+	resourceManager resource.Manager
 
 	// materialized view
 	enableMaterializedView bool
@@ -137,7 +120,7 @@ type Proxy struct {
 }
 
 // NewProxy returns a Proxy struct.
-func NewProxy(ctx context.Context, factory dependency.Factory) (*Proxy, error) {
+func NewProxy(ctx context.Context, _ dependency.Factory) (*Proxy, error) {
 	rand.Seed(time.Now().UnixNano())
 	ctx1, cancel := context.WithCancel(ctx)
 	n := 1024 // better to be configurable
@@ -145,18 +128,15 @@ func NewProxy(ctx context.Context, factory dependency.Factory) (*Proxy, error) {
 	lbPolicy := NewLBPolicyImpl(mgr)
 	lbPolicy.Start(ctx)
 	resourceManager := resource.NewManager(10*time.Second, 20*time.Second, make(map[string]time.Duration))
-	replicateStreamManager := NewReplicateStreamManager(ctx, factory, resourceManager)
 	node := &Proxy{
-		ctx:                    ctx1,
-		cancel:                 cancel,
-		factory:                factory,
-		searchResultCh:         make(chan *internalpb.SearchResults, n),
-		shardMgr:               mgr,
-		simpleLimiter:          NewSimpleLimiter(Params.QuotaConfig.AllocWaitInterval.GetAsDuration(time.Millisecond), Params.QuotaConfig.AllocRetryTimes.GetAsUint()),
-		lbPolicy:               lbPolicy,
-		resourceManager:        resourceManager,
-		replicateStreamManager: replicateStreamManager,
-		slowQueries:            expirable.NewLRU[Timestamp, *metricsinfo.SlowQuery](20, nil, time.Minute*15),
+		ctx:             ctx1,
+		cancel:          cancel,
+		searchResultCh:  make(chan *internalpb.SearchResults, n),
+		shardMgr:        mgr,
+		simpleLimiter:   NewSimpleLimiter(Params.QuotaConfig.AllocWaitInterval.GetAsDuration(time.Millisecond), Params.QuotaConfig.AllocRetryTimes.GetAsUint()),
+		lbPolicy:        lbPolicy,
+		resourceManager: resourceManager,
+		slowQueries:     expirable.NewLRU[Timestamp, *metricsinfo.SlowQuery](20, nil, time.Minute*15),
 	}
 	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 	expr.Register("proxy", node)
@@ -225,17 +205,13 @@ func (node *Proxy) Init() error {
 	}
 	log.Info("init session for Proxy done")
 
-	node.factory.Init(Params)
-
-	log.Debug("init access log for Proxy done")
-
 	err := node.initRateCollector()
 	if err != nil {
 		return err
 	}
 	log.Info("Proxy init rateCollector done", zap.Int64("nodeID", paramtable.GetNodeID()))
 
-	idAllocator, err := allocator.NewIDAllocator(node.ctx, node.rootCoord, paramtable.GetNodeID())
+	idAllocator, err := allocator.NewIDAllocator(node.ctx, node.mixCoord, paramtable.GetNodeID())
 	if err != nil {
 		log.Warn("failed to create id allocator",
 			zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()),
@@ -245,7 +221,7 @@ func (node *Proxy) Init() error {
 	node.rowIDAllocator = idAllocator
 	log.Debug("create id allocator done", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()))
 
-	tsoAllocator, err := newTimestampAllocator(node.rootCoord, paramtable.GetNodeID())
+	tsoAllocator, err := newTimestampAllocator(node.mixCoord, paramtable.GetNodeID())
 	if err != nil {
 		log.Warn("failed to create timestamp allocator",
 			zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()),
@@ -255,49 +231,23 @@ func (node *Proxy) Init() error {
 	node.tsoAllocator = tsoAllocator
 	log.Debug("create timestamp allocator done", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()))
 
-	segAssigner, err := newSegIDAssigner(node.ctx, node.dataCoord, node.lastTick)
-	if err != nil {
-		log.Warn("failed to create segment id assigner",
-			zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()),
-			zap.Error(err))
-		return err
-	}
-	node.segAssigner = segAssigner
-	node.segAssigner.PeerID = paramtable.GetNodeID()
-	log.Debug("create segment id assigner done", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()))
-
-	dmlChannelsFunc := getDmlChannelsFunc(node.ctx, node.rootCoord)
-	chMgr := newChannelsMgrImpl(dmlChannelsFunc, defaultInsertRepackFunc, node.factory)
+	dmlChannelsFunc := getDmlChannelsFunc(node.ctx, node.mixCoord)
+	chMgr := newChannelsMgrImpl(dmlChannelsFunc, defaultInsertRepackFunc)
 	node.chMgr = chMgr
 	log.Debug("create channels manager done", zap.String("role", typeutil.ProxyRole))
 
-	replicateMsgChannel := Params.CommonCfg.ReplicateMsgChannel.GetValue()
-	node.replicateMsgStream, err = node.factory.NewMsgStream(node.ctx)
-	if err != nil {
-		log.Warn("failed to create replicate msg stream",
-			zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", paramtable.GetNodeID()),
-			zap.Error(err))
-		return err
-	}
-	node.replicateMsgStream.ForceEnableProduce(true)
-	node.replicateMsgStream.AsProducer(node.ctx, []string{replicateMsgChannel})
-
-	node.sched, err = newTaskScheduler(node.ctx, node.tsoAllocator, node.factory)
+	node.sched, err = newTaskScheduler(node.ctx, node.tsoAllocator)
 	if err != nil {
 		log.Warn("failed to create task scheduler", zap.String("role", typeutil.ProxyRole), zap.Error(err))
 		return err
 	}
 	log.Debug("create task scheduler done", zap.String("role", typeutil.ProxyRole))
 
-	syncTimeTickInterval := Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond) / 2
-	node.chTicker = newChannelsTimeTicker(node.ctx, Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond)/2, []string{}, node.sched.getPChanStatistics, tsoAllocator)
-	log.Debug("create channels time ticker done", zap.String("role", typeutil.ProxyRole), zap.Duration("syncTimeTickInterval", syncTimeTickInterval))
-
 	node.enableComplexDeleteLimit = Params.QuotaConfig.ComplexDeleteLimitEnable.GetAsBool()
 	node.metricsCacheManager = metricsinfo.NewMetricsCacheManager()
 	log.Debug("create metrics cache manager done", zap.String("role", typeutil.ProxyRole))
 
-	if err := InitMetaCache(node.ctx, node.rootCoord, node.queryCoord, node.shardMgr); err != nil {
+	if err := InitMetaCache(node.ctx, node.mixCoord, node.shardMgr); err != nil {
 		log.Warn("failed to init meta cache", zap.String("role", typeutil.ProxyRole), zap.Error(err))
 		return err
 	}
@@ -316,93 +266,13 @@ func (node *Proxy) Init() error {
 	return nil
 }
 
-// sendChannelsTimeTickLoop starts a goroutine that synchronizes the time tick information.
-func (node *Proxy) sendChannelsTimeTickLoop() {
-	log := log.Ctx(node.ctx)
-	node.wg.Add(1)
-	go func() {
-		defer node.wg.Done()
-
-		ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond))
-		defer ticker.Stop()
-		for {
-			select {
-			case <-node.ctx.Done():
-				log.Info("send channels time tick loop exit")
-				return
-			case <-ticker.C:
-				if !Params.CommonCfg.TTMsgEnabled.GetAsBool() {
-					continue
-				}
-				stats, ts, err := node.chTicker.getMinTsStatistics()
-				if err != nil {
-					log.Warn("sendChannelsTimeTickLoop.getMinTsStatistics", zap.Error(err))
-					continue
-				}
-
-				if ts == 0 {
-					log.Warn("sendChannelsTimeTickLoop.getMinTsStatistics default timestamp equal 0")
-					continue
-				}
-
-				channels := make([]pChan, 0, len(stats))
-				tss := make([]Timestamp, 0, len(stats))
-
-				maxTs := ts
-				for channel, ts := range stats {
-					channels = append(channels, channel)
-					tss = append(tss, ts)
-					if ts > maxTs {
-						maxTs = ts
-					}
-				}
-
-				req := &internalpb.ChannelTimeTickMsg{
-					Base: commonpbutil.NewMsgBase(
-						commonpbutil.WithMsgType(commonpb.MsgType_TimeTick),
-						commonpbutil.WithSourceID(node.session.ServerID),
-					),
-					ChannelNames:     channels,
-					Timestamps:       tss,
-					DefaultTimestamp: maxTs,
-				}
-
-				func() {
-					// we should pay more attention to the max lag.
-					minTs := maxTs
-					minTsOfChannel := "default"
-
-					// find the min ts and the related channel.
-					for channel, ts := range stats {
-						if ts < minTs {
-							minTs = ts
-							minTsOfChannel = channel
-						}
-					}
-
-					sub := tsoutil.SubByNow(minTs)
-					metrics.ProxySyncTimeTickLag.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), minTsOfChannel).Set(float64(sub))
-				}()
-
-				status, err := node.rootCoord.UpdateChannelTimeTick(node.ctx, req)
-				if err != nil {
-					log.Warn("sendChannelsTimeTickLoop.UpdateChannelTimeTick", zap.Error(err))
-					continue
-				}
-				if status.GetErrorCode() != 0 {
-					log.Warn("sendChannelsTimeTickLoop.UpdateChannelTimeTick",
-						zap.Any("ErrorCode", status.ErrorCode),
-						zap.Any("Reason", status.Reason))
-					continue
-				}
-			}
-		}
-	}()
-}
-
 // Start starts a proxy node.
 func (node *Proxy) Start() error {
 	log := log.Ctx(node.ctx)
+
+	node.shardMgr.Start()
+	log.Debug("start shard client manager done", zap.String("role", typeutil.ProxyRole))
+
 	if err := node.sched.Start(); err != nil {
 		log.Warn("failed to start task scheduler", zap.String("role", typeutil.ProxyRole), zap.Error(err))
 		return err
@@ -414,22 +284,6 @@ func (node *Proxy) Start() error {
 		return err
 	}
 	log.Debug("start id allocator done", zap.String("role", typeutil.ProxyRole))
-
-	if !streamingutil.IsStreamingServiceEnabled() {
-		if err := node.segAssigner.Start(); err != nil {
-			log.Warn("failed to start segment id assigner", zap.String("role", typeutil.ProxyRole), zap.Error(err))
-			return err
-		}
-		log.Debug("start segment id assigner done", zap.String("role", typeutil.ProxyRole))
-
-		if err := node.chTicker.start(); err != nil {
-			log.Warn("failed to start channels time ticker", zap.String("role", typeutil.ProxyRole), zap.Error(err))
-			return err
-		}
-		log.Debug("start channels time ticker done", zap.String("role", typeutil.ProxyRole))
-
-		node.sendChannelsTimeTickLoop()
-	}
 
 	// Start callbacks
 	for _, cb := range node.startCallbacks {
@@ -463,21 +317,6 @@ func (node *Proxy) Stop() error {
 		log.Info("close scheduler", zap.String("role", typeutil.ProxyRole))
 	}
 
-	if !streamingutil.IsStreamingServiceEnabled() {
-		if node.segAssigner != nil {
-			node.segAssigner.Close()
-			log.Info("close segment id assigner", zap.String("role", typeutil.ProxyRole))
-		}
-
-		if node.chTicker != nil {
-			err := node.chTicker.close()
-			if err != nil {
-				return err
-			}
-			log.Info("close channels time ticker", zap.String("role", typeutil.ProxyRole))
-		}
-	}
-
 	for _, cb := range node.closeCallbacks {
 		cb()
 	}
@@ -488,10 +327,6 @@ func (node *Proxy) Stop() error {
 
 	if node.shardMgr != nil {
 		node.shardMgr.Close()
-	}
-
-	if node.chMgr != nil {
-		node.chMgr.removeAllDMLStream()
 	}
 
 	if node.lbPolicy != nil {
@@ -517,11 +352,6 @@ func (node *Proxy) AddStartCallback(callbacks ...func()) {
 	node.startCallbacks = append(node.startCallbacks, callbacks...)
 }
 
-// lastTick returns the last write timestamp of all pchans in this Proxy.
-func (node *Proxy) lastTick() Timestamp {
-	return node.chTicker.getMinTick()
-}
-
 // AddCloseCallback adds a callback in the Close phase.
 func (node *Proxy) AddCloseCallback(callbacks ...func()) {
 	node.closeCallbacks = append(node.closeCallbacks, callbacks...)
@@ -535,24 +365,9 @@ func (node *Proxy) GetAddress() string {
 	return node.address
 }
 
-// SetEtcdClient sets etcd client for proxy.
-func (node *Proxy) SetEtcdClient(client *clientv3.Client) {
-	node.etcdCli = client
-}
-
-// SetRootCoordClient sets RootCoord client for proxy.
-func (node *Proxy) SetRootCoordClient(cli types.RootCoordClient) {
-	node.rootCoord = cli
-}
-
-// SetDataCoordClient sets DataCoord client for proxy.
-func (node *Proxy) SetDataCoordClient(cli types.DataCoordClient) {
-	node.dataCoord = cli
-}
-
-// SetQueryCoordClient sets QueryCoord client for proxy.
-func (node *Proxy) SetQueryCoordClient(cli types.QueryCoordClient) {
-	node.queryCoord = cli
+// SetMixCoordClient sets MixCoord client for proxy.
+func (node *Proxy) SetMixCoordClient(cli types.MixCoordClient) {
+	node.mixCoord = cli
 }
 
 func (node *Proxy) SetQueryNodeCreator(f func(ctx context.Context, addr string, nodeID int64) (types.QueryNodeClient, error)) {
@@ -562,7 +377,7 @@ func (node *Proxy) SetQueryNodeCreator(f func(ctx context.Context, addr string, 
 // GetRateLimiter returns the rateLimiter in Proxy.
 func (node *Proxy) GetRateLimiter() (types.Limiter, error) {
 	if node.simpleLimiter == nil {
-		return nil, fmt.Errorf("nil rate limiter in Proxy")
+		return nil, errors.New("nil rate limiter in Proxy")
 	}
 	return node.simpleLimiter, nil
 }

@@ -169,7 +169,7 @@ func buildReqParams(c *gin.Context, metricsType string, customParams ...*commonp
 
 func getQueryComponentMetrics(node *Proxy, metricsType string, customParams ...*commonpb.KeyValuePair) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		params := buildReqParams(c, metricsType)
+		params := buildReqParams(c, metricsType, metricsinfo.RequestProcessInQCRole)
 		req, err := metricsinfo.ConstructGetMetricsRequest(params)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
@@ -178,7 +178,7 @@ func getQueryComponentMetrics(node *Proxy, metricsType string, customParams ...*
 			return
 		}
 
-		resp, err := node.queryCoord.GetMetrics(c, req)
+		resp, err := node.mixCoord.GetMetrics(c, req)
 		if err := merr.CheckRPCCall(resp, err); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				mhttp.HTTPReturnMessage: err.Error(),
@@ -191,7 +191,7 @@ func getQueryComponentMetrics(node *Proxy, metricsType string, customParams ...*
 
 func getDataComponentMetrics(node *Proxy, metricsType string, customParams ...*commonpb.KeyValuePair) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		params := buildReqParams(c, metricsType)
+		params := buildReqParams(c, metricsType, metricsinfo.RequestProcessInDCRole)
 		req, err := metricsinfo.ConstructGetMetricsRequest(params)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
@@ -200,7 +200,7 @@ func getDataComponentMetrics(node *Proxy, metricsType string, customParams ...*c
 			return
 		}
 
-		resp, err := node.dataCoord.GetMetrics(c, req)
+		resp, err := node.mixCoord.GetMetrics(c, req)
 		if err := merr.CheckRPCCall(resp, err); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				mhttp.HTTPReturnMessage: err.Error(),
@@ -214,8 +214,8 @@ func getDataComponentMetrics(node *Proxy, metricsType string, customParams ...*c
 // The Get request should be used to get the query parameters, not the body, such as Javascript
 // fetch API only support GET request with query parameter.
 func listCollection(node *Proxy) gin.HandlerFunc {
-	rootCoord := node.rootCoord
-	queryCoord := node.queryCoord
+	rootCoord := node.mixCoord
+	queryCoord := node.mixCoord
 	return func(c *gin.Context) {
 		dbName := c.Query(httpDBName)
 		if len(dbName) == 0 {
@@ -236,7 +236,7 @@ func listCollection(node *Proxy) gin.HandlerFunc {
 			return
 		}
 
-		queryCollectionListResp, err := queryCoord.ShowCollections(c, &querypb.ShowCollectionsRequest{
+		queryCollectionListResp, err := queryCoord.ShowLoadCollections(c, &querypb.ShowCollectionsRequest{
 			Base: &commonpb.MsgBase{
 				MsgType: commonpb.MsgType_ShowCollections,
 			},
@@ -296,7 +296,7 @@ func listCollection(node *Proxy) gin.HandlerFunc {
 }
 
 func describeCollection(node *Proxy) gin.HandlerFunc {
-	rootCoord := node.rootCoord
+	rootCoord := node.mixCoord
 	return func(c *gin.Context) {
 		dbName := c.Query(httpDBName)
 		collectionName := c.Query(HTTPCollectionName)
@@ -355,6 +355,7 @@ func describeCollection(node *Proxy) gin.HandlerFunc {
 			PartitionInfos:       metricsinfo.NewPartitionInfos(describePartitionResp),
 			EnableDynamicField:   describeCollectionResp.Schema.EnableDynamicField,
 			Fields:               metricsinfo.NewFields(describeCollectionResp.GetSchema()),
+			StructArrayFields:    metricsinfo.NewStructArrayFields(describeCollectionResp.GetSchema()),
 		}
 
 		// Marshal the collection struct to JSON

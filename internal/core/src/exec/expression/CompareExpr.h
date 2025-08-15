@@ -40,6 +40,8 @@ struct CompareElementFunc {
                const U* right,
                size_t size,
                TargetBitmapView res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
         // This is the original code, kept here for the documentation purposes
         // also, used for iterative filter
@@ -59,7 +61,35 @@ struct CompareElementFunc {
                 } else if constexpr (op == proto::plan::OpType::LessEqual) {
                     res[i] = left[offset] <= right[offset];
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
+                        OpTypeInvalid,
+                        fmt::format(
+                            "unsupported op_type:{} for CompareElementFunc",
+                            op));
+                }
+            }
+            return;
+        }
+
+        if (!bitmap_input.empty()) {
+            for (int i = 0; i < size; ++i) {
+                if (!bitmap_input[start_cursor + i]) {
+                    continue;
+                }
+                if constexpr (op == proto::plan::OpType::Equal) {
+                    res[i] = left[i] == right[i];
+                } else if constexpr (op == proto::plan::OpType::NotEqual) {
+                    res[i] = left[i] != right[i];
+                } else if constexpr (op == proto::plan::OpType::GreaterThan) {
+                    res[i] = left[i] > right[i];
+                } else if constexpr (op == proto::plan::OpType::LessThan) {
+                    res[i] = left[i] < right[i];
+                } else if constexpr (op == proto::plan::OpType::GreaterEqual) {
+                    res[i] = left[i] >= right[i];
+                } else if constexpr (op == proto::plan::OpType::LessEqual) {
+                    res[i] = left[i] <= right[i];
+                } else {
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported op_type:{} for CompareElementFunc",
@@ -88,7 +118,7 @@ struct CompareElementFunc {
             res.inplace_compare_column<T, U, milvus::bitset::CompareOpType::LE>(
                 left, right, size);
         } else {
-            PanicInfo(OpTypeInvalid,
+            ThrowInfo(OpTypeInvalid,
                       fmt::format(
                           "unsupported op_type:{} for CompareElementFunc", op));
         }
@@ -145,21 +175,36 @@ class PhyCompareFilterExpr : public Expr {
     Eval(EvalCtx& context, VectorPtr& result) override;
 
     void
+    MoveCursorForIndexed(int64_t& pos) {
+        pos = pos + batch_size_ >= segment_chunk_reader_.active_count_
+                  ? segment_chunk_reader_.active_count_
+                  : pos + batch_size_;
+    }
+
+    void
     MoveCursor() override {
         if (!has_offset_input_) {
             if (segment_chunk_reader_.segment_->is_chunked()) {
-                segment_chunk_reader_.MoveCursorForMultipleChunk(
-                    left_current_chunk_id_,
-                    left_current_chunk_pos_,
-                    left_field_,
-                    left_num_chunk_,
-                    batch_size_);
-                segment_chunk_reader_.MoveCursorForMultipleChunk(
-                    right_current_chunk_id_,
-                    right_current_chunk_pos_,
-                    right_field_,
-                    right_num_chunk_,
-                    batch_size_);
+                if (is_left_indexed_) {
+                    MoveCursorForIndexed(left_current_chunk_pos_);
+                } else {
+                    segment_chunk_reader_.MoveCursorForMultipleChunk(
+                        left_current_chunk_id_,
+                        left_current_chunk_pos_,
+                        left_field_,
+                        left_num_chunk_,
+                        batch_size_);
+                }
+                if (is_right_indexed_) {
+                    MoveCursorForIndexed(right_current_chunk_pos_);
+                } else {
+                    segment_chunk_reader_.MoveCursorForMultipleChunk(
+                        right_current_chunk_id_,
+                        right_current_chunk_pos_,
+                        right_field_,
+                        right_num_chunk_,
+                        batch_size_);
+                }
             } else {
                 segment_chunk_reader_.MoveCursorForSingleChunk(
                     current_chunk_id_,
@@ -168,6 +213,21 @@ class PhyCompareFilterExpr : public Expr {
                     batch_size_);
             }
         }
+    }
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
     }
 
  private:
@@ -250,12 +310,12 @@ class PhyCompareFilterExpr : public Expr {
                 auto [right_chunk_id, right_chunk_offset] =
                     get_chunk_id_and_offset(right_field_);
 
-                auto left_chunk = segment_chunk_reader_.segment_->chunk_data<T>(
+                auto pw_left = segment_chunk_reader_.segment_->chunk_data<T>(
                     left_field_, left_chunk_id);
-
-                auto right_chunk =
-                    segment_chunk_reader_.segment_->chunk_data<U>(
-                        right_field_, right_chunk_id);
+                auto left_chunk = pw_left.get();
+                auto pw_right = segment_chunk_reader_.segment_->chunk_data<U>(
+                    right_field_, right_chunk_id);
+                auto right_chunk = pw_right.get();
                 const T* left_data = left_chunk.data() + left_chunk_offset;
                 const U* right_data = right_chunk.data() + right_chunk_offset;
                 func.template operator()<FilterType::random>(
@@ -281,10 +341,12 @@ class PhyCompareFilterExpr : public Expr {
             }
             return processed_size;
         } else {
-            auto left_chunk =
+            auto pw_left =
                 segment_chunk_reader_.segment_->chunk_data<T>(left_field_, 0);
-            auto right_chunk =
+            auto left_chunk = pw_left.get();
+            auto pw_right =
                 segment_chunk_reader_.segment_->chunk_data<U>(right_field_, 0);
+            auto right_chunk = pw_right.get();
             const T* left_data = left_chunk.data();
             const U* right_data = right_chunk.data();
             func.template operator()<FilterType::random>(
@@ -318,10 +380,12 @@ class PhyCompareFilterExpr : public Expr {
 
         const auto active_count = segment_chunk_reader_.active_count_;
         for (size_t i = current_chunk_id_; i < num_chunk_; i++) {
-            auto left_chunk =
+            auto pw_left =
                 segment_chunk_reader_.segment_->chunk_data<T>(left_field_, i);
-            auto right_chunk =
+            auto left_chunk = pw_left.get();
+            auto pw_right =
                 segment_chunk_reader_.segment_->chunk_data<U>(right_field_, i);
+            auto right_chunk = pw_right.get();
             auto data_pos = (i == current_chunk_id_) ? current_chunk_pos_ : 0;
             auto size =
                 (i == (num_chunk_ - 1))
@@ -386,10 +450,12 @@ class PhyCompareFilterExpr : public Expr {
 
         // only call this function when left and right are not indexed, so they have the same number of chunks
         for (size_t i = left_current_chunk_id_; i < left_num_chunk_; i++) {
-            auto left_chunk =
+            auto pw_left =
                 segment_chunk_reader_.segment_->chunk_data<T>(left_field_, i);
-            auto right_chunk =
+            auto left_chunk = pw_left.get();
+            auto pw_right =
                 segment_chunk_reader_.segment_->chunk_data<U>(right_field_, i);
+            auto right_chunk = pw_right.get();
             auto data_pos =
                 (i == left_current_chunk_id_) ? left_current_chunk_pos_ : 0;
             auto size = 0;
@@ -451,21 +517,21 @@ class PhyCompareFilterExpr : public Expr {
 
     template <typename OpType>
     VectorPtr
-    ExecCompareExprDispatcher(OpType op, OffsetVector* input = nullptr);
+    ExecCompareExprDispatcher(OpType op, EvalCtx& context);
 
     VectorPtr
-    ExecCompareExprDispatcherForHybridSegment(OffsetVector* input = nullptr);
+    ExecCompareExprDispatcherForHybridSegment(EvalCtx& context);
 
     VectorPtr
-    ExecCompareExprDispatcherForBothDataSegment(OffsetVector* input = nullptr);
+    ExecCompareExprDispatcherForBothDataSegment(EvalCtx& context);
 
     template <typename T>
     VectorPtr
-    ExecCompareLeftType(OffsetVector* input = nullptr);
+    ExecCompareLeftType(EvalCtx& context);
 
     template <typename T, typename U>
     VectorPtr
-    ExecCompareRightType(OffsetVector* input = nullptr);
+    ExecCompareRightType(EvalCtx& context);
 
  private:
     const FieldId left_field_;

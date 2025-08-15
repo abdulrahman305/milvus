@@ -44,9 +44,17 @@ struct BinaryRangeElementFunc {
                const T* src,
                size_t n,
                TargetBitmapView res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
-        if constexpr (filter_type == FilterType::random) {
+        if constexpr (filter_type == FilterType::random ||
+                      std::is_same_v<T, std::string> ||
+                      std::is_same_v<T, std::string_view>) {
+            bool has_bitmap_input = !bitmap_input.empty();
             for (size_t i = 0; i < n; ++i) {
+                if (has_bitmap_input && !bitmap_input[i + start_cursor]) {
+                    continue;
+                }
                 auto offset = (offsets) ? offsets[i] : i;
                 if constexpr (lower_inclusive && upper_inclusive) {
                     res[i] = val1 <= src[offset] && src[offset] <= val2;
@@ -83,6 +91,9 @@ struct BinaryRangeElementFunc {
             res[i] = valid_res[i] = false;                         \
             break;                                                 \
         }                                                          \
+        if (has_bitmap_input && !bitmap_input[i + start_cursor]) { \
+            break;                                                 \
+        }                                                          \
         auto x = src[offset].template at<GetType>(pointer);        \
         if (x.error()) {                                           \
             if constexpr (std::is_same_v<GetType, int64_t>) {      \
@@ -117,7 +128,10 @@ struct BinaryRangeElementFuncForJson {
                size_t n,
                TargetBitmapView res,
                TargetBitmapView valid_res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
+        bool has_bitmap_input = !bitmap_input.empty();
         for (size_t i = 0; i < n; ++i) {
             auto offset = i;
             if constexpr (filter_type == FilterType::random) {
@@ -153,8 +167,14 @@ struct BinaryRangeElementFuncForArray {
                size_t n,
                TargetBitmapView res,
                TargetBitmapView valid_res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
+        bool has_bitmap_input = !bitmap_input.empty();
         for (size_t i = 0; i < n; ++i) {
+            if (has_bitmap_input && !bitmap_input[i + start_cursor]) {
+                continue;
+            }
             size_t offset = i;
             if constexpr (filter_type == FilterType::random) {
                 offset = (offsets) ? offsets[i] : i;
@@ -225,20 +245,37 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
                       expr->column_.field_id_,
                       expr->column_.nested_path_,
-                      DataType::NONE,
+                      FromValCase(expr->lower_val_.val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
 
  private:
     // Check overflow and cache result for performace
@@ -259,7 +296,7 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecRangeVisitorImpl(OffsetVector* input = nullptr);
+    ExecRangeVisitorImpl(EvalCtx& context);
 
     template <typename T>
     VectorPtr
@@ -267,15 +304,19 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecRangeVisitorImplForData(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplForData(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecRangeVisitorImplForJson(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplForJson(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecRangeVisitorImplForArray(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplForJsonForIndex();
+
+    template <typename ValueType>
+    VectorPtr
+    ExecRangeVisitorImplForArray(EvalCtx& context);
 
  private:
     std::shared_ptr<const milvus::expr::BinaryRangeFilterExpr> expr_;

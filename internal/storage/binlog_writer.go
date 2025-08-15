@@ -19,7 +19,8 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
@@ -91,7 +92,7 @@ func (writer *baseBinlogWriter) GetBinlogType() BinlogType {
 // GetBuffer gets binlog buffer. Return nil if binlog is not finished yet.
 func (writer *baseBinlogWriter) GetBuffer() ([]byte, error) {
 	if writer.buffer == nil {
-		return nil, fmt.Errorf("please close binlog before get buffer")
+		return nil, errors.New("please close binlog before get buffer")
 	}
 	return writer.buffer.Bytes(), nil
 }
@@ -102,7 +103,7 @@ func (writer *baseBinlogWriter) Finish() error {
 		return nil
 	}
 	if writer.StartTimestamp == 0 || writer.EndTimestamp == 0 {
-		return fmt.Errorf("invalid start/end timestamp")
+		return errors.New("invalid start/end timestamp")
 	}
 
 	var offset int32
@@ -153,7 +154,7 @@ type InsertBinlogWriter struct {
 // NextInsertEventWriter returns an event writer to write insert data to an event.
 func (writer *InsertBinlogWriter) NextInsertEventWriter(opts ...PayloadWriterOptions) (*insertEventWriter, error) {
 	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
+		return nil, errors.New("binlog has closed")
 	}
 
 	event, err := newInsertEventWriter(writer.PayloadDataType, opts...)
@@ -173,70 +174,9 @@ type DeleteBinlogWriter struct {
 // NextDeleteEventWriter returns an event writer to write delete data to an event.
 func (writer *DeleteBinlogWriter) NextDeleteEventWriter(opts ...PayloadWriterOptions) (*deleteEventWriter, error) {
 	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
+		return nil, errors.New("binlog has closed")
 	}
 	event, err := newDeleteEventWriter(writer.PayloadDataType, opts...)
-	if err != nil {
-		return nil, err
-	}
-	writer.eventWriters = append(writer.eventWriters, event)
-	return event, nil
-}
-
-// DDLBinlogWriter is an object to write binlog file which saves ddl information.
-type DDLBinlogWriter struct {
-	baseBinlogWriter
-}
-
-// NextCreateCollectionEventWriter returns an event writer to write CreateCollection
-// information to an event.
-func (writer *DDLBinlogWriter) NextCreateCollectionEventWriter() (*createCollectionEventWriter, error) {
-	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
-	}
-	event, err := newCreateCollectionEventWriter(writer.PayloadDataType)
-	if err != nil {
-		return nil, err
-	}
-	writer.eventWriters = append(writer.eventWriters, event)
-	return event, nil
-}
-
-// NextDropCollectionEventWriter returns an event writer to write DropCollection
-// information to an event.
-func (writer *DDLBinlogWriter) NextDropCollectionEventWriter() (*dropCollectionEventWriter, error) {
-	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
-	}
-	event, err := newDropCollectionEventWriter(writer.PayloadDataType)
-	if err != nil {
-		return nil, err
-	}
-	writer.eventWriters = append(writer.eventWriters, event)
-	return event, nil
-}
-
-// NextCreatePartitionEventWriter returns an event writer to write CreatePartition
-// information to an event.
-func (writer *DDLBinlogWriter) NextCreatePartitionEventWriter() (*createPartitionEventWriter, error) {
-	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
-	}
-	event, err := newCreatePartitionEventWriter(writer.PayloadDataType)
-	if err != nil {
-		return nil, err
-	}
-	writer.eventWriters = append(writer.eventWriters, event)
-	return event, nil
-}
-
-// NextDropPartitionEventWriter returns an event writer to write DropPartition
-// information to an event.
-func (writer *DDLBinlogWriter) NextDropPartitionEventWriter() (*dropPartitionEventWriter, error) {
-	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
-	}
-	event, err := newDropPartitionEventWriter(writer.PayloadDataType)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +192,7 @@ type IndexFileBinlogWriter struct {
 // NextIndexFileEventWriter return next available EventWriter
 func (writer *IndexFileBinlogWriter) NextIndexFileEventWriter() (*indexFileEventWriter, error) {
 	if writer.isClosed() {
-		return nil, fmt.Errorf("binlog has closed")
+		return nil, errors.New("binlog has closed")
 	}
 	event, err := newIndexFileEventWriter(writer.PayloadDataType)
 	if err != nil {
@@ -298,23 +238,6 @@ func NewDeleteBinlogWriter(dataType schemapb.DataType, collectionID, partitionID
 			descriptorEvent: *descriptorEvent,
 			magicNumber:     MagicNumber,
 			binlogType:      DeleteBinlog,
-			eventWriters:    make([]EventWriter, 0),
-			buffer:          nil,
-		},
-	}
-	return w
-}
-
-// NewDDLBinlogWriter creates DDLBinlogWriter to write binlog file.
-func NewDDLBinlogWriter(dataType schemapb.DataType, collectionID int64) *DDLBinlogWriter {
-	descriptorEvent := newDescriptorEvent()
-	descriptorEvent.PayloadDataType = dataType
-	descriptorEvent.CollectionID = collectionID
-	w := &DDLBinlogWriter{
-		baseBinlogWriter: baseBinlogWriter{
-			descriptorEvent: *descriptorEvent,
-			magicNumber:     MagicNumber,
-			binlogType:      DDLBinlog,
 			eventWriters:    make([]EventWriter, 0),
 			buffer:          nil,
 		},

@@ -32,6 +32,7 @@ func NewResumableConsumer(factory factory, opts *ConsumerOptions) ResumableConsu
 			inner:                  opts.MessageHandler,
 			lastConfirmedMessageID: nil,
 			lastTimeTick:           0,
+			lastMessageVersion:     message.VersionOld,
 		},
 		factory:    factory,
 		consumeErr: syncutil.NewFuture[error](),
@@ -89,14 +90,26 @@ func (rc *resumableConsumerImpl) resumeLoop() {
 		// Consume ordering is always time tick order now.
 		if rc.mh.lastConfirmedMessageID != nil {
 			// set the deliver policy start after the last message id.
-			deliverPolicy = options.DeliverPolicyStartAfter(rc.mh.lastConfirmedMessageID)
+			// !!! we always set the deliver policy to start from the last confirmed message id.
+			// because the catchup scanner at the streamingnode server must see the last confirmed message id if it's the last timetick.
+			deliverPolicy = options.DeliverPolicyStartFrom(rc.mh.lastConfirmedMessageID)
 			newDeliverFilters := make([]options.DeliverFilter, 0, len(deliverFilters)+1)
 			for _, filter := range deliverFilters {
 				if !options.IsDeliverFilterTimeTick(filter) {
 					newDeliverFilters = append(newDeliverFilters, filter)
 				}
 			}
-			newDeliverFilters = append(newDeliverFilters, options.DeliverFilterTimeTickGT(rc.mh.lastTimeTick))
+			if rc.mh.lastMessageVersion == message.VersionOld {
+				newDeliverFilters = append(newDeliverFilters, options.DeliverFilterTimeTickGTE(rc.mh.lastTimeTick))
+				// If the message is old version, the message is write by msgstream, so different message may have same timetick.
+				// So we need to resume from the last timetick, and a message lost will happen if we skip it.
+				// Meanwhile, the message may be duplicated, so we need to deduplicate the message.
+				// It will be done on MsgPackAdaptorHandler with message id.
+			} else {
+				// New version message always have a unique timetick for every message (txn message will be treated as one message)
+				// So if we have seen the last timetick, we can skip it, only need to resume from the greater timetick.
+				newDeliverFilters = append(newDeliverFilters, options.DeliverFilterTimeTickGT(rc.mh.lastTimeTick))
+			}
 			deliverFilters = newDeliverFilters
 		}
 		opts := &handler.ConsumerOptions{
@@ -131,6 +144,8 @@ func (rc *resumableConsumerImpl) createNewConsumer(opts *handler.ConsumerOptions
 	backoff.InitialInterval = 100 * time.Millisecond
 	backoff.MaxInterval = 10 * time.Second
 	backoff.MaxElapsedTime = 0
+	backoff.Reset()
+
 	for {
 		// Create a new consumer.
 		// a underlying stream consumer life time should be equal to the resumable producer.

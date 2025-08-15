@@ -229,6 +229,7 @@ func (suite *QueryNodeSuite) TestStop() {
 	segment, err := segments.NewSegment(
 		context.Background(),
 		collection,
+		suite.node.manager.Segment,
 		segments.SegmentTypeSealed,
 		1,
 		&querypb.SegmentLoadInfo{
@@ -238,7 +239,6 @@ func (suite *QueryNodeSuite) TestStop() {
 			Level:         datapb.SegmentLevel_Legacy,
 			InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", 1),
 		},
-		nil,
 	)
 	suite.NoError(err)
 	suite.node.manager.Segment.Put(context.Background(), segments.SegmentTypeSealed, segment)

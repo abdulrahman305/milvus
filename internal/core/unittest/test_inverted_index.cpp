@@ -22,53 +22,13 @@
 #include "index/IndexFactory.h"
 #include "test_utils/indexbuilder_test_utils.h"
 #include "index/Meta.h"
+#include "test_utils/DataGen.h"
+#include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
+using namespace milvus::segcore;
 
 namespace milvus::test {
-auto
-gen_field_meta(int64_t collection_id = 1,
-               int64_t partition_id = 2,
-               int64_t segment_id = 3,
-               int64_t field_id = 101,
-               DataType data_type = DataType::NONE,
-               DataType element_type = DataType::NONE,
-               bool nullable = false) -> storage::FieldDataMeta {
-    auto meta = storage::FieldDataMeta{
-        .collection_id = collection_id,
-        .partition_id = partition_id,
-        .segment_id = segment_id,
-        .field_id = field_id,
-    };
-    meta.field_schema.set_data_type(
-        static_cast<proto::schema::DataType>(data_type));
-    meta.field_schema.set_element_type(
-        static_cast<proto::schema::DataType>(element_type));
-    meta.field_schema.set_nullable(nullable);
-    return meta;
-}
-
-auto
-gen_index_meta(int64_t segment_id = 3,
-               int64_t field_id = 101,
-               int64_t index_build_id = 1000,
-               int64_t index_version = 10000) -> storage::IndexMeta {
-    return storage::IndexMeta{
-        .segment_id = segment_id,
-        .field_id = field_id,
-        .build_id = index_build_id,
-        .index_version = index_version,
-    };
-}
-
-auto
-gen_local_storage_config(const std::string& root_path)
-    -> storage::StorageConfig {
-    auto ret = storage::StorageConfig{};
-    ret.storage_type = "local";
-    ret.root_path = root_path;
-    return ret;
-}
 
 struct ChunkManagerWrapper {
     ChunkManagerWrapper(storage::ChunkManagerPtr cm) : cm_(cm) {
@@ -96,7 +56,9 @@ struct ChunkManagerWrapper {
 template <typename T,
           DataType dtype,
           DataType element_type = DataType::NONE,
-          bool nullable = false>
+          bool nullable = false,
+          bool has_lack_binlog_row_ = false,
+          bool has_default_value_ = false>
 void
 test_run() {
     int64_t collection_id = 1;
@@ -105,19 +67,34 @@ test_run() {
     int64_t field_id = 101;
     int64_t index_build_id = 4000;
     int64_t index_version = 4000;
+    int64_t lack_binlog_row = 100;
 
-    auto field_meta = test::gen_field_meta(collection_id,
-                                           partition_id,
-                                           segment_id,
-                                           field_id,
-                                           dtype,
-                                           element_type,
-                                           nullable);
-    auto index_meta = test::gen_index_meta(
-        segment_id, field_id, index_build_id, index_version);
+    auto field_meta = milvus::segcore::gen_field_meta(collection_id,
+                                                      partition_id,
+                                                      segment_id,
+                                                      field_id,
+                                                      dtype,
+                                                      element_type,
+                                                      nullable);
+    auto index_meta =
+        gen_index_meta(segment_id, field_id, index_build_id, index_version);
+
+    if (has_default_value_) {
+        auto default_value = field_meta.field_schema.mutable_default_value();
+        if constexpr (std::is_same_v<int8_t, T> || std::is_same_v<int16_t, T> ||
+                      std::is_same_v<int32_t, T>) {
+            default_value->set_int_data(20);
+        } else if constexpr (std::is_same_v<int64_t, T>) {
+            default_value->set_long_data(20);
+        } else if constexpr (std::is_same_v<float, T>) {
+            default_value->set_float_data(20);
+        } else if constexpr (std::is_same_v<double, T>) {
+            default_value->set_double_data(20);
+        }
+    }
 
     std::string root_path = "/tmp/test-inverted-index/";
-    auto storage_config = test::gen_local_storage_config(root_path);
+    auto storage_config = gen_local_storage_config(root_path);
     auto cm = storage::CreateChunkManager(storage_config);
 
     size_t nb = 10000;
@@ -155,13 +132,15 @@ test_run() {
                 valid_data_[byteIndex] &= ~(1 << bitIndex);
             }
         }
-        field_data->FillFieldData(data.data(), valid_data_, data.size());
+        field_data->FillFieldData(data.data(), valid_data_, data.size(), 0);
         delete[] valid_data_;
     } else {
         field_data->FillFieldData(data.data(), data.size());
     }
     // std::cout << "length:" << field_data->get_num_rows() << std::endl;
-    storage::InsertData insert_data(field_data);
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    storage::InsertData insert_data(payload_reader);
     insert_data.SetFieldDataMeta(field_meta);
     insert_data.SetTimestamps(0, 100);
 
@@ -187,7 +166,11 @@ test_run() {
     {
         Config config;
         config["index_type"] = milvus::index::INVERTED_INDEX_TYPE;
-        config["insert_files"] = std::vector<std::string>{log_path};
+        config[INSERT_FILES_KEY] = std::vector<std::string>{log_path};
+        config[INDEX_NUM_ROWS_KEY] = nb;
+        if (has_lack_binlog_row_) {
+            config[INDEX_NUM_ROWS_KEY] = nb + lack_binlog_row;
+        }
 
         auto index = indexbuilder::IndexFactory::GetInstance().CreateIndex(
             dtype, config, ctx);
@@ -208,14 +191,19 @@ test_run() {
 
         Config config;
         config["index_files"] = index_files;
-
+        config[milvus::LOAD_PRIORITY] =
+            milvus::proto::common::LoadPriority::HIGH;
         ctx.set_for_loading_index(true);
         auto index =
             index::IndexFactory::GetInstance().CreateIndex(index_info, ctx);
         index->Load(milvus::tracer::TraceContext{}, config);
 
         auto cnt = index->Count();
-        ASSERT_EQ(cnt, nb);
+        if (has_lack_binlog_row_) {
+            ASSERT_EQ(cnt, nb + lack_binlog_row);
+        } else {
+            ASSERT_EQ(cnt, nb);
+        }
 
         using IndexType = index::ScalarIndex<T>;
         auto real_index = dynamic_cast<IndexType*>(index.get());
@@ -233,11 +221,23 @@ test_run() {
                 auto bitset =
                     real_index->In(test_data.size(), test_data.data());
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < bitset.size(); i++) {
-                    if (nullable && !valid_data[i]) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (!has_default_value_) {
+                            ASSERT_EQ(bitset[i], false);
+                        } else {
+                            ASSERT_EQ(bitset[i], s.find(20) != s.end());
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+                for (size_t i = start; i < bitset.size(); i++) {
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(bitset[i], false);
                     } else {
-                        ASSERT_EQ(bitset[i], s.find(data[i]) != s.end());
+                        ASSERT_EQ(bitset[i],
+                                  s.find(data[i - start]) != s.end());
                     }
                 }
             }
@@ -253,11 +253,23 @@ test_run() {
                 auto bitset =
                     real_index->NotIn(test_data.size(), test_data.data());
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < bitset.size(); i++) {
-                    if (nullable && !valid_data[i]) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (!has_default_value_) {
+                            ASSERT_EQ(bitset[i], false);
+                        } else {
+                            ASSERT_EQ(bitset[i], s.find(20) == s.end());
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+                for (size_t i = start; i < bitset.size(); i++) {
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(bitset[i], false);
                     } else {
-                        ASSERT_NE(bitset[i], s.find(data[i]) != s.end());
+                        ASSERT_NE(bitset[i],
+                                  s.find(data[i - start]) != s.end());
                     }
                 }
             }
@@ -265,8 +277,19 @@ test_run() {
             {
                 auto bitset = real_index->IsNull();
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < bitset.size(); i++) {
-                    if (nullable && !valid_data[i]) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (has_default_value_) {
+                            ASSERT_EQ(bitset[i], false);
+                        } else {
+                            ASSERT_EQ(bitset[i], true);
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+                for (size_t i = start; i < bitset.size(); i++) {
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(bitset[i], true);
                     } else {
                         ASSERT_EQ(bitset[i], false);
@@ -277,8 +300,20 @@ test_run() {
             {
                 auto bitset = real_index->IsNotNull();
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < bitset.size(); i++) {
-                    if (nullable && !valid_data[i]) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (has_default_value_) {
+                            ASSERT_EQ(bitset[i], true);
+                        } else {
+                            ASSERT_EQ(bitset[i], false);
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+
+                for (size_t i = start; i < bitset.size(); i++) {
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(bitset[i], false);
                     } else {
                         ASSERT_EQ(bitset[i], true);
@@ -293,27 +328,51 @@ test_run() {
             // range query on boolean is not reasonable.
 
             {
-                std::vector<std::tuple<T, OpType, RefFunc>> test_cases{
-                    {20,
-                     OpType::GreaterThan,
-                     [&](int64_t i) -> bool { return data[i] > 20; }},
-                    {20,
-                     OpType::GreaterEqual,
-                     [&](int64_t i) -> bool { return data[i] >= 20; }},
-                    {20,
-                     OpType::LessThan,
-                     [&](int64_t i) -> bool { return data[i] < 20; }},
-                    {20,
-                     OpType::LessEqual,
-                     [&](int64_t i) -> bool { return data[i] <= 20; }},
+                std::vector<std::tuple<T, OpType, RefFunc, bool>> test_cases{
+                    {
+                        20,
+                        OpType::GreaterThan,
+                        [&](int64_t i) -> bool { return data[i] > 20; },
+                        false,
+                    },
+                    {
+                        20,
+                        OpType::GreaterEqual,
+                        [&](int64_t i) -> bool { return data[i] >= 20; },
+                        true,
+                    },
+                    {
+                        20,
+                        OpType::LessThan,
+                        [&](int64_t i) -> bool { return data[i] < 20; },
+                        false,
+                    },
+                    {
+                        20,
+                        OpType::LessEqual,
+                        [&](int64_t i) -> bool { return data[i] <= 20; },
+                        true,
+                    },
                 };
-                for (const auto& [test_value, op, ref] : test_cases) {
+                for (const auto& [test_value, op, ref, default_value_res] :
+                     test_cases) {
                     auto bitset = real_index->Range(test_value, op);
                     ASSERT_EQ(cnt, bitset.size());
-                    for (size_t i = 0; i < nb; i++) {
+                    size_t start = 0;
+                    if (has_lack_binlog_row_) {
+                        for (int i = 0; i < lack_binlog_row; i++) {
+                            if (has_default_value_) {
+                                ASSERT_EQ(bitset[i], default_value_res);
+                            } else {
+                                ASSERT_EQ(bitset[i], false);
+                            }
+                        }
+                        start += lack_binlog_row;
+                    }
+                    for (size_t i = start; i < bitset.size(); i++) {
                         auto ans = bitset[i];
-                        auto should = ref(i);
-                        if (nullable && !valid_data[i]) {
+                        auto should = ref(i - start);
+                        if (nullable && !valid_data[i - start]) {
                             ASSERT_EQ(ans, false);
                         } else {
                             ASSERT_EQ(ans, should)
@@ -325,45 +384,73 @@ test_run() {
             }
 
             {
-                std::vector<std::tuple<T, bool, T, bool, RefFunc>> test_cases{
-                    {1,
-                     false,
-                     20,
-                     false,
-                     [&](int64_t i) -> bool {
-                         return 1 < data[i] && data[i] < 20;
-                     }},
-                    {1,
-                     false,
-                     20,
-                     true,
-                     [&](int64_t i) -> bool {
-                         return 1 < data[i] && data[i] <= 20;
-                     }},
-                    {1,
-                     true,
-                     20,
-                     false,
-                     [&](int64_t i) -> bool {
-                         return 1 <= data[i] && data[i] < 20;
-                     }},
-                    {1,
-                     true,
-                     20,
-                     true,
-                     [&](int64_t i) -> bool {
-                         return 1 <= data[i] && data[i] <= 20;
-                     }},
-                };
-                for (const auto& [lb, lb_inclusive, ub, ub_inclusive, ref] :
-                     test_cases) {
+                std::vector<std::tuple<T, bool, T, bool, RefFunc, bool>>
+                    test_cases{
+                        {
+                            1,
+                            false,
+                            20,
+                            false,
+                            [&](int64_t i) -> bool {
+                                return 1 < data[i] && data[i] < 20;
+                            },
+                            false,
+                        },
+                        {
+                            1,
+                            false,
+                            20,
+                            true,
+                            [&](int64_t i) -> bool {
+                                return 1 < data[i] && data[i] <= 20;
+                            },
+                            true,
+                        },
+                        {
+                            1,
+                            true,
+                            20,
+                            false,
+                            [&](int64_t i) -> bool {
+                                return 1 <= data[i] && data[i] < 20;
+                            },
+                            false,
+                        },
+                        {
+                            1,
+                            true,
+                            20,
+                            true,
+                            [&](int64_t i) -> bool {
+                                return 1 <= data[i] && data[i] <= 20;
+                            },
+                            true,
+                        },
+                    };
+                for (const auto& [lb,
+                                  lb_inclusive,
+                                  ub,
+                                  ub_inclusive,
+                                  ref,
+                                  default_value_res] : test_cases) {
                     auto bitset =
                         real_index->Range(lb, lb_inclusive, ub, ub_inclusive);
                     ASSERT_EQ(cnt, bitset.size());
-                    for (size_t i = 0; i < nb; i++) {
+                    size_t start = 0;
+                    if (has_lack_binlog_row_) {
+                        for (int i = 0; i < lack_binlog_row; i++) {
+                            if (has_default_value_) {
+                                ASSERT_EQ(bitset[i], default_value_res);
+                            } else {
+                                ASSERT_EQ(bitset[i], false);
+                            }
+                        }
+                        start += lack_binlog_row;
+                    }
+                    for (size_t i = start; i < bitset.size(); i++) {
                         auto ans = bitset[i];
-                        auto should = ref(i);
-                        if (nullable && !valid_data[i]) {
+                        auto should = ref(i - start);
+                        if (nullable && !valid_data[i - start]) {
                             ASSERT_EQ(ans, false);
                         } else {
                             ASSERT_EQ(ans, should)
@@ -377,7 +464,9 @@ test_run() {
     }
 }
 
-template <bool nullable = false>
+template <bool nullable = false,
+          bool has_lack_binlog_row_ = false,
+          bool has_default_value_ = false>
 void
 test_string() {
     using T = std::string;
@@ -389,19 +478,25 @@ test_string() {
     int64_t field_id = 101;
     int64_t index_build_id = 4001;
     int64_t index_version = 4001;
+    int64_t lack_binlog_row = 100;
 
-    auto field_meta = test::gen_field_meta(collection_id,
-                                           partition_id,
-                                           segment_id,
-                                           field_id,
-                                           dtype,
-                                           DataType::NONE,
-                                           nullable);
-    auto index_meta = test::gen_index_meta(
-        segment_id, field_id, index_build_id, index_version);
+    auto field_meta = milvus::segcore::gen_field_meta(collection_id,
+                                                      partition_id,
+                                                      segment_id,
+                                                      field_id,
+                                                      dtype,
+                                                      DataType::NONE,
+                                                      nullable);
+    auto index_meta =
+        gen_index_meta(segment_id, field_id, index_build_id, index_version);
+
+    if (has_default_value_) {
+        auto default_value = field_meta.field_schema.mutable_default_value();
+        default_value->set_string_data("20");
+    }
 
     std::string root_path = "/tmp/test-inverted-index/";
-    auto storage_config = test::gen_local_storage_config(root_path);
+    auto storage_config = gen_local_storage_config(root_path);
     auto cm = storage::CreateChunkManager(storage_config);
 
     size_t nb = 10000;
@@ -431,12 +526,14 @@ test_string() {
                 valid_data_[byteIndex] &= ~(1 << bitIndex);
             }
         }
-        field_data->FillFieldData(data.data(), valid_data_, data.size());
+        field_data->FillFieldData(data.data(), valid_data_, data.size(), 0);
         delete[] valid_data_;
     } else {
         field_data->FillFieldData(data.data(), data.size());
     }
-    storage::InsertData insert_data(field_data);
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    storage::InsertData insert_data(payload_reader);
     insert_data.SetFieldDataMeta(field_meta);
     insert_data.SetTimestamps(0, 100);
 
@@ -462,7 +559,11 @@ test_string() {
     {
         Config config;
         config["index_type"] = milvus::index::INVERTED_INDEX_TYPE;
-        config["insert_files"] = std::vector<std::string>{log_path};
+        config[INSERT_FILES_KEY] = std::vector<std::string>{log_path};
+        config[INDEX_NUM_ROWS_KEY] = nb;
+        if (has_lack_binlog_row_) {
+            config[INDEX_NUM_ROWS_KEY] = nb + lack_binlog_row;
+        }
 
         auto index = indexbuilder::IndexFactory::GetInstance().CreateIndex(
             dtype, config, ctx);
@@ -483,14 +584,19 @@ test_string() {
 
         Config config;
         config["index_files"] = index_files;
-
+        config[milvus::LOAD_PRIORITY] =
+            milvus::proto::common::LoadPriority::HIGH;
         ctx.set_for_loading_index(true);
         auto index =
             index::IndexFactory::GetInstance().CreateIndex(index_info, ctx);
         index->Load(milvus::tracer::TraceContext{}, config);
 
         auto cnt = index->Count();
-        ASSERT_EQ(cnt, nb);
+        if (has_lack_binlog_row_) {
+            ASSERT_EQ(cnt, nb + lack_binlog_row);
+        } else {
+            ASSERT_EQ(cnt, nb);
+        }
 
         using IndexType = index::ScalarIndex<T>;
         auto real_index = dynamic_cast<IndexType*>(index.get());
@@ -505,11 +611,22 @@ test_string() {
             }
             auto bitset = real_index->In(test_data.size(), test_data.data());
             ASSERT_EQ(cnt, bitset.size());
-            for (size_t i = 0; i < bitset.size(); i++) {
-                if (nullable && !valid_data[i]) {
+            size_t start = 0;
+            if (has_lack_binlog_row_) {
+                for (int i = 0; i < lack_binlog_row; i++) {
+                    if (!has_default_value_) {
+                        ASSERT_EQ(bitset[i], false);
+                    } else {
+                        ASSERT_EQ(bitset[i], s.find("20") != s.end());
+                    }
+                }
+                start += lack_binlog_row;
+            }
+            for (size_t i = start; i < bitset.size(); i++) {
+                if (nullable && !valid_data[i - start]) {
                     ASSERT_EQ(bitset[i], false);
                 } else {
-                    ASSERT_EQ(bitset[i], s.find(data[i]) != s.end());
+                    ASSERT_EQ(bitset[i], s.find(data[i - start]) != s.end());
                 }
             }
         }
@@ -524,11 +641,22 @@ test_string() {
             }
             auto bitset = real_index->NotIn(test_data.size(), test_data.data());
             ASSERT_EQ(cnt, bitset.size());
-            for (size_t i = 0; i < bitset.size(); i++) {
-                if (nullable && !valid_data[i]) {
+            size_t start = 0;
+            if (has_lack_binlog_row_) {
+                for (int i = 0; i < lack_binlog_row; i++) {
+                    if (!has_default_value_) {
+                        ASSERT_EQ(bitset[i], false);
+                    } else {
+                        ASSERT_NE(bitset[i], s.find("20") != s.end());
+                    }
+                }
+                start += lack_binlog_row;
+            }
+            for (size_t i = start; i < bitset.size(); i++) {
+                if (nullable && !valid_data[i - start]) {
                     ASSERT_EQ(bitset[i], false);
                 } else {
-                    ASSERT_NE(bitset[i], s.find(data[i]) != s.end());
+                    ASSERT_NE(bitset[i], s.find(data[i - start]) != s.end());
                 }
             }
         }
@@ -536,27 +664,51 @@ test_string() {
         using RefFunc = std::function<bool(int64_t)>;
 
         {
-            std::vector<std::tuple<T, OpType, RefFunc>> test_cases{
-                {"20",
-                 OpType::GreaterThan,
-                 [&](int64_t i) -> bool { return data[i] > "20"; }},
-                {"20",
-                 OpType::GreaterEqual,
-                 [&](int64_t i) -> bool { return data[i] >= "20"; }},
-                {"20",
-                 OpType::LessThan,
-                 [&](int64_t i) -> bool { return data[i] < "20"; }},
-                {"20",
-                 OpType::LessEqual,
-                 [&](int64_t i) -> bool { return data[i] <= "20"; }},
+            std::vector<std::tuple<T, OpType, RefFunc, bool>> test_cases{
+                {
+                    "20",
+                    OpType::GreaterThan,
+                    [&](int64_t i) -> bool { return data[i] > "20"; },
+                    false,
+                },
+                {
+                    "20",
+                    OpType::GreaterEqual,
+                    [&](int64_t i) -> bool { return data[i] >= "20"; },
+                    true,
+                },
+                {
+                    "20",
+                    OpType::LessThan,
+                    [&](int64_t i) -> bool { return data[i] < "20"; },
+                    false,
+                },
+                {
+                    "20",
+                    OpType::LessEqual,
+                    [&](int64_t i) -> bool { return data[i] <= "20"; },
+                    true,
+                },
             };
-            for (const auto& [test_value, op, ref] : test_cases) {
+            for (const auto& [test_value, op, ref, default_value_res] :
+                 test_cases) {
                 auto bitset = real_index->Range(test_value, op);
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < bitset.size(); i++) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (has_default_value_) {
+                            ASSERT_EQ(bitset[i], default_value_res);
+                        } else {
+                            ASSERT_EQ(bitset[i], false);
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+                for (size_t i = start; i < bitset.size(); i++) {
                     auto ans = bitset[i];
-                    auto should = ref(i);
-                    if (nullable && !valid_data[i]) {
+                    auto should = ref(i - start);
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(ans, false);
                     } else {
                         ASSERT_EQ(ans, should)
@@ -568,45 +720,72 @@ test_string() {
         }
 
         {
-            std::vector<std::tuple<T, bool, T, bool, RefFunc>> test_cases{
-                {"1",
-                 false,
-                 "20",
-                 false,
-                 [&](int64_t i) -> bool {
-                     return "1" < data[i] && data[i] < "20";
-                 }},
-                {"1",
-                 false,
-                 "20",
-                 true,
-                 [&](int64_t i) -> bool {
-                     return "1" < data[i] && data[i] <= "20";
-                 }},
-                {"1",
-                 true,
-                 "20",
-                 false,
-                 [&](int64_t i) -> bool {
-                     return "1" <= data[i] && data[i] < "20";
-                 }},
-                {"1",
-                 true,
-                 "20",
-                 true,
-                 [&](int64_t i) -> bool {
-                     return "1" <= data[i] && data[i] <= "20";
-                 }},
+            std::vector<std::tuple<T, bool, T, bool, RefFunc, bool>> test_cases{
+                {
+                    "1",
+                    false,
+                    "20",
+                    false,
+                    [&](int64_t i) -> bool {
+                        return "1" < data[i] && data[i] < "20";
+                    },
+                    false,
+                },
+                {
+                    "1",
+                    false,
+                    "20",
+                    true,
+                    [&](int64_t i) -> bool {
+                        return "1" < data[i] && data[i] <= "20";
+                    },
+                    true,
+                },
+                {
+                    "1",
+                    true,
+                    "20",
+                    false,
+                    [&](int64_t i) -> bool {
+                        return "1" <= data[i] && data[i] < "20";
+                    },
+                    false,
+                },
+                {
+                    "1",
+                    true,
+                    "20",
+                    true,
+                    [&](int64_t i) -> bool {
+                        return "1" <= data[i] && data[i] <= "20";
+                    },
+                    true,
+                },
             };
-            for (const auto& [lb, lb_inclusive, ub, ub_inclusive, ref] :
-                 test_cases) {
+            for (const auto& [lb,
+                              lb_inclusive,
+                              ub,
+                              ub_inclusive,
+                              ref,
+                              default_value_res] : test_cases) {
                 auto bitset =
                     real_index->Range(lb, lb_inclusive, ub, ub_inclusive);
                 ASSERT_EQ(cnt, bitset.size());
-                for (size_t i = 0; i < nb; i++) {
+                size_t start = 0;
+                if (has_lack_binlog_row_) {
+                    for (int i = 0; i < lack_binlog_row; i++) {
+                        if (has_default_value_) {
+                            ASSERT_EQ(bitset[i], default_value_res);
+                        } else {
+                            ASSERT_EQ(bitset[i], false);
+                        }
+                    }
+                    start += lack_binlog_row;
+                }
+                for (size_t i = start; i < bitset.size(); i++) {
                     auto ans = bitset[i];
-                    auto should = ref(i);
-                    if (nullable && !valid_data[i]) {
+                    auto should = ref(i - start);
+                    if (nullable && !valid_data[i - start]) {
                         ASSERT_EQ(ans, false);
                     } else {
                         ASSERT_EQ(ans, should) << "@" << i << ", ans: " << ans
@@ -620,12 +799,23 @@ test_string() {
             auto dataset = std::make_shared<Dataset>();
             auto prefix = data[0];
             dataset->Set(index::OPERATOR_TYPE, OpType::PrefixMatch);
-            dataset->Set(index::PREFIX_VALUE, prefix);
+            dataset->Set(index::MATCH_VALUE, prefix);
             auto bitset = real_index->Query(dataset);
             ASSERT_EQ(cnt, bitset.size());
-            for (size_t i = 0; i < bitset.size(); i++) {
-                auto should = boost::starts_with(data[i], prefix);
-                if (nullable && !valid_data[i]) {
+            size_t start = 0;
+            if (has_lack_binlog_row_) {
+                for (int i = 0; i < lack_binlog_row; i++) {
+                    if (has_default_value_) {
+                        ASSERT_EQ(bitset[i], boost::starts_with("20", prefix));
+                    } else {
+                        ASSERT_EQ(bitset[i], false);
+                    }
+                }
+                start += lack_binlog_row;
+            }
+            for (size_t i = start; i < bitset.size(); i++) {
+                auto should = boost::starts_with(data[i - start], prefix);
+                if (nullable && !valid_data[i - start]) {
                     should = false;
                 }
                 ASSERT_EQ(bitset[i], should);
@@ -637,9 +827,20 @@ test_string() {
             auto prefix = data[0];
             auto bitset = real_index->RegexQuery(prefix + "(.|\n)*");
             ASSERT_EQ(cnt, bitset.size());
-            for (size_t i = 0; i < bitset.size(); i++) {
-                auto should = boost::starts_with(data[i], prefix);
-                if (nullable && !valid_data[i]) {
+            size_t start = 0;
+            if (has_lack_binlog_row_) {
+                for (int i = 0; i < lack_binlog_row; i++) {
+                    if (has_default_value_) {
+                        ASSERT_EQ(bitset[i], boost::starts_with("20", prefix));
+                    } else {
+                        ASSERT_EQ(bitset[i], false);
+                    }
+                }
+                start += lack_binlog_row;
+            }
+            for (size_t i = start; i < bitset.size(); i++) {
+                auto should = boost::starts_with(data[i - start], prefix);
+                if (nullable && !valid_data[i - start]) {
                     should = false;
                 }
                 ASSERT_EQ(bitset[i], should);
@@ -671,4 +872,32 @@ TEST(InvertedIndex, Naive) {
     test_run<double, DataType::DOUBLE, DataType::NONE, true>();
 
     test_string<true>();
+}
+
+TEST(InvertedIndex, HasLackBinlogRows) {
+    // lack binlog is null
+    test_run<int8_t, DataType::INT8, DataType::NONE, true, true>();
+    test_run<int16_t, DataType::INT16, DataType::NONE, true, true>();
+    test_run<int32_t, DataType::INT32, DataType::NONE, true, true>();
+    test_run<int64_t, DataType::INT64, DataType::NONE, true, true>();
+
+    test_run<bool, DataType::BOOL, DataType::NONE, true, true>();
+
+    test_run<float, DataType::FLOAT, DataType::NONE, true, true>();
+    test_run<double, DataType::DOUBLE, DataType::NONE, true, true>();
+
+    test_string<true, true>();
+
+    // lack binlog is default_value
+    test_run<int8_t, DataType::INT8, DataType::NONE, true, true, true>();
+    test_run<int16_t, DataType::INT16, DataType::NONE, true, true, true>();
+    test_run<int32_t, DataType::INT32, DataType::NONE, true, true, true>();
+    test_run<int64_t, DataType::INT64, DataType::NONE, true, true, true>();
+
+    test_run<bool, DataType::BOOL, DataType::NONE, true, true, true>();
+
+    test_run<float, DataType::FLOAT, DataType::NONE, true, true, true>();
+    test_run<double, DataType::DOUBLE, DataType::NONE, true, true, true>();
+
+    test_string<true, true, true>();
 }

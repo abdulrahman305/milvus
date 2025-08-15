@@ -20,7 +20,6 @@ const interceptorName = "timetick"
 
 var (
 	_ interceptors.InterceptorWithMetrics       = (*timeTickAppendInterceptor)(nil)
-	_ interceptors.InterceptorWithReady         = (*timeTickAppendInterceptor)(nil)
 	_ interceptors.InterceptorWithGracefulClose = (*timeTickAppendInterceptor)(nil)
 )
 
@@ -34,18 +33,9 @@ func (impl *timeTickAppendInterceptor) Name() string {
 	return interceptorName
 }
 
-// Ready implements AppendInterceptor.
-func (impl *timeTickAppendInterceptor) Ready() <-chan struct{} {
-	return impl.operator.Ready()
-}
-
 // Do implements AppendInterceptor.
 func (impl *timeTickAppendInterceptor) DoAppend(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (msgID message.MessageID, err error) {
-	cm, err := impl.operator.MVCCManager(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+	cm := impl.operator.MVCCManager()
 	defer func() {
 		if err == nil {
 			// the cursor manager should beready since the timetick interceptor is ready.
@@ -133,7 +123,7 @@ func (impl *timeTickAppendInterceptor) DoAppend(ctx context.Context, msg message
 func (impl *timeTickAppendInterceptor) GracefulClose() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	logger := log.With(zap.Any("pchannel", impl.operator.pchannel))
+	logger := log.With(zap.Any("pchannel", impl.operator.interceptorBuildParam.ChannelInfo))
 	logger.Info("timeTickAppendInterceptor is closing, try to perform a txn manager graceful shutdown")
 	if err := impl.txnManager.GracefulClose(ctx); err != nil {
 		logger.Warn("timeTickAppendInterceptor is closed", zap.Error(err))
@@ -155,12 +145,10 @@ func (impl *timeTickAppendInterceptor) handleBegin(ctx context.Context, msg mess
 		return nil, nil, err
 	}
 	// Begin transaction will generate a txn context.
-	session, err := impl.txnManager.BeginNewTxn(ctx, msg.TimeTick(), time.Duration(beginTxnMsg.Header().KeepaliveMilliseconds)*time.Millisecond)
+	session, err := impl.txnManager.BeginNewTxn(ctx, beginTxnMsg)
 	if err != nil {
-		session.BeginRollback()
 		return nil, nil, err
 	}
-	session.BeginDone()
 	return session, msg.WithTxnContext(session.TxnContext()), nil
 }
 

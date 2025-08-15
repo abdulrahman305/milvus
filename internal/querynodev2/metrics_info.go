@@ -25,12 +25,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/querynodev2/collector"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -75,9 +77,6 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 	collections := node.manager.Collection.ListWithName()
 	nodeID := fmt.Sprint(node.GetNodeID())
 
-	metrics.QueryNodeNumEntities.Reset()
-	metrics.QueryNodeEntitiesSize.Reset()
-
 	var totalGrowingSize int64
 	growingSegments := node.manager.Segment.GetBy(segments.WithType(segments.SegmentTypeGrowing))
 	growingGroupByCollection := lo.GroupBy(growingSegments, func(seg segments.Segment) int64 {
@@ -119,10 +118,8 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 		metrics.QueryNodeEntitiesSize.WithLabelValues(fmt.Sprint(node.GetNodeID()),
 			fmt.Sprint(collection), segments.SegmentTypeSealed.String()).Set(float64(size))
 	}
-	sealedGroupByPartition := lo.GroupBy(sealedSegments, func(seg segments.Segment) int64 {
-		return seg.Partition()
-	})
-	for _, segs := range sealedGroupByPartition {
+
+	for _, segs := range sealedGroupByCollection {
 		numEntities := lo.SumBy(segs, func(seg segments.Segment) int64 {
 			return seg.RowNum()
 		})
@@ -164,7 +161,27 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 			CollectionDeleteBufferNum:  deleteBufferNum,
 			CollectionDeleteBufferSize: deleteBufferSize,
 		},
+		StreamingQuota: getStreamingQuotaMetrics(),
 	}, nil
+}
+
+// getStreamingQuotaMetrics returns the streaming quota metrics of the QueryNode.
+func getStreamingQuotaMetrics() *metricsinfo.StreamingQuotaMetrics {
+	if streamingMetrics, err := streaming.WAL().Local().GetMetricsIfLocal(context.Background()); err == nil {
+		walMetrics := make([]metricsinfo.WALMetrics, 0, len(streamingMetrics.WALMetrics))
+		for channel, metric := range streamingMetrics.WALMetrics {
+			if rwMetric, ok := metric.(types.RWWALMetrics); ok {
+				walMetrics = append(walMetrics, metricsinfo.WALMetrics{
+					Channel:          channel,
+					RecoveryTimeTick: rwMetric.RecoveryTimeTick,
+				})
+			}
+		}
+		return &metricsinfo.StreamingQuotaMetrics{
+			WALs: walMetrics,
+		}
+	}
+	return nil
 }
 
 func getCollectionMetrics(node *QueryNode) (*metricsinfo.QueryNodeCollectionMetrics, error) {

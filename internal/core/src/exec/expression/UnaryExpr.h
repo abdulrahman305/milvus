@@ -18,6 +18,7 @@
 
 #include <fmt/core.h>
 
+#include <optional>
 #include <utility>
 
 #include "common/EasyAssert.h"
@@ -41,15 +42,20 @@ struct UnaryElementFuncForMatch {
 
     void
     operator()(const T* src,
-
                size_t size,
                IndexInnerType val,
                TargetBitmapView res,
-               int64_t* offsets = nullptr) {
+               const TargetBitmap& bitmap_input,
+               int start_cursor,
+               const int32_t* offsets = nullptr) {
         PatternMatchTranslator translator;
         auto regex_pattern = translator(val);
         RegexMatcher matcher(regex_pattern);
+        bool has_bitmap_input = !bitmap_input.empty();
         for (int i = 0; i < size; ++i) {
+            if (has_bitmap_input && !bitmap_input[i + start_cursor]) {
+                continue;
+            }
             if constexpr (filter_type == FilterType::random) {
                 res[i] = matcher(src[offsets ? offsets[i] : i]);
             } else {
@@ -69,10 +75,13 @@ struct UnaryElementFunc {
                size_t size,
                IndexInnerType val,
                TargetBitmapView res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
+        bool has_bitmap_input = !bitmap_input.empty();
         if constexpr (op == proto::plan::OpType::Match) {
             UnaryElementFuncForMatch<T, filter_type> func;
-            func(src, size, val, res);
+            func(src, size, val, res, bitmap_input, start_cursor, offsets);
             return;
         }
 
@@ -93,25 +102,67 @@ struct UnaryElementFunc {
                     res[i] = src[offset] >= val;
                 } else if constexpr (op == proto::plan::OpType::LessEqual) {
                     res[i] = src[offset] <= val;
-                } else if constexpr (op == proto::plan::OpType::PrefixMatch) {
-                    res[i] = milvus::query::Match(
-                        src[offset], val, proto::plan::OpType::PrefixMatch);
+                } else if constexpr (op == proto::plan::OpType::PrefixMatch ||
+                                     op == proto::plan::OpType::PostfixMatch ||
+                                     op == proto::plan::OpType::InnerMatch) {
+                    res[i] = milvus::query::Match(src[offset], val, op);
                 } else {
-                    PanicInfo(
-                        OpTypeInvalid,
-                        fmt::format(
-                            "unsupported op_type:{} for UnaryElementFunc", op));
+                    ThrowInfo(OpTypeInvalid,
+                              "unsupported op_type:{} for UnaryElementFunc",
+                              op);
                 }
             }
             return;
         }
 
-        if constexpr (op == proto::plan::OpType::PrefixMatch) {
-            for (int i = 0; i < size; ++i) {
-                res[i] = milvus::query::Match(
-                    src[i], val, proto::plan::OpType::PrefixMatch);
+        if (has_bitmap_input) {
+            if constexpr (std::is_same_v<T, std::string_view> ||
+                          std::is_same_v<T, std::string>) {
+                for (int i = 0; i < size; ++i) {
+                    if (!bitmap_input[i + start_cursor]) {
+                        continue;
+                    }
+                    if constexpr (op == proto::plan::OpType::Equal) {
+                        res[i] = src[i] == val;
+                    } else if constexpr (op == proto::plan::OpType::NotEqual) {
+                        res[i] = src[i] != val;
+                    } else if constexpr (op ==
+                                         proto::plan::OpType::GreaterThan) {
+                        res[i] = src[i] > val;
+                    } else if constexpr (op == proto::plan::OpType::LessThan) {
+                        res[i] = src[i] < val;
+                    } else if constexpr (op ==
+                                         proto::plan::OpType::GreaterEqual) {
+                        res[i] = src[i] >= val;
+                    } else if constexpr (op == proto::plan::OpType::LessEqual) {
+                        res[i] = src[i] <= val;
+                    } else if constexpr (op ==
+                                             proto::plan::OpType::PrefixMatch ||
+                                         op == proto::plan::OpType::
+                                                   PostfixMatch ||
+                                         op ==
+                                             proto::plan::OpType::InnerMatch) {
+                        res[i] = milvus::query::Match(src[i], val, op);
+                    } else {
+                        ThrowInfo(OpTypeInvalid,
+                                  "unsupported op_type:{} for UnaryElementFunc",
+                                  op);
+                    }
+                }
+                return;
             }
-        } else if constexpr (op == proto::plan::OpType::Equal) {
+        }
+
+        if constexpr (op == proto::plan::OpType::PrefixMatch ||
+                      op == proto::plan::OpType::PostfixMatch ||
+                      op == proto::plan::OpType::InnerMatch) {
+            for (int i = 0; i < size; ++i) {
+                res[i] = milvus::query::Match(src[i], val, op);
+            }
+            return;
+        }
+
+        if constexpr (op == proto::plan::OpType::Equal) {
             res.inplace_compare_val<T, milvus::bitset::CompareOpType::EQ>(
                 src, size, val);
         } else if constexpr (op == proto::plan::OpType::NotEqual) {
@@ -130,9 +181,9 @@ struct UnaryElementFunc {
             res.inplace_compare_val<T, milvus::bitset::CompareOpType::LE>(
                 src, size, val);
         } else {
-            PanicInfo(
-                OpTypeInvalid,
-                fmt::format("unsupported op_type:{} for UnaryElementFunc", op));
+            ThrowInfo(OpTypeInvalid,
+                      "unsupported op_type:{} for UnaryElementFunc",
+                      op);
         }
     }
 };
@@ -164,7 +215,10 @@ struct UnaryElementFuncForArray {
                int index,
                TargetBitmapView res,
                TargetBitmapView valid_res,
+               const TargetBitmap& bitmap_input,
+               size_t start_cursor,
                const int32_t* offsets = nullptr) {
+        bool has_bitmap_input = !bitmap_input.empty();
         for (int i = 0; i < size; ++i) {
             auto offset = i;
             if constexpr (filter_type == FilterType::random) {
@@ -172,6 +226,9 @@ struct UnaryElementFuncForArray {
             }
             if (valid_data != nullptr && !valid_data[offset]) {
                 res[i] = valid_res[i] = false;
+                continue;
+            }
+            if (has_bitmap_input && !bitmap_input[i + start_cursor]) {
                 continue;
             }
             if constexpr (op == proto::plan::OpType::Equal) {
@@ -206,7 +263,9 @@ struct UnaryElementFuncForArray {
                 UnaryArrayCompare(array_data >= val);
             } else if constexpr (op == proto::plan::OpType::LessEqual) {
                 UnaryArrayCompare(array_data <= val);
-            } else if constexpr (op == proto::plan::OpType::PrefixMatch) {
+            } else if constexpr (op == proto::plan::OpType::PrefixMatch ||
+                                 op == proto::plan::OpType::PostfixMatch ||
+                                 op == proto::plan::OpType::InnerMatch) {
                 UnaryArrayCompare(milvus::query::Match(array_data, val, op));
             } else if constexpr (op == proto::plan::OpType::Match) {
                 if constexpr (std::is_same_v<GetType, proto::plan::Array>) {
@@ -224,7 +283,7 @@ struct UnaryElementFuncForArray {
                     res[i] = matcher(array_data);
                 }
             } else {
-                PanicInfo(OpTypeInvalid,
+                ThrowInfo(OpTypeInvalid,
                           "unsupported op_type:{} for "
                           "UnaryElementFuncForArray",
                           op);
@@ -239,36 +298,57 @@ struct UnaryIndexFuncForMatch {
         std::conditional_t<std::is_same_v<T, std::string_view>, std::string, T>;
     using Index = index::ScalarIndex<IndexInnerType>;
     TargetBitmap
-    operator()(Index* index, IndexInnerType val) {
-        if constexpr (!std::is_same_v<T, std::string_view> &&
-                      !std::is_same_v<T, std::string>) {
-            PanicInfo(Unsupported, "regex query is only supported on string");
-        } else {
-            if (index->SupportRegexQuery()) {
-                return index->PatternMatch(val);
+    operator()(Index* index, IndexInnerType val, proto::plan::OpType op) {
+        AssertInfo(op == proto::plan::OpType::Match ||
+                       op == proto::plan::OpType::PostfixMatch ||
+                       op == proto::plan::OpType::InnerMatch ||
+                       op == proto::plan::OpType::PrefixMatch,
+                   "op must be one of the following: Match, PrefixMatch, "
+                   "PostfixMatch, InnerMatch");
+
+        if constexpr (std::is_same_v<T, std::string> ||
+                      std::is_same_v<T, std::string_view>) {
+            if (index->SupportPatternMatch()) {
+                return index->PatternMatch(val, op);
             }
+
             if (!index->HasRawData()) {
-                PanicInfo(Unsupported,
+                ThrowInfo(Unsupported,
                           "index don't support regex query and don't have "
                           "raw data");
             }
-
             // retrieve raw data to do brute force query, may be very slow.
             auto cnt = index->Count();
             TargetBitmap res(cnt);
-            PatternMatchTranslator translator;
-            auto regex_pattern = translator(val);
-            RegexMatcher matcher(regex_pattern);
-            for (int64_t i = 0; i < cnt; i++) {
-                auto raw = index->Reverse_Lookup(i);
-                if (!raw.has_value()) {
-                    res[i] = false;
-                    continue;
+            if (op == proto::plan::OpType::InnerMatch ||
+                op == proto::plan::OpType::PostfixMatch ||
+                op == proto::plan::OpType::PrefixMatch) {
+                for (int64_t i = 0; i < cnt; i++) {
+                    auto raw = index->Reverse_Lookup(i);
+                    if (!raw.has_value()) {
+                        res[i] = false;
+                        continue;
+                    }
+                    res[i] = milvus::query::Match(raw.value(), val, op);
                 }
-                res[i] = matcher(raw.value());
+                return res;
+            } else {
+                PatternMatchTranslator translator;
+                auto regex_pattern = translator(val);
+                RegexMatcher matcher(regex_pattern);
+                for (int64_t i = 0; i < cnt; i++) {
+                    auto raw = index->Reverse_Lookup(i);
+                    if (!raw.has_value()) {
+                        res[i] = false;
+                        continue;
+                    }
+                    res[i] = matcher(raw.value());
+                }
+                return res;
             }
-            return res;
         }
+        ThrowInfo(ErrorCode::Unsupported,
+                  "UnaryIndexFuncForMatch is only supported on string types");
     }
 };
 
@@ -291,17 +371,14 @@ struct UnaryIndexFunc {
             return index->Range(val, OpType::GreaterEqual);
         } else if constexpr (op == proto::plan::OpType::LessEqual) {
             return index->Range(val, OpType::LessEqual);
-        } else if constexpr (op == proto::plan::OpType::PrefixMatch) {
-            auto dataset = std::make_unique<Dataset>();
-            dataset->Set(milvus::index::OPERATOR_TYPE,
-                         proto::plan::OpType::PrefixMatch);
-            dataset->Set(milvus::index::PREFIX_VALUE, val);
-            return index->Query(std::move(dataset));
-        } else if constexpr (op == proto::plan::OpType::Match) {
+        } else if constexpr (op == proto::plan::OpType::PrefixMatch ||
+                             op == proto::plan::OpType::Match ||
+                             op == proto::plan::OpType::PostfixMatch ||
+                             op == proto::plan::OpType::InnerMatch) {
             UnaryIndexFuncForMatch<T> func;
-            return func(index, val);
+            return func(index, val, op);
         } else {
-            PanicInfo(
+            ThrowInfo(
                 OpTypeInvalid,
                 fmt::format("unsupported op_type:{} for UnaryIndexFunc", op));
         }
@@ -316,7 +393,8 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
@@ -324,7 +402,8 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
                       expr->column_.nested_path_,
                       FromValCase(expr->val_.val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr) {
     }
 
@@ -340,10 +419,45 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
         return true;
     }
 
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::shared_ptr<const milvus::expr::UnaryRangeFilterExpr>
+    GetLogicalExpr() {
+        return expr_;
+    }
+
+    proto::plan::OpType
+    GetOpType() {
+        return expr_->op_type_;
+    }
+
+    FieldId
+    GetFieldId() {
+        return expr_->column_.field_id_;
+    }
+
+    DataType
+    GetFieldType() {
+        return expr_->column_.data_type_;
+    }
+
  private:
     template <typename T>
     VectorPtr
-    ExecRangeVisitorImpl(OffsetVector* input = nullptr);
+    ExecRangeVisitorImpl(EvalCtx& context);
 
     template <typename T>
     VectorPtr
@@ -351,23 +465,27 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecRangeVisitorImplForData(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplForData(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecRangeVisitorImplJson(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplJson(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecRangeVisitorImplArray(OffsetVector* input = nullptr);
+    ExecRangeVisitorImplJsonForIndex();
+
+    template <typename ExprValueType>
+    VectorPtr
+    ExecRangeVisitorImplArray(EvalCtx& context);
 
     template <typename T>
     VectorPtr
-    ExecRangeVisitorImplArrayForIndex();
+    ExecRangeVisitorImplArrayForIndex(EvalCtx& context);
 
     template <typename T>
     VectorPtr
-    ExecArrayEqualForIndex(bool reverse);
+    ExecArrayEqualForIndex(EvalCtx& context, bool reverse);
 
     // Check overflow and cache result for performace
     template <typename T>
@@ -387,6 +505,18 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
 
     VectorPtr
     ExecTextMatch();
+
+    bool
+    CanExecNgramMatch(proto::plan::OpType op_type);
+
+    bool
+    CanExecNgramMatchForJson(DataType val_type);
+
+    std::optional<VectorPtr>
+    ExecNgramMatch();
+
+    std::pair<std::string, std::string>
+    SplitAtFirstSlashDigit(std::string input);
 
  private:
     std::shared_ptr<const milvus::expr::UnaryRangeFilterExpr> expr_;

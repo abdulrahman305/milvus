@@ -57,6 +57,7 @@ func ReduceSearchResults(ctx context.Context, results []*internalpb.SearchResult
 	})
 
 	if len(results) == 1 {
+		log.Debug("Shortcut return ReduceSearchResults", zap.Any("result info", info))
 		return results[0], nil
 	}
 
@@ -94,7 +95,9 @@ func ReduceSearchResults(ctx context.Context, results []*internalpb.SearchResult
 		log.Debug("reduceSearchResultData",
 			zap.Int("result No.", i),
 			zap.Int64("nq", sData.NumQueries),
-			zap.Int64("topk", sData.TopK))
+			zap.Int64("topk", sData.TopK),
+			zap.Int("ids.len", typeutil.GetSizeOfIDs(sData.Ids)),
+			zap.Int("fieldsData.len", len(sData.FieldsData)))
 	}
 
 	searchReduce := InitSearchReducer(info)
@@ -110,15 +113,10 @@ func ReduceSearchResults(ctx context.Context, results []*internalpb.SearchResult
 	}
 
 	requestCosts := lo.FilterMap(results, func(result *internalpb.SearchResults, _ int) (*internalpb.CostAggregation, bool) {
-		if paramtable.Get().QueryNodeCfg.EnableWorkerSQCostMetrics.GetAsBool() {
-			return result.GetCostAggregation(), true
-		}
-
-		if result.GetBase().GetSourceID() == paramtable.GetNodeID() {
-			return result.GetCostAggregation(), true
-		}
-
-		return nil, false
+		// delegator node won't be used to load sealed segment if stream node is enabled
+		// and if growing segment doesn't exists, delegator won't produce any cost metrics
+		// so we deprecate the EnableWorkerSQCostMetrics param
+		return result.GetCostAggregation(), true
 	})
 	searchResults.CostAggregation = mergeRequestCost(requestCosts)
 	if searchResults.CostAggregation == nil {
@@ -169,15 +167,10 @@ func ReduceAdvancedSearchResults(ctx context.Context, results []*internalpb.Sear
 	}
 	searchResults.ChannelsMvcc = channelsMvcc
 	requestCosts := lo.FilterMap(results, func(result *internalpb.SearchResults, _ int) (*internalpb.CostAggregation, bool) {
-		if paramtable.Get().QueryNodeCfg.EnableWorkerSQCostMetrics.GetAsBool() {
-			return result.GetCostAggregation(), true
-		}
-
-		if result.GetBase().GetSourceID() == paramtable.GetNodeID() {
-			return result.GetCostAggregation(), true
-		}
-
-		return nil, false
+		// delegator node won't be used to load sealed segment if stream node is enabled
+		// and if growing segment doesn't exists, delegator won't produce any cost metrics
+		// so we deprecate the EnableWorkerSQCostMetrics param
+		return result.GetCostAggregation(), true
 	})
 	searchResults.CostAggregation = mergeRequestCost(requestCosts)
 	if searchResults.CostAggregation == nil {
@@ -244,7 +237,9 @@ func DecodeSearchResults(ctx context.Context, searchResults []*internalpb.Search
 	return results, nil
 }
 
-func EncodeSearchResultData(ctx context.Context, searchResultData *schemapb.SearchResultData, nq int64, topk int64, metricType string) (searchResults *internalpb.SearchResults, err error) {
+func EncodeSearchResultData(ctx context.Context, searchResultData *schemapb.SearchResultData,
+	nq int64, topk int64, metricType string,
+) (searchResults *internalpb.SearchResults, err error) {
 	_, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, "EncodeSearchResultData")
 	defer sp.End()
 
@@ -356,15 +351,10 @@ func MergeInternalRetrieveResult(ctx context.Context, retrieveResults []*interna
 	}
 
 	requestCosts := lo.FilterMap(retrieveResults, func(result *internalpb.RetrieveResults, _ int) (*internalpb.CostAggregation, bool) {
-		if paramtable.Get().QueryNodeCfg.EnableWorkerSQCostMetrics.GetAsBool() {
-			return result.GetCostAggregation(), true
-		}
-
-		if result.GetBase().GetSourceID() == paramtable.GetNodeID() {
-			return result.GetCostAggregation(), true
-		}
-
-		return nil, false
+		// delegator node won't be used to load sealed segment if stream node is enabled
+		// and if growing segment doesn't exists, delegator won't produce any cost metrics
+		// so we deprecate the EnableWorkerSQCostMetrics param
+		return result.GetCostAggregation(), true
 	})
 	ret.CostAggregation = mergeRequestCost(requestCosts)
 	if ret.CostAggregation == nil {

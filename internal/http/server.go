@@ -103,7 +103,9 @@ func registerDefaults() {
 		Handler: GetStaticHandler(),
 	})
 
-	RegisterWebUIHandler()
+	if paramtable.Get().HTTPCfg.EnableWebUI.GetAsBool() {
+		RegisterWebUIHandler()
+	}
 }
 
 func RegisterStopComponent(triggerComponentStop func(role string) error) {
@@ -150,7 +152,10 @@ func RegisterWebUIHandler() {
 	httpFS := http.FS(staticFiles)
 	fileServer := http.FileServer(httpFS)
 	serveIndex := serveFile(RouteWebUI+"index.html", httpFS)
-	http.Handle(RouteWebUI, handleNotFound(fileServer, serveIndex))
+	Register(&Handler{
+		Path:    RouteWebUI,
+		Handler: handleNotFound(fileServer, serveIndex),
+	})
 }
 
 type responseInterceptor struct {
@@ -239,9 +244,12 @@ func ServeHTTP() {
 		bindAddr := getHTTPAddr()
 		log.Info("management listen", zap.String("addr", bindAddr))
 		server = &http.Server{Handler: metricsServer, Addr: bindAddr, ReadTimeout: 10 * time.Second}
-		// enable mutex && block profile, sampling rate 10%
-		runtime.SetMutexProfileFraction(10)
-		runtime.SetBlockProfileRate(10)
+
+		if runtime.GOARCH != "arm64" {
+			// enable mutex && block profile, sampling rate 10%
+			runtime.SetMutexProfileFraction(10)
+			runtime.SetBlockProfileRate(10)
+		}
 
 		if err := server.ListenAndServe(); err != nil {
 			log.Error("handle metrics failed", zap.Error(err))

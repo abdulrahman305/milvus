@@ -17,13 +17,18 @@
 #include "index/IndexFactory.h"
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include "common/EasyAssert.h"
 #include "common/FieldDataInterface.h"
+#include "common/JsonCastType.h"
 #include "common/Types.h"
+#include "index/Index.h"
+#include "index/JsonFlatIndex.h"
 #include "index/VectorMemIndex.h"
 #include "index/Utils.h"
 #include "index/Meta.h"
 #include "index/JsonInvertedIndex.h"
+#include "index/NgramInvertedIndex.h"
 #include "knowhere/utils.h"
 
 #include "index/VectorDiskIndex.h"
@@ -45,8 +50,10 @@ IndexFactory::CreatePrimitiveScalarIndex(
     const storage::FileManagerContext& file_manager_context) {
     auto index_type = create_index_info.index_type;
     if (index_type == INVERTED_INDEX_TYPE) {
+        assert(create_index_info.tantivy_index_version != 0);
         // scalar_index_engine_version 0 means we should built tantivy index within single segment
         return std::make_unique<InvertedIndexTantivy<T>>(
+            create_index_info.tantivy_index_version,
             file_manager_context,
             create_index_info.scalar_index_engine_version == 0);
     }
@@ -54,17 +61,11 @@ IndexFactory::CreatePrimitiveScalarIndex(
         return std::make_unique<BitmapIndex<T>>(file_manager_context);
     }
     if (index_type == HYBRID_INDEX_TYPE) {
-        return std::make_unique<HybridScalarIndex<T>>(file_manager_context);
+        return std::make_unique<HybridScalarIndex<T>>(
+            create_index_info.tantivy_index_version, file_manager_context);
     }
     return CreateScalarIndexSort<T>(file_manager_context);
 }
-
-// template <>
-// inline ScalarIndexPtr<bool>
-// IndexFactory::CreateScalarIndex(const IndexType& index_type) {
-//    return CreateBoolIndex();
-//}
-//
 
 template <>
 ScalarIndexPtr<std::string>
@@ -74,8 +75,10 @@ IndexFactory::CreatePrimitiveScalarIndex<std::string>(
     auto index_type = create_index_info.index_type;
 #if defined(__linux__) || defined(__APPLE__)
     if (index_type == INVERTED_INDEX_TYPE) {
+        assert(create_index_info.tantivy_index_version != 0);
         // scalar_index_engine_version 0 means we should built tantivy index within single segment
         return std::make_unique<InvertedIndexTantivy<std::string>>(
+            create_index_info.tantivy_index_version,
             file_manager_context,
             create_index_info.scalar_index_engine_version == 0);
     }
@@ -84,11 +87,11 @@ IndexFactory::CreatePrimitiveScalarIndex<std::string>(
     }
     if (index_type == HYBRID_INDEX_TYPE) {
         return std::make_unique<HybridScalarIndex<std::string>>(
-            file_manager_context);
+            create_index_info.tantivy_index_version, file_manager_context);
     }
     return CreateStringIndexMarisa(file_manager_context);
 #else
-    PanicInfo(Unsupported, "unsupported platform");
+    ThrowInfo(Unsupported, "unsupported platform");
 #endif
 }
 
@@ -97,7 +100,7 @@ IndexFactory::IndexLoadResource(
     DataType field_type,
     IndexVersion index_version,
     float index_size,
-    std::map<std::string, std::string>& index_params,
+    const std::map<std::string, std::string>& index_params,
     bool mmap_enable) {
     if (milvus::IsVectorDataType(field_type)) {
         return VecIndexLoadResource(
@@ -113,7 +116,7 @@ IndexFactory::VecIndexLoadResource(
     DataType field_type,
     IndexVersion index_version,
     float index_size,
-    std::map<std::string, std::string>& index_params,
+    const std::map<std::string, std::string>& index_params,
     bool mmap_enable) {
     auto config = milvus::index::ParseConfigFromIndexParams(index_params);
 
@@ -222,7 +225,7 @@ IndexFactory::ScalarIndexLoadResource(
     DataType field_type,
     IndexVersion index_version,
     float index_size,
-    std::map<std::string, std::string>& index_params,
+    const std::map<std::string, std::string>& index_params,
     bool mmap_enable) {
     auto config = milvus::index::ParseConfigFromIndexParams(index_params);
 
@@ -257,17 +260,10 @@ IndexFactory::ScalarIndexLoadResource(
         }
         request.has_raw_data = true;
     } else if (index_type == milvus::index::INVERTED_INDEX_TYPE) {
-        if (mmap_enable) {
-            request.final_memory_cost = 0;
-            request.final_disk_cost = index_size_gb;
-            request.max_memory_cost = index_size_gb;
-            request.max_disk_cost = index_size_gb;
-        } else {
-            request.final_memory_cost = index_size_gb;
-            request.final_disk_cost = 0;
-            request.max_memory_cost = 2 * index_size_gb;
-            request.max_disk_cost = 0;
-        }
+        request.final_memory_cost = 0;
+        request.final_disk_cost = index_size_gb;
+        request.max_memory_cost = index_size_gb;
+        request.max_disk_cost = index_size_gb;
 
         request.has_raw_data = false;
     } else if (index_type == milvus::index::BITMAP_INDEX_TYPE) {
@@ -283,11 +279,7 @@ IndexFactory::ScalarIndexLoadResource(
             request.max_disk_cost = 0;
         }
 
-        if (field_type == milvus::DataType::ARRAY) {
-            request.has_raw_data = false;
-        } else {
-            request.has_raw_data = true;
-        }
+        request.has_raw_data = false;
     } else if (index_type == milvus::index::HYBRID_INDEX_TYPE) {
         request.final_memory_cost = index_size_gb;
         request.final_disk_cost = index_size_gb;
@@ -298,7 +290,7 @@ IndexFactory::ScalarIndexLoadResource(
         LOG_ERROR(
             "invalid index type to estimate scalar index load resource: {}",
             index_type);
-        return LoadResourceRequest{0, 0, 0, 0, true};
+        return LoadResourceRequest{0, 0, 0, 0, false};
     }
     return request;
 }
@@ -306,9 +298,11 @@ IndexFactory::ScalarIndexLoadResource(
 IndexBasePtr
 IndexFactory::CreateIndex(
     const CreateIndexInfo& create_index_info,
-    const storage::FileManagerContext& file_manager_context) {
+    const storage::FileManagerContext& file_manager_context,
+    bool use_build_pool) {
     if (IsVectorDataType(create_index_info.field_type)) {
-        return CreateVectorIndex(create_index_info, file_manager_context);
+        return CreateVectorIndex(
+            create_index_info, file_manager_context, use_build_pool);
     }
 
     return CreateScalarIndex(create_index_info, file_manager_context);
@@ -345,11 +339,17 @@ IndexFactory::CreatePrimitiveScalarIndex(
 
             // create string index
         case DataType::STRING:
-        case DataType::VARCHAR:
+        case DataType::VARCHAR: {
+            auto& ngram_params = create_index_info.ngram_params;
+            if (ngram_params.has_value()) {
+                return std::make_unique<NgramInvertedIndex>(
+                    file_manager_context, ngram_params.value());
+            }
             return CreatePrimitiveScalarIndex<std::string>(
                 create_index_info, file_manager_context);
+        }
         default:
-            PanicInfo(
+            ThrowInfo(
                 DataTypeInvalid,
                 fmt::format("invalid data type to build index: {}", data_type));
     }
@@ -367,7 +367,7 @@ IndexFactory::CreateCompositeScalarIndex(
         return CreatePrimitiveScalarIndex(
             element_type, create_index_info, file_manager_context);
     } else {
-        PanicInfo(
+        ThrowInfo(
             Unsupported,
             fmt::format("index type: {} for composite scalar not supported now",
                         index_type));
@@ -378,41 +378,55 @@ IndexBasePtr
 IndexFactory::CreateComplexScalarIndex(
     IndexType index_type,
     const storage::FileManagerContext& file_manager_context) {
-    PanicInfo(Unsupported, "Complex index not supported now");
+    ThrowInfo(Unsupported, "Complex index not supported now");
 }
 
 IndexBasePtr
 IndexFactory::CreateJsonIndex(
-    IndexType index_type,
-    DataType cast_dtype,
-    const std::string& nested_path,
+    const CreateIndexInfo& create_index_info,
     const storage::FileManagerContext& file_manager_context) {
-    AssertInfo(index_type == INVERTED_INDEX_TYPE,
+    AssertInfo(create_index_info.index_type == INVERTED_INDEX_TYPE ||
+                   create_index_info.index_type == NGRAM_INDEX_TYPE,
                "Invalid index type for json index");
-    switch (cast_dtype) {
-        case DataType::BOOL:
+
+    const auto& cast_dtype = create_index_info.json_cast_type;
+    const auto& nested_path = create_index_info.json_path;
+    const auto& json_cast_function = create_index_info.json_cast_function;
+    switch (cast_dtype.element_type()) {
+        case JsonCastType::DataType::BOOL:
             return std::make_unique<index::JsonInvertedIndex<bool>>(
-                proto::schema::DataType::Bool,
+                cast_dtype,
                 nested_path,
-                file_manager_context);
-        case DataType::INT8:
-        case DataType::INT16:
-        case DataType::INT32:
-        case DataType::INT64:
-        case DataType::FLOAT:
-        case DataType::DOUBLE:
+                file_manager_context,
+                create_index_info.tantivy_index_version,
+                JsonCastFunction::FromString(json_cast_function));
+        case JsonCastType::DataType::DOUBLE:
             return std::make_unique<index::JsonInvertedIndex<double>>(
-                proto::schema::DataType::Double,
+                cast_dtype,
                 nested_path,
-                file_manager_context);
-        case DataType::STRING:
-        case DataType::VARCHAR:
+                file_manager_context,
+                create_index_info.tantivy_index_version,
+                JsonCastFunction::FromString(json_cast_function));
+        case JsonCastType::DataType::VARCHAR: {
+            auto& ngram_params = create_index_info.ngram_params;
+            if (ngram_params.has_value()) {
+                return std::make_unique<NgramInvertedIndex>(
+                    file_manager_context, ngram_params.value(), nested_path);
+            }
             return std::make_unique<index::JsonInvertedIndex<std::string>>(
-                proto::schema::DataType::String,
+                cast_dtype,
                 nested_path,
-                file_manager_context);
+                file_manager_context,
+                create_index_info.tantivy_index_version,
+                JsonCastFunction::FromString(json_cast_function));
+        }
+        case JsonCastType::DataType::JSON:
+            return std::make_unique<JsonFlatIndex>(
+                file_manager_context,
+                nested_path,
+                create_index_info.tantivy_index_version);
         default:
-            PanicInfo(DataTypeInvalid, "Invalid data type:{}", cast_dtype);
+            ThrowInfo(DataTypeInvalid, "Invalid data type:{}", cast_dtype);
     }
 }
 
@@ -438,20 +452,18 @@ IndexFactory::CreateScalarIndex(
                                               file_manager_context);
         }
         case DataType::JSON: {
-            return CreateJsonIndex(create_index_info.index_type,
-                                   create_index_info.json_cast_type,
-                                   create_index_info.json_path,
-                                   file_manager_context);
+            return CreateJsonIndex(create_index_info, file_manager_context);
         }
         default:
-            PanicInfo(DataTypeInvalid, "Invalid data type:{}", data_type);
+            ThrowInfo(DataTypeInvalid, "Invalid data type:{}", data_type);
     }
 }
 
 IndexBasePtr
 IndexFactory::CreateVectorIndex(
     const CreateIndexInfo& create_index_info,
-    const storage::FileManagerContext& file_manager_context) {
+    const storage::FileManagerContext& file_manager_context,
+    bool use_knowhere_build_pool) {
     auto index_type = create_index_info.index_type;
     auto metric_type = create_index_info.metric_type;
     auto version = create_index_info.index_engine_version;
@@ -483,7 +495,7 @@ IndexFactory::CreateVectorIndex(
                 // TODO caiyd, not support yet
             }
             default:
-                PanicInfo(
+                ThrowInfo(
                     DataTypeInvalid,
                     fmt::format("invalid data type to build disk index: {}",
                                 data_type));
@@ -493,26 +505,46 @@ IndexFactory::CreateVectorIndex(
             case DataType::VECTOR_FLOAT:
             case DataType::VECTOR_SPARSE_FLOAT: {
                 return std::make_unique<VectorMemIndex<float>>(
-                    index_type, metric_type, version, file_manager_context);
+                    index_type,
+                    metric_type,
+                    version,
+                    use_knowhere_build_pool,
+                    file_manager_context);
             }
             case DataType::VECTOR_BINARY: {
                 return std::make_unique<VectorMemIndex<bin1>>(
-                    index_type, metric_type, version, file_manager_context);
+                    index_type,
+                    metric_type,
+                    version,
+                    use_knowhere_build_pool,
+                    file_manager_context);
             }
             case DataType::VECTOR_FLOAT16: {
                 return std::make_unique<VectorMemIndex<float16>>(
-                    index_type, metric_type, version, file_manager_context);
+                    index_type,
+                    metric_type,
+                    version,
+                    use_knowhere_build_pool,
+                    file_manager_context);
             }
             case DataType::VECTOR_BFLOAT16: {
                 return std::make_unique<VectorMemIndex<bfloat16>>(
-                    index_type, metric_type, version, file_manager_context);
+                    index_type,
+                    metric_type,
+                    version,
+                    use_knowhere_build_pool,
+                    file_manager_context);
             }
             case DataType::VECTOR_INT8: {
                 return std::make_unique<VectorMemIndex<int8>>(
-                    index_type, metric_type, version, file_manager_context);
+                    index_type,
+                    metric_type,
+                    version,
+                    use_knowhere_build_pool,
+                    file_manager_context);
             }
             default:
-                PanicInfo(
+                ThrowInfo(
                     DataTypeInvalid,
                     fmt::format("invalid data type to build mem index: {}",
                                 data_type));

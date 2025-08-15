@@ -18,16 +18,15 @@ package grpcdatanode
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
@@ -43,44 +42,10 @@ func Test_NewServer(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, server)
 
-	mockRootCoord := mocks.NewMockRootCoordClient(t)
-	mockRootCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newRootCoordClient = func() (types.RootCoordClient, error) {
-		return mockRootCoord, nil
-	}
-
-	mockDataCoord := mocks.NewMockDataCoordClient(t)
-	mockDataCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newDataCoordClient = func() (types.DataCoordClient, error) {
-		return mockDataCoord, nil
-	}
-
 	t.Run("Run", func(t *testing.T) {
 		datanode := mocks.NewMockDataNode(t)
 		datanode.EXPECT().SetEtcdClient(mock.Anything).Return()
 		datanode.EXPECT().SetAddress(mock.Anything).Return()
-		datanode.EXPECT().SetRootCoordClient(mock.Anything).Return(nil)
-		datanode.EXPECT().SetDataCoordClient(mock.Anything).Return(nil)
 		datanode.EXPECT().UpdateStateCode(mock.Anything).Return()
 		datanode.EXPECT().Register().Return(nil)
 		datanode.EXPECT().Init().Return(nil)
@@ -208,45 +173,11 @@ func Test_Run(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, server)
 
-	mockRootCoord := mocks.NewMockRootCoordClient(t)
-	mockRootCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newRootCoordClient = func() (types.RootCoordClient, error) {
-		return mockRootCoord, nil
-	}
-
-	mockDataCoord := mocks.NewMockDataCoordClient(t)
-	mockDataCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newDataCoordClient = func() (types.DataCoordClient, error) {
-		return mockDataCoord, nil
-	}
-
 	datanode := mocks.NewMockDataNode(t)
 	datanode.EXPECT().SetEtcdClient(mock.Anything).Return()
 	datanode.EXPECT().SetAddress(mock.Anything).Return()
-	datanode.EXPECT().SetRootCoordClient(mock.Anything).Return(nil)
-	datanode.EXPECT().SetDataCoordClient(mock.Anything).Return(nil)
 	datanode.EXPECT().UpdateStateCode(mock.Anything).Return()
-	datanode.EXPECT().Init().Return(fmt.Errorf("mock err"))
+	datanode.EXPECT().Init().Return(errors.New("mock err"))
 	server.datanode = datanode
 
 	err = server.Prepare()
@@ -257,8 +188,6 @@ func Test_Run(t *testing.T) {
 	datanode = mocks.NewMockDataNode(t)
 	datanode.EXPECT().SetEtcdClient(mock.Anything).Return()
 	datanode.EXPECT().SetAddress(mock.Anything).Return()
-	datanode.EXPECT().SetRootCoordClient(mock.Anything).Return(nil)
-	datanode.EXPECT().SetDataCoordClient(mock.Anything).Return(nil)
 	datanode.EXPECT().UpdateStateCode(mock.Anything).Return()
 	datanode.EXPECT().Register().Return(nil)
 	datanode.EXPECT().Init().Return(nil)
@@ -277,43 +206,9 @@ func TestIndexService(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, server)
 
-	mockRootCoord := mocks.NewMockRootCoordClient(t)
-	mockRootCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newRootCoordClient = func() (types.RootCoordClient, error) {
-		return mockRootCoord, nil
-	}
-
-	mockDataCoord := mocks.NewMockDataCoordClient(t)
-	mockDataCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: merr.Success(),
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil)
-	server.newDataCoordClient = func() (types.DataCoordClient, error) {
-		return mockDataCoord, nil
-	}
-
 	dn := mocks.NewMockDataNode(t)
 	dn.EXPECT().SetEtcdClient(mock.Anything).Return()
 	dn.EXPECT().SetAddress(mock.Anything).Return()
-	dn.EXPECT().SetRootCoordClient(mock.Anything).Return(nil)
-	dn.EXPECT().SetDataCoordClient(mock.Anything).Return(nil)
 	dn.EXPECT().UpdateStateCode(mock.Anything).Return()
 	dn.EXPECT().Register().Return(nil)
 	dn.EXPECT().Init().Return(nil)
@@ -434,6 +329,32 @@ func TestIndexService(t *testing.T) {
 		dn.EXPECT().DropJobsV2(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 		req := &workerpb.DropJobsV2Request{}
 		resp, err := server.DropJobsV2(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("CreateTask", func(t *testing.T) {
+		dn.EXPECT().CreateTask(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		req := &workerpb.CreateTaskRequest{}
+		resp, err := server.CreateTask(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("QueryTask", func(t *testing.T) {
+		dn.EXPECT().QueryTask(mock.Anything, mock.Anything).Return(&workerpb.QueryTaskResponse{
+			Status: merr.Success(),
+		}, nil)
+		req := &workerpb.QueryTaskRequest{}
+		resp, err := server.QueryTask(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	t.Run("DropTask", func(t *testing.T) {
+		dn.EXPECT().DropTask(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		req := &workerpb.DropTaskRequest{}
+		resp, err := server.DropTask(ctx, req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})

@@ -193,6 +193,7 @@ func Test_garbageCollector_scan(t *testing.T) {
 		segment.Statslogs = []*datapb.FieldBinlog{getFieldBinlogPaths(0, stats[0])}
 		segment.Deltalogs = []*datapb.FieldBinlog{getFieldBinlogPaths(0, delta[0])}
 
+		meta.DropSegment(context.TODO(), segment.ID)
 		err = meta.AddSegment(context.TODO(), segment)
 		require.NoError(t, err)
 
@@ -363,7 +364,6 @@ func createMetaForRecycleUnusedIndexes(catalog metastore.DataCoordCatalog) *meta
 		indexID = UniqueID(400)
 	)
 	return &meta{
-		RWMutex:      lock.RWMutex{},
 		ctx:          ctx,
 		catalog:      catalog,
 		collections:  nil,
@@ -517,7 +517,6 @@ func createMetaForRecycleUnusedSegIndexes(catalog metastore.DataCoordCatalog) *m
 	segIndexes.Insert(segID, segIdx0)
 	segIndexes.Insert(segID+1, segIdx1)
 	meta := &meta{
-		RWMutex:     lock.RWMutex{},
 		ctx:         ctx,
 		catalog:     catalog,
 		collections: nil,
@@ -527,6 +526,7 @@ func createMetaForRecycleUnusedSegIndexes(catalog metastore.DataCoordCatalog) *m
 			segmentIndexes:   segIndexes,
 			indexes:          map[UniqueID]map[UniqueID]*model.Index{},
 			segmentBuildInfo: newSegmentIndexBuildInfo(),
+			keyLock:          lock.NewKeyLock[UniqueID](),
 		},
 		channelCPs:   nil,
 		chunkManager: nil,
@@ -682,7 +682,6 @@ func createMetaTableForRecycleUnusedIndexFiles(catalog *datacoord.Catalog) *meta
 	segIndexes.Insert(segID, segIdx0)
 	segIndexes.Insert(segID+1, segIdx1)
 	meta := &meta{
-		RWMutex:     lock.RWMutex{},
 		ctx:         ctx,
 		catalog:     catalog,
 		collections: nil,
@@ -1044,6 +1043,33 @@ func TestGarbageCollector_clearETCD(t *testing.T) {
 			},
 		},
 	}
+
+	collections := typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()
+	collections.Insert(collID, &collectionInfo{
+		ID: collID,
+		Schema: &schemapb.CollectionSchema{
+			Name:        "",
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      fieldID,
+					Name:         "",
+					IsPrimaryKey: false,
+					Description:  "",
+					DataType:     schemapb.DataType_FloatVector,
+					TypeParams:   nil,
+					IndexParams:  nil,
+					AutoID:       false,
+					State:        0,
+				},
+			},
+		},
+		Partitions:     nil,
+		StartPositions: nil,
+		Properties:     nil,
+	})
+
 	segIndexes := typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]]()
 	segIdx0 := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
 	segIdx0.Insert(indexID, &model.SegmentIndex{
@@ -1111,32 +1137,7 @@ func TestGarbageCollector_clearETCD(t *testing.T) {
 			},
 		},
 
-		collections: map[UniqueID]*collectionInfo{
-			collID: {
-				ID: collID,
-				Schema: &schemapb.CollectionSchema{
-					Name:        "",
-					Description: "",
-					AutoID:      false,
-					Fields: []*schemapb.FieldSchema{
-						{
-							FieldID:      fieldID,
-							Name:         "",
-							IsPrimaryKey: false,
-							Description:  "",
-							DataType:     schemapb.DataType_FloatVector,
-							TypeParams:   nil,
-							IndexParams:  nil,
-							AutoID:       false,
-							State:        0,
-						},
-					},
-				},
-				Partitions:     nil,
-				StartPositions: nil,
-				Properties:     nil,
-			},
-		},
+		collections: collections,
 	}
 
 	m.indexMeta.segmentBuildInfo.Add(&model.SegmentIndex{
@@ -1730,6 +1731,31 @@ func (s *GarbageCollectorSuite) TestRunRecycleTaskWithPauser() {
 		cnt++
 	})
 	s.Equal(cnt, 2)
+}
+
+func (s *GarbageCollectorSuite) TestAvoidGCLoadedSegments() {
+	handler := NewNMockHandler(s.T())
+	handler.EXPECT().ListLoadedSegments(mock.Anything).Return([]int64{1}, nil).Once()
+	gc := newGarbageCollector(s.meta, handler, GcOption{
+		cli:              s.cli,
+		enabled:          true,
+		checkInterval:    time.Millisecond * 10,
+		scanInterval:     time.Hour * 7 * 24,
+		missingTolerance: time.Hour * 24,
+		dropTolerance:    time.Hour * 24,
+	})
+
+	s.meta.AddSegment(context.TODO(), &SegmentInfo{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:        1,
+			State:     commonpb.SegmentState_Dropped,
+			DroppedAt: 0,
+		},
+	})
+
+	gc.recycleDroppedSegments(context.TODO())
+	seg := s.meta.GetSegment(context.TODO(), 1)
+	s.NotNil(seg)
 }
 
 func TestGarbageCollector(t *testing.T) {

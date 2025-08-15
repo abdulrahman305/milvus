@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -33,20 +32,18 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/internal/coordinator/coordclient"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/kv/tikv"
 	"github.com/milvus-io/milvus/internal/metastore"
-	kvmetestore "github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
+	kvmetastore "github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	streamingcoord "github.com/milvus-io/milvus/internal/streamingcoord/server"
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	tso2 "github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
@@ -64,6 +61,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/contextutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
@@ -118,24 +116,20 @@ type Core struct {
 	idAllocator  allocator.Interface
 	tsoAllocator tso2.Allocator
 
-	dataCoord  types.DataCoordClient
-	queryCoord types.QueryCoordClient
-
-	quotaCenter *QuotaCenter
+	mixCoord       types.MixCoord
+	streamingCoord *streamingcoord.Server
+	quotaCenter    *QuotaCenter
 
 	stateCode atomic.Int32
 	initOnce  sync.Once
 	startOnce sync.Once
-	session   *sessionutil.Session
+	session   sessionutil.SessionInterface
 
 	factory dependency.Factory
 
-	enableActiveStandBy bool
-	activateFunc        func() error
+	activateFunc func() error
 
 	metricsRequest *metricsinfo.MetricsRequest
-
-	streamingCoord *streamingcoord.Server
 }
 
 // --------------------- function --------------------------
@@ -145,11 +139,10 @@ func NewCore(c context.Context, factory dependency.Factory) (*Core, error) {
 	ctx, cancel := context.WithCancel(c)
 	rand.Seed(time.Now().UnixNano())
 	core := &Core{
-		ctx:                 ctx,
-		cancel:              cancel,
-		factory:             factory,
-		enableActiveStandBy: Params.RootCoordCfg.EnableActiveStandby.GetAsBool(),
-		metricsRequest:      metricsinfo.NewMetricsRequest(),
+		ctx:            ctx,
+		cancel:         cancel,
+		factory:        factory,
+		metricsRequest: metricsinfo.NewMetricsRequest(),
 	}
 
 	core.UpdateStateCode(commonpb.StateCode_Abnormal)
@@ -222,10 +215,28 @@ func (c *Core) sendMinDdlTsAsTt() {
 func (c *Core) startTimeTickLoop() {
 	log := log.Ctx(c.ctx)
 	defer c.wg.Done()
+
+	streamingNotifier := snmanager.NewStreamingReadyNotifier()
+	defer streamingNotifier.Release()
+
+	if streamingutil.IsStreamingServiceEnabled() {
+		if err := snmanager.StaticStreamingNodeManager.RegisterStreamingEnabledListener(c.ctx, streamingNotifier); err != nil {
+			log.Info("register streaming enabled listener failed", zap.Error(err))
+			return
+		}
+		if streamingNotifier.IsReady() {
+			log.Info("streaming service has been enabled, ddl timetick from rootcoord should not start")
+			return
+		}
+	}
+
 	ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond))
 	defer ticker.Stop()
 	for {
 		select {
+		case <-streamingNotifier.Ready():
+			log.Info("streaming service has been enabled, ddl timetick from rootcoord should stop")
+			return
 		case <-c.ctx.Done():
 			log.Info("rootcoord's timetick loop quit!")
 			return
@@ -263,46 +274,13 @@ func (c *Core) SetProxyCreator(f func(ctx context.Context, addr string, nodeID i
 	c.proxyCreator = f
 }
 
-func (c *Core) SetDataCoordClient(s types.DataCoordClient) error {
-	if s == nil {
-		return errors.New("null DataCoord interface")
-	}
-	c.dataCoord = s
-	return nil
-}
-
-func (c *Core) SetQueryCoordClient(s types.QueryCoordClient) error {
-	if s == nil {
-		return errors.New("null QueryCoord interface")
-	}
-	c.queryCoord = s
+func (c *Core) SetMixCoord(s types.MixCoord) error {
+	c.mixCoord = s
 	return nil
 }
 
 // Register register rootcoord at etcd
 func (c *Core) Register() error {
-	log := log.Ctx(c.ctx)
-	c.session.Register()
-	afterRegister := func() {
-		metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.RootCoordRole).Inc()
-		log.Info("RootCoord Register Finished")
-		c.session.LivenessCheck(c.ctx, func() {
-			log.Error("Root Coord disconnected from etcd, process will exit", zap.Int64("Server Id", c.session.ServerID))
-			os.Exit(1)
-		})
-	}
-	if c.enableActiveStandBy {
-		go func() {
-			if err := c.session.ProcessActiveStandBy(c.activateFunc); err != nil {
-				log.Warn("failed to activate standby rootcoord server", zap.Error(err))
-				panic(err)
-			}
-			afterRegister()
-		}()
-	} else {
-		afterRegister()
-	}
-
 	return nil
 }
 
@@ -320,13 +298,11 @@ func (c *Core) SetTiKVClient(client *txnkv.Client) {
 	c.tikvCli = client
 }
 
-func (c *Core) initSession() error {
-	c.session = sessionutil.NewSession(c.ctx)
+func (c *Core) SetSession(session sessionutil.SessionInterface) error {
+	c.session = session
 	if c.session == nil {
-		return fmt.Errorf("session is nil, the etcd client connection may have failed")
+		return errors.New("session is nil, the etcd client connection may have failed")
 	}
-	c.session.Init(typeutil.RootCoordRole, c.address, true, true)
-	c.session.SetEnableActiveStandBy(c.enableActiveStandBy)
 	return nil
 }
 
@@ -346,15 +322,6 @@ func (c *Core) initKVCreator() {
 	}
 }
 
-func (c *Core) initStreamingCoord() {
-	c.streamingCoord = streamingcoord.NewServerBuilder().
-		WithETCD(c.etcdCli).
-		WithMetaKV(c.metaKVCreator()).
-		WithSession(c.session).
-		WithRootCoordClient(coordclient.MustGetLocalRootCoordClientFuture()).
-		Build()
-}
-
 func (c *Core) initMetaTable(initCtx context.Context) error {
 	fn := func() error {
 		var catalog metastore.RootCoordCatalog
@@ -363,24 +330,24 @@ func (c *Core) initMetaTable(initCtx context.Context) error {
 		switch Params.MetaStoreCfg.MetaStoreType.GetValue() {
 		case util.MetaStoreTypeEtcd:
 			log.Ctx(initCtx).Info("Using etcd as meta storage.")
-			var ss *kvmetestore.SuffixSnapshot
+			var ss *kvmetastore.SuffixSnapshot
 			var err error
 
 			metaKV := c.metaKVCreator()
-			if ss, err = kvmetestore.NewSuffixSnapshot(metaKV, kvmetestore.SnapshotsSep, Params.EtcdCfg.MetaRootPath.GetValue(), kvmetestore.SnapshotPrefix); err != nil {
+			if ss, err = kvmetastore.NewSuffixSnapshot(metaKV, kvmetastore.SnapshotsSep, Params.EtcdCfg.MetaRootPath.GetValue(), kvmetastore.SnapshotPrefix); err != nil {
 				return err
 			}
-			catalog = kvmetestore.NewCatalog(metaKV, ss)
+			catalog = kvmetastore.NewCatalog(metaKV, ss)
 		case util.MetaStoreTypeTiKV:
 			log.Ctx(initCtx).Info("Using tikv as meta storage.")
-			var ss *kvmetestore.SuffixSnapshot
+			var ss *kvmetastore.SuffixSnapshot
 			var err error
 
 			metaKV := c.metaKVCreator()
-			if ss, err = kvmetestore.NewSuffixSnapshot(metaKV, kvmetestore.SnapshotsSep, Params.TiKVCfg.MetaRootPath.GetValue(), kvmetestore.SnapshotPrefix); err != nil {
+			if ss, err = kvmetastore.NewSuffixSnapshot(metaKV, kvmetastore.SnapshotsSep, Params.TiKVCfg.MetaRootPath.GetValue(), kvmetastore.SnapshotPrefix); err != nil {
 				return err
 			}
-			catalog = kvmetestore.NewCatalog(metaKV, ss)
+			catalog = kvmetastore.NewCatalog(metaKV, ss)
 		default:
 			return retry.Unrecoverable(fmt.Errorf("not supported meta store: %s", Params.MetaStoreCfg.MetaStoreType.GetValue()))
 		}
@@ -466,7 +433,7 @@ func (c *Core) initInternal() error {
 
 	c.factory.Init(Params)
 	chanMap := c.meta.ListCollectionPhysicalChannels(c.ctx)
-	c.chanTimeTick = newTimeTickSync(initCtx, c.ctx, c.session.ServerID, c.factory, chanMap)
+	c.chanTimeTick = newTimeTickSync(initCtx, c.ctx, c.session.GetServerID(), c.factory, chanMap)
 	log.Info("create TimeTick sync done")
 
 	c.proxyClientManager = proxyutil.NewProxyClientManager(c.proxyCreator)
@@ -476,31 +443,18 @@ func (c *Core) initInternal() error {
 	c.garbageCollector = newBgGarbageCollector(c)
 	c.stepExecutor = newBgStepExecutor(c.ctx)
 
-	if err := c.streamingCoord.Start(c.ctx); err != nil {
-		log.Info("start streaming coord failed", zap.Error(err))
-		return err
-	}
-	if !streamingutil.IsStreamingServiceEnabled() {
-		c.proxyWatcher = proxyutil.NewProxyWatcher(
-			c.etcdCli,
-			c.chanTimeTick.initSessions,
-			c.proxyClientManager.AddProxyClients,
-		)
-		c.proxyWatcher.AddSessionFunc(c.chanTimeTick.addSession, c.proxyClientManager.AddProxyClient)
-		c.proxyWatcher.DelSessionFunc(c.chanTimeTick.delSession, c.proxyClientManager.DelProxyClient)
-	} else {
-		c.proxyWatcher = proxyutil.NewProxyWatcher(
-			c.etcdCli,
-			c.proxyClientManager.AddProxyClients,
-		)
-		c.proxyWatcher.AddSessionFunc(c.proxyClientManager.AddProxyClient)
-		c.proxyWatcher.DelSessionFunc(c.proxyClientManager.DelProxyClient)
-	}
+	c.proxyWatcher = proxyutil.NewProxyWatcher(
+		c.etcdCli,
+		c.chanTimeTick.initSessions,
+		c.proxyClientManager.AddProxyClients,
+	)
+	c.proxyWatcher.AddSessionFunc(c.chanTimeTick.addSession, c.proxyClientManager.AddProxyClient)
+	c.proxyWatcher.DelSessionFunc(c.chanTimeTick.delSession, c.proxyClientManager.DelProxyClient)
 	log.Info("init proxy manager done")
 
 	c.metricsCacheManager = metricsinfo.NewMetricsCacheManager()
 
-	c.quotaCenter = NewQuotaCenter(c.proxyClientManager, c.queryCoord, c.dataCoord, c.tsoAllocator, c.meta)
+	c.quotaCenter = NewQuotaCenter(c.proxyClientManager, c.mixCoord, c.tsoAllocator, c.meta)
 	log.Debug("RootCoord init QuotaCenter done")
 
 	if err := c.initCredentials(initCtx); err != nil {
@@ -530,40 +484,12 @@ func (c *Core) Init() error {
 	var initError error
 	c.registerMetricsRequest()
 	c.factory.Init(Params)
-	if err := c.initSession(); err != nil {
-		return err
-	}
 	c.initKVCreator()
-	c.initStreamingCoord()
 
-	if c.enableActiveStandBy {
-		c.activateFunc = func() error {
-			log.Info("RootCoord switch from standby to active, activating")
-
-			var err error
-			c.initOnce.Do(func() {
-				if err = c.initInternal(); err != nil {
-					log.Error("RootCoord init failed", zap.Error(err))
-				}
-			})
-			if err != nil {
-				return err
-			}
-			c.startOnce.Do(func() {
-				if err = c.startInternal(); err != nil {
-					log.Error("RootCoord start failed", zap.Error(err))
-				}
-			})
-			log.Info("RootCoord startup success", zap.String("address", c.session.Address))
-			return err
-		}
-		c.UpdateStateCode(commonpb.StateCode_StandBy)
-		log.Info("RootCoord enter standby mode successfully")
-	} else {
-		c.initOnce.Do(func() {
-			initError = c.initInternal()
-		})
-	}
+	c.initOnce.Do(func() {
+		initError = c.initInternal()
+	})
+	log.Info("RootCoord init successfully")
 
 	return initError
 }
@@ -765,34 +691,24 @@ func (c *Core) startInternal() error {
 
 	c.startServerLoop()
 	c.UpdateStateCode(commonpb.StateCode_Healthy)
-	sessionutil.SaveServerInfo(typeutil.RootCoordRole, c.session.ServerID)
+	sessionutil.SaveServerInfo(typeutil.MixCoordRole, c.session.GetServerID())
 	log.Info("rootcoord startup successfully")
-
-	// regster the core as a appendoperator for broadcast service.
-	// TODO: should be removed at 2.6.0.
-	// Add the wal accesser to the broadcaster registry for making broadcast operation.
-	registry.Register(registry.AppendOperatorTypeMsgstream, newMsgStreamAppendOperator(c))
 	return nil
 }
 
 func (c *Core) startServerLoop() {
-	c.wg.Add(1)
+	c.wg.Add(3)
 	go c.tsLoop()
-	if !streamingutil.IsStreamingServiceEnabled() {
-		c.wg.Add(2)
-		go c.startTimeTickLoop()
-		go c.chanTimeTick.startWatch(&c.wg)
-	}
+	go c.startTimeTickLoop()
+	go c.chanTimeTick.startWatch(&c.wg)
 }
 
 // Start starts RootCoord.
 func (c *Core) Start() error {
 	var err error
-	if !c.enableActiveStandBy {
-		c.startOnce.Do(func() {
-			err = c.startInternal()
-		})
-	}
+	c.startOnce.Do(func() {
+		err = c.startInternal()
+	})
 
 	return err
 }
@@ -827,9 +743,6 @@ func (c *Core) revokeSession() {
 }
 
 func (c *Core) GracefulStop() {
-	if c.streamingCoord != nil {
-		c.streamingCoord.Stop()
-	}
 }
 
 // Stop stops rootCoord.
@@ -858,7 +771,7 @@ func (c *Core) GetComponentStates(ctx context.Context, req *milvuspb.GetComponen
 
 	nodeID := common.NotRegisteredID
 	if c.session != nil && c.session.Registered() {
-		nodeID = c.session.ServerID
+		nodeID = c.session.GetServerID()
 	}
 
 	return &milvuspb.ComponentStates{
@@ -1079,6 +992,57 @@ func (c *Core) CreateCollection(ctx context.Context, in *milvuspb.CreateCollecti
 	return merr.Success(), nil
 }
 
+// AddCollectionField add field
+func (c *Core) AddCollectionField(ctx context.Context, in *milvuspb.AddCollectionFieldRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionField", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("AddCollectionField")
+
+	log.Ctx(ctx).Info("received request to add field",
+		zap.String("dbName", in.GetDbName()),
+		zap.String("name", in.GetCollectionName()),
+		zap.String("role", typeutil.RootCoordRole))
+
+	t := &addCollectionFieldTask{
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
+	}
+
+	if err := c.scheduler.AddTask(t); err != nil {
+		log.Ctx(ctx).Info("failed to enqueue request to add field",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("name", in.GetCollectionName()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionField", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	if err := t.WaitToFinish(); err != nil {
+		log.Ctx(ctx).Info("failed to add field",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("name", in.GetCollectionName()),
+			zap.Uint64("ts", t.GetTs()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionField", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionField", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("AddCollectionField").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("AddCollectionField").Observe(float64(t.queueDur.Milliseconds()))
+
+	log.Ctx(ctx).Info("done to add field",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("name", in.GetCollectionName()),
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Success(), nil
+}
+
 // DropCollection drop collection
 func (c *Core) DropCollection(ctx context.Context, in *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
 	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
@@ -1205,6 +1169,7 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string, dbName str
 		Description:        collInfo.Description,
 		AutoID:             collInfo.AutoID,
 		Fields:             model.MarshalFieldModels(collInfo.Fields),
+		StructArrayFields:  model.MarshalStructArrayFieldModels(collInfo.StructArrayFields),
 		Functions:          model.MarshalFunctionModels(collInfo.Functions),
 		EnableDynamicField: collInfo.EnableDynamicField,
 		Properties:         collInfo.Properties,
@@ -1228,6 +1193,8 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string, dbName str
 	resp.NumPartitions = int64(len(collInfo.Partitions))
 	resp.DbId = collInfo.DBID
 	resp.UpdateTimestamp = collInfo.UpdateTimestamp
+	resp.UpdateTimestampStr = strconv.FormatUint(collInfo.UpdateTimestamp, 10)
+
 	return resp
 }
 
@@ -1811,6 +1778,7 @@ func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestam
 	}
 
 	ts, err := c.tsoAllocator.GenerateTSO(in.GetCount())
+	physicalTs, _ := tsoutil.ParseTS(ts)
 	if err != nil {
 		log.Ctx(ctx).Error("failed to allocate timestamp", zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err))
@@ -1822,7 +1790,7 @@ func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestam
 
 	// return first available timestamp
 	ts = ts - uint64(in.GetCount()) + 1
-	metrics.RootCoordTimestamp.Set(float64(ts))
+	metrics.RootCoordTimestamp.Set(float64(physicalTs.Unix()))
 	return &rootcoordpb.AllocTimestampResponse{
 		Status:    merr.Success(),
 		Timestamp: ts,
@@ -2181,7 +2149,7 @@ func (c *Core) ListAliases(ctx context.Context, in *milvuspb.ListAliasesRequest)
 func (c *Core) ExpireCredCache(ctx context.Context, username string) error {
 	req := proxypb.InvalidateCredCacheRequest{
 		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithSourceID(c.session.ServerID),
+			commonpbutil.WithSourceID(c.session.GetServerID()),
 		),
 		Username: username,
 	}
@@ -2192,7 +2160,7 @@ func (c *Core) ExpireCredCache(ctx context.Context, username string) error {
 func (c *Core) UpdateCredCache(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 	req := proxypb.UpdateCredCacheRequest{
 		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithSourceID(c.session.ServerID),
+			commonpbutil.WithSourceID(c.session.GetServerID()),
 		),
 		Username: credInfo.Username,
 		Password: credInfo.Sha256Password,
@@ -2873,19 +2841,17 @@ func (c *Core) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest)
 
 	policies, err := c.meta.ListPolicy(ctx, util.DefaultTenant)
 	if err != nil {
-		errMsg := "fail to list policy"
-		ctxLog.Warn(errMsg, zap.Error(err))
+		ctxLog.Error("fail to list policy", zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
+			Status: merr.StatusWithErrorCode(fmt.Errorf("fail to list policy: %s", err.Error()), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 	// expand privilege groups and turn to policies
 	allGroups, err := c.getDefaultAndCustomPrivilegeGroups(ctx)
 	if err != nil {
-		errMsg := "fail to get privilege groups"
-		ctxLog.Warn(errMsg, zap.Error(err))
+		ctxLog.Error("fail to get privilege groups", zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
+			Status: merr.StatusWithErrorCode(fmt.Errorf("fail to get privilege groups: %s", err.Error()), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 	groups := lo.SliceToMap(allGroups, func(group *milvuspb.PrivilegeGroupInfo) (string, []*milvuspb.PrivilegeEntity) {
@@ -2893,10 +2859,9 @@ func (c *Core) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest)
 	})
 	expandGrants, err := c.expandPrivilegeGroups(ctx, policies, groups)
 	if err != nil {
-		errMsg := "fail to expand privilege groups"
-		ctxLog.Warn(errMsg, zap.Error(err))
+		ctxLog.Error("fail to expand privilege groups", zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
+			Status: merr.StatusWithErrorCode(fmt.Errorf("fail to expand privilege groups: %s", err.Error()), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 	expandPolicies := lo.Map(expandGrants, func(r *milvuspb.GrantEntity, _ int) string {
@@ -2905,10 +2870,9 @@ func (c *Core) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest)
 
 	userRoles, err := c.meta.ListUserRole(ctx, util.DefaultTenant)
 	if err != nil {
-		errMsg := "fail to list user-role"
-		ctxLog.Warn(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Error("fail to list user-role", zap.Any("in", in), zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
+			Status: merr.StatusWithErrorCode(fmt.Errorf("fail to list user-role: %s", err.Error()), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 
@@ -2982,7 +2946,10 @@ func (c *Core) RenameCollection(ctx context.Context, req *milvuspb.RenameCollect
 		return merr.Status(err), nil
 	}
 
-	log := log.Ctx(ctx).With(zap.String("oldCollectionName", req.GetOldName()), zap.String("newCollectionName", req.GetNewName()))
+	log := log.Ctx(ctx).With(zap.String("oldCollectionName", req.GetOldName()),
+		zap.String("newCollectionName", req.GetNewName()),
+		zap.String("oldDbName", req.GetDbName()),
+		zap.String("newDbName", req.GetNewDBName()))
 	log.Info("received request to rename collection")
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("RenameCollection", metrics.TotalLabel).Inc()
@@ -3050,7 +3017,7 @@ func (c *Core) CheckHealth(ctx context.Context, in *milvuspb.CheckHealthRequest)
 		return &milvuspb.CheckHealthResponse{
 			Status:    merr.Status(err),
 			IsHealthy: false,
-			Reasons:   []string{fmt.Sprintf("serverID=%d: %v", c.session.ServerID, err)},
+			Reasons:   []string{fmt.Sprintf("serverID=%d: %v", c.session.GetServerID(), err)},
 		}, nil
 	}
 
@@ -3081,7 +3048,7 @@ func (c *Core) CheckHealth(ctx context.Context, in *milvuspb.CheckHealthRequest)
 	maxDelay := Params.QuotaConfig.MaxTimeTickDelay.GetAsDuration(time.Second)
 	if maxDelay > 0 {
 		group.Go(func() error {
-			err := CheckTimeTickLagExceeded(ctx, c.queryCoord, c.dataCoord, maxDelay)
+			err := CheckTimeTickLagExceeded(ctx, c.mixCoord, maxDelay)
 			if err != nil {
 				errs.Insert(err)
 			}
@@ -3264,7 +3231,137 @@ func (c *Core) getDefaultAndCustomPrivilegeGroups(ctx context.Context) ([]*milvu
 	return allGroups, nil
 }
 
-// RegisterStreamingCoordGRPCService registers the grpc service of streaming coordinator.
-func (s *Core) RegisterStreamingCoordGRPCService(server *grpc.Server) {
-	s.streamingCoord.RegisterGRPCService(server)
+func (c *Core) getCurrentUserVisibleDatabases(ctx context.Context) (typeutil.Set[string], error) {
+	enableAuth := Params.CommonCfg.AuthorizationEnabled.GetAsBool()
+	privilegeDatabases := typeutil.NewSet[string]()
+	if !enableAuth {
+		privilegeDatabases.Insert(util.AnyWord)
+		return privilegeDatabases, nil
+	}
+	curUser, err := contextutil.GetCurUserFromContext(ctx)
+	// it will fail if the inner node server use the list database API
+	if err != nil || (curUser == util.UserRoot && !Params.CommonCfg.RootShouldBindRole.GetAsBool()) {
+		if err != nil {
+			log.Ctx(ctx).Warn("get current user from context failed", zap.Error(err))
+		}
+		privilegeDatabases.Insert(util.AnyWord)
+		return privilegeDatabases, nil
+	}
+	userRoles, err := c.meta.SelectUser(ctx, "", &milvuspb.UserEntity{
+		Name: curUser,
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(userRoles) == 0 {
+		return privilegeDatabases, nil
+	}
+	for _, role := range userRoles[0].Roles {
+		if role.GetName() == util.RoleAdmin {
+			privilegeDatabases.Insert(util.AnyWord)
+			return privilegeDatabases, nil
+		}
+		if role.GetName() == util.RolePublic {
+			continue
+		}
+		entities, err := c.meta.SelectGrant(ctx, "", &milvuspb.GrantEntity{
+			Role:   role,
+			DbName: util.AnyWord,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, entity := range entities {
+			privilegeDatabases.Insert(entity.GetDbName())
+			if entity.GetDbName() == util.AnyWord {
+				return privilegeDatabases, nil
+			}
+		}
+	}
+	return privilegeDatabases, nil
+}
+
+func isVisibleDatabaseForCurUser(currentDatabase string, visibleDatabases typeutil.Set[string]) bool {
+	if visibleDatabases.Contain(util.AnyWord) {
+		return true
+	}
+	return visibleDatabases.Contain(currentDatabase)
+}
+
+func (c *Core) getCurrentUserVisibleCollections(ctx context.Context, databaseName string) (typeutil.Set[string], error) {
+	enableAuth := Params.CommonCfg.AuthorizationEnabled.GetAsBool()
+	privilegeColls := typeutil.NewSet[string]()
+	if !enableAuth {
+		privilegeColls.Insert(util.AnyWord)
+		return privilegeColls, nil
+	}
+	curUser, err := contextutil.GetCurUserFromContext(ctx)
+	if err != nil || (curUser == util.UserRoot && !Params.CommonCfg.RootShouldBindRole.GetAsBool()) {
+		if err != nil {
+			log.Ctx(ctx).Warn("get current user from context failed", zap.Error(err))
+		}
+		privilegeColls.Insert(util.AnyWord)
+		return privilegeColls, nil
+	}
+	userRoles, err := c.meta.SelectUser(ctx, "", &milvuspb.UserEntity{
+		Name: curUser,
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(userRoles) == 0 {
+		return privilegeColls, nil
+	}
+	for _, role := range userRoles[0].Roles {
+		if role.GetName() == util.RoleAdmin {
+			privilegeColls.Insert(util.AnyWord)
+			return privilegeColls, nil
+		}
+		if role.GetName() == util.RolePublic {
+			continue
+		}
+		entities, err := c.meta.SelectGrant(ctx, "", &milvuspb.GrantEntity{
+			Role:   role,
+			DbName: databaseName,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, entity := range entities {
+			objectType := entity.GetObject().GetName()
+			priv := entity.GetGrantor().GetPrivilege().GetName()
+			if objectType == commonpb.ObjectType_Global.String() &&
+				priv == util.PrivilegeNameForAPI(commonpb.ObjectPrivilege_PrivilegeAll.String()) {
+				privilegeColls.Insert(util.AnyWord)
+				return privilegeColls, nil
+			}
+			// should list collection level built-in privilege group or custom privilege group objects
+			if objectType != commonpb.ObjectType_Collection.String() {
+				customGroup, err := c.meta.IsCustomPrivilegeGroup(ctx, priv)
+				if err != nil {
+					return nil, err
+				}
+				if !customGroup && !Params.RbacConfig.IsCollectionPrivilegeGroup(priv) {
+					continue
+				}
+			}
+			collectionName := entity.GetObjectName()
+			privilegeColls.Insert(collectionName)
+			if collectionName == util.AnyWord {
+				return privilegeColls, nil
+			}
+		}
+	}
+	return privilegeColls, nil
+}
+
+func isVisibleCollectionForCurUser(collectionName string, visibleCollections typeutil.Set[string]) bool {
+	if visibleCollections.Contain(util.AnyWord) {
+		return true
+	}
+	return visibleCollections.Contain(collectionName)
+}
+
+func (c *Core) GetQuotaMetrics(ctx context.Context, req *internalpb.GetQuotaMetricsRequest) (*internalpb.GetQuotaMetricsResponse, error) {
+	return c.quotaCenter.getQuotaMetrics(), nil
 }

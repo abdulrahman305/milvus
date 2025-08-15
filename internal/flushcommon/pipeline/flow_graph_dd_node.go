@@ -249,7 +249,7 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 				zap.Uint64("timetick", createSegment.CreateSegmentMessage.TimeTick()),
 			)
 			logger.Info("receive create segment message")
-			if err := ddn.msgHandler.HandleCreateSegment(context.Background(), ddn.vChannelName, createSegment.CreateSegmentMessage); err != nil {
+			if err := ddn.msgHandler.HandleCreateSegment(ddn.ctx, createSegment.CreateSegmentMessage); err != nil {
 				logger.Warn("handle create segment message failed", zap.Error(err))
 			} else {
 				logger.Info("handle create segment message success")
@@ -262,7 +262,7 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 				zap.Uint64("timetick", flushMsg.FlushMessage.TimeTick()),
 			)
 			logger.Info("receive flush message")
-			if err := ddn.msgHandler.HandleFlush(ddn.vChannelName, flushMsg.FlushMessage); err != nil {
+			if err := ddn.msgHandler.HandleFlush(flushMsg.FlushMessage); err != nil {
 				logger.Warn("handle flush message failed", zap.Error(err))
 			} else {
 				logger.Info("handle flush message success")
@@ -274,27 +274,13 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 				zap.Int32("msgType", int32(msg.Type())),
 				zap.Uint64("timetick", manualFlushMsg.ManualFlushMessage.TimeTick()),
 				zap.Uint64("flushTs", manualFlushMsg.ManualFlushMessage.Header().FlushTs),
+				zap.Int64s("segmentIDs", manualFlushMsg.ManualFlushMessage.Header().SegmentIds),
 			)
 			logger.Info("receive manual flush message")
-			if err := ddn.msgHandler.HandleManualFlush(ddn.vChannelName, manualFlushMsg.ManualFlushMessage); err != nil {
+			if err := ddn.msgHandler.HandleManualFlush(manualFlushMsg.ManualFlushMessage); err != nil {
 				logger.Warn("handle manual flush message failed", zap.Error(err))
 			} else {
 				logger.Info("handle manual flush message success")
-			}
-		case commonpb.MsgType_Import:
-			importMsg := msg.(*msgstream.ImportMsg)
-			if importMsg.GetCollectionID() != ddn.collectionID {
-				continue
-			}
-			logger := log.With(
-				zap.String("vchannel", ddn.Name()),
-				zap.Int32("msgType", int32(msg.Type())),
-			)
-			logger.Info("receive import message")
-			if err := ddn.msgHandler.HandleImport(context.Background(), ddn.vChannelName, importMsg.ImportMsg); err != nil {
-				logger.Warn("handle import message failed", zap.Error(err))
-			} else {
-				logger.Info("handle import message success")
 			}
 		}
 	}

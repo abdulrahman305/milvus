@@ -116,8 +116,10 @@ func (iNode *insertNode) Operate(in Msg) Msg {
 	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Inc()
 
 	return &deleteNodeMsg{
-		deleteMsgs: nodeMsg.deleteMsgs,
-		timeRange:  nodeMsg.timeRange,
+		deleteMsgs:    nodeMsg.deleteMsgs,
+		timeRange:     nodeMsg.timeRange,
+		schema:        nodeMsg.schema,
+		schemaVersion: nodeMsg.schemaVersion,
 	}
 }
 

@@ -5,6 +5,8 @@ const (
 
 	DirectoryWAL           = "wal"
 	DirectorySegmentAssign = "segment-assign"
+	DirectoryVChannel      = "vchannel"
+	DirectorySchema        = "schema"
 
 	KeyConsumeCheckpoint = "consume-checkpoint"
 )

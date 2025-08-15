@@ -12,12 +12,11 @@
 #include <gtest/gtest.h>
 #include "common/Schema.h"
 #include "query/Plan.h"
-#include "segcore/SegmentSealedImpl.h"
+
 #include "segcore/reduce_c.h"
-#include "segcore/plan_c.h"
-#include "segcore/segment_c.h"
+#include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/DataGen.h"
-#include "test_utils/c_api_test_utils.h"
+#include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -29,29 +28,6 @@ using namespace milvus::tracer;
  * this UT is to cover Iterative filtering execution logic (knowhere iterator next() -> scalar filtering)
  * so we will not cover all expr type here, just some examples
  */
-
-void
-prepareSegmentFieldData(const std::unique_ptr<SegmentSealed>& segment,
-                        size_t row_count,
-                        GeneratedData& data_set) {
-    auto field_data =
-        std::make_shared<milvus::FieldData<int64_t>>(DataType::INT64, false);
-    field_data->FillFieldData(data_set.row_ids_.data(), row_count);
-    auto field_data_info =
-        FieldDataInfo{RowFieldID.get(),
-                      row_count,
-                      std::vector<milvus::FieldDataPtr>{field_data}};
-    segment->LoadFieldData(RowFieldID, field_data_info);
-
-    field_data =
-        std::make_shared<milvus::FieldData<int64_t>>(DataType::INT64, false);
-    field_data->FillFieldData(data_set.timestamps_.data(), row_count);
-    field_data_info =
-        FieldDataInfo{TimestampFieldID.get(),
-                      row_count,
-                      std::vector<milvus::FieldDataPtr>{field_data}};
-    segment->LoadFieldData(TimestampFieldID, field_data_info);
-}
 
 void
 CheckFilterSearchResult(const SearchResult& search_result_by_iterative_filter,
@@ -91,24 +67,11 @@ TEST(IterativeFilter, SealedIndex) {
     auto str_fid = schema->AddDebugField("string1", DataType::VARCHAR);
     auto bool_fid = schema->AddDebugField("bool", DataType::BOOL);
     schema->set_primary_field_id(str_fid);
-    auto segment = CreateSealedSegment(schema);
     size_t N = 50;
 
     //2. load raw data
     auto raw_data = DataGen(schema, N, 42, 0, 8, 10, false, false);
-    auto fields = schema->get_fields();
-    for (auto field_data : raw_data.raw_->fields_data()) {
-        int64_t field_id = field_data.field_id();
-
-        auto info = FieldDataInfo(field_data.field_id(), N);
-        auto field_meta = fields.at(FieldId(field_id));
-        info.channel->push(
-            CreateFieldDataFromDataArray(N, &field_data, field_meta));
-        info.channel->close();
-
-        segment->LoadFieldData(FieldId(field_id), info);
-    }
-    prepareSegmentFieldData(segment, N, raw_data);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, raw_data);
 
     //3. load index
     auto vector_data = raw_data.get_col<float>(vec_fid);
@@ -116,7 +79,9 @@ TEST(IterativeFilter, SealedIndex) {
         N, dim, vector_data.data(), knowhere::IndexEnum::INDEX_HNSW);
     LoadIndexInfo load_index_info;
     load_index_info.field_id = vec_fid.get();
-    load_index_info.index = std::move(indexing);
+    load_index_info.index_params = GenIndexParams(indexing.get());
+    load_index_info.cache_index =
+        CreateTestCacheIndex("test", std::move(indexing));
     load_index_info.index_params["metric_type"] = knowhere::metric::L2;
     segment->LoadIndex(load_index_info);
     int topK = 10;
@@ -152,7 +117,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -188,7 +153,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(
@@ -218,7 +183,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -247,7 +212,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(
@@ -268,7 +233,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -288,7 +253,7 @@ TEST(IterativeFilter, SealedIndex) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(
@@ -313,24 +278,11 @@ TEST(IterativeFilter, SealedData) {
     auto str_fid = schema->AddDebugField("string1", DataType::VARCHAR);
     auto bool_fid = schema->AddDebugField("bool", DataType::BOOL);
     schema->set_primary_field_id(str_fid);
-    auto segment = CreateSealedSegment(schema);
     size_t N = 100;
 
     //2. load raw data
     auto raw_data = DataGen(schema, N, 42, 0, 8, 10, false, false);
-    auto fields = schema->get_fields();
-    for (auto field_data : raw_data.raw_->fields_data()) {
-        int64_t field_id = field_data.field_id();
-
-        auto info = FieldDataInfo(field_data.field_id(), N);
-        auto field_meta = fields.at(FieldId(field_id));
-        info.channel->push(
-            CreateFieldDataFromDataArray(N, &field_data, field_meta));
-        info.channel->close();
-
-        segment->LoadFieldData(FieldId(field_id), info);
-    }
-    prepareSegmentFieldData(segment, N, raw_data);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, raw_data);
 
     int topK = 10;
     // int8 binaryRange
@@ -363,7 +315,7 @@ TEST(IterativeFilter, SealedData) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -399,7 +351,7 @@ TEST(IterativeFilter, SealedData) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(
@@ -470,7 +422,7 @@ TEST(IterativeFilter, GrowingRawData) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -506,7 +458,7 @@ TEST(IterativeFilter, GrowingRawData) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment_growing_impl->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(
@@ -590,7 +542,7 @@ TEST(IterativeFilter, GrowingIndex) {
         proto::plan::PlanNode plan_node;
         auto ok =
             google::protobuf::TextFormat::ParseFromString(raw_plan, &plan_node);
-        auto plan = CreateSearchPlanFromPlanNode(*schema, plan_node);
+        auto plan = CreateSearchPlanFromPlanNode(schema, plan_node);
         auto num_queries = 1;
         auto seed = 1024;
         auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, seed);
@@ -626,7 +578,7 @@ TEST(IterativeFilter, GrowingIndex) {
         proto::plan::PlanNode plan_node2;
         auto ok2 = google::protobuf::TextFormat::ParseFromString(raw_plan2,
                                                                  &plan_node2);
-        auto plan2 = CreateSearchPlanFromPlanNode(*schema, plan_node2);
+        auto plan2 = CreateSearchPlanFromPlanNode(schema, plan_node2);
         auto search_result2 =
             segment_growing_impl->Search(plan2.get(), ph_group.get(), 1L << 63);
         CheckFilterSearchResult(

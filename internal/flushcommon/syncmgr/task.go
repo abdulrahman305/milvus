@@ -25,14 +25,16 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
@@ -62,6 +64,7 @@ type SyncTask struct {
 
 	metacache  metacache.MetaCache
 	metaWriter MetaWriter
+	schema     *schemapb.CollectionSchema // schema for when buffer created, could be different from current on in metacache
 
 	pack *SyncPack
 
@@ -76,10 +79,12 @@ type SyncTask struct {
 
 	tr *timerecord.TimeRecorder
 
-	flushedSize         int64
-	execTime            time.Duration
-	multiPartUploadSize int64
-	syncBufferSize      int64
+	flushedSize int64
+	execTime    time.Duration
+
+	// storage config used in pooled tasks, optional
+	// use singleton config for non-pooled tasks
+	storageConfig *indexpb.StorageConfig
 }
 
 func (t *SyncTask) getLogger() *log.MLogger {
@@ -119,21 +124,22 @@ func (t *SyncTask) Run(ctx context.Context) (err error) {
 			log.Info("segment dropped, discard sync task")
 			return nil
 		}
-		log.Warn("failed to sync data, segment not found in metacache")
-		err := merr.WrapErrSegmentNotFound(t.segmentID)
-		return err
+		log.Warn("segment not found in metacache, may be already synced")
+		return nil
 	}
 
 	switch segmentInfo.GetStorageVersion() {
 	case storage.StorageV2:
-		writer := NewBulkPackWriterV2(t.metacache, t.chunkManager, t.allocator, t.syncBufferSize, t.multiPartUploadSize, t.writeRetryOpts...)
+		// New sync task means needs to flush data immediately, so do not need to buffer data in writer again.
+		writer := NewBulkPackWriterV2(t.metacache, t.schema, t.chunkManager, t.allocator, 0,
+			packed.DefaultMultiPartUploadSize, t.storageConfig, t.writeRetryOpts...)
 		t.insertBinlogs, t.deltaBinlog, t.statsBinlogs, t.bm25Binlogs, t.flushedSize, err = writer.Write(ctx, t.pack)
 		if err != nil {
 			log.Warn("failed to write sync data with storage v2 format", zap.Error(err))
 			return err
 		}
 	default:
-		writer := NewBulkPackWriter(t.metacache, t.chunkManager, t.allocator, t.writeRetryOpts...)
+		writer := NewBulkPackWriter(t.metacache, t.schema, t.chunkManager, t.allocator, t.writeRetryOpts...)
 		t.insertBinlogs, t.deltaBinlog, t.statsBinlogs, t.bm25Binlogs, t.flushedSize, err = writer.Write(ctx, t.pack)
 		if err != nil {
 			log.Warn("failed to write sync data", zap.Error(err))
@@ -165,6 +171,8 @@ func (t *SyncTask) Run(ctx context.Context) (err error) {
 			return err
 		}
 	}
+
+	t.pack.ReleaseData()
 
 	actions := []metacache.SegmentAction{metacache.FinishSyncing(t.batchRows)}
 	if t.pack.isFlush {

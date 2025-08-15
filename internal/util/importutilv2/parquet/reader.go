@@ -35,9 +35,12 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
+const totalReadBufferSize = int64(64 * 1024 * 1024)
+
 type reader struct {
 	ctx    context.Context
 	cm     storage.ChunkManager
+	cmr    storage.FileReader
 	schema *schemapb.CollectionSchema
 
 	path string
@@ -55,17 +58,31 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	if err != nil {
 		return nil, err
 	}
+
+	// Each ColumnReader consumes ReaderProperties.BufferSize memory independently.
+	// Therefore, the bufferSize should be divided by the number of columns
+	// to ensure total memory usage stays within the intended limit.
+	columnReaderBufferSize := totalReadBufferSize / int64(len(schema.GetFields()))
+
 	r, err := file.NewParquetReader(cmReader, file.WithReadProps(&parquet.ReaderProperties{
-		BufferSize:            int64(bufferSize),
+		BufferSize:            columnReaderBufferSize,
 		BufferedStreamEnabled: true,
 	}))
 	if err != nil {
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("new parquet reader failed, err=%v", err))
 	}
-	log.Info("create parquet reader done", zap.Int("row group num", r.NumRowGroups()),
+	log.Info("parquet file info", zap.Int("row group num", r.NumRowGroups()),
 		zap.Int64("num rows", r.NumRows()))
 
-	fileReader, err := pqarrow.NewFileReader(r, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
+	if err != nil {
+		return nil, err
+	}
+
+	readProps := pqarrow.ArrowReadProperties{
+		BatchSize: count,
+	}
+	fileReader, err := pqarrow.NewFileReader(r, readProps, memory.DefaultAllocator)
 	if err != nil {
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("new parquet file reader failed, err=%v", err))
 	}
@@ -74,13 +91,10 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	if err != nil {
 		return nil, err
 	}
-	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
-	if err != nil {
-		return nil, err
-	}
 	return &reader{
 		ctx:        ctx,
 		cm:         cm,
+		cmr:        cmReader,
 		schema:     schema,
 		fileSize:   atomic.NewInt64(0),
 		path:       path,
@@ -120,10 +134,6 @@ OUTER:
 			return nil, io.EOF
 		}
 	}
-	err = common.FillDynamicData(insertData, r.schema)
-	if err != nil {
-		return nil, err
-	}
 	return insertData, nil
 }
 
@@ -140,11 +150,11 @@ func (r *reader) Size() (int64, error) {
 }
 
 func (r *reader) Close() {
-	for _, cr := range r.frs {
-		cr.Close()
-	}
 	err := r.r.Close()
 	if err != nil {
 		log.Warn("close parquet reader failed", zap.Error(err))
+	}
+	if r.cmr != nil {
+		r.cmr.Close()
 	}
 }

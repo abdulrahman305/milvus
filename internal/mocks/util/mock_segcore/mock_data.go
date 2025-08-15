@@ -378,6 +378,7 @@ func GenTestIndexInfoList(collectionID int64, schema *schemapb.CollectionSchema)
 					{Key: common.MetricTypeKey, Value: metric.L2},
 					{Key: common.IndexTypeKey, Value: IndexFaissIVFFlat},
 					{Key: "nlist", Value: "128"},
+					{Key: common.LoadPriorityKey, Value: "high"},
 				}
 			}
 		case schemapb.DataType_BinaryVector:
@@ -386,6 +387,7 @@ func GenTestIndexInfoList(collectionID int64, schema *schemapb.CollectionSchema)
 					{Key: common.MetricTypeKey, Value: metric.JACCARD},
 					{Key: common.IndexTypeKey, Value: IndexFaissBinIVFFlat},
 					{Key: "nlist", Value: "128"},
+					{Key: common.LoadPriorityKey, Value: "high"},
 				}
 			}
 		case schemapb.DataType_SparseFloatVector:
@@ -394,6 +396,7 @@ func GenTestIndexInfoList(collectionID int64, schema *schemapb.CollectionSchema)
 					{Key: common.MetricTypeKey, Value: metric.IP},
 					{Key: common.IndexTypeKey, Value: IndexSparseWand},
 					{Key: "M", Value: "16"},
+					{Key: common.LoadPriorityKey, Value: "high"},
 				}
 			}
 		}
@@ -824,7 +827,7 @@ func GenAndSaveIndexV2(collectionID, partitionID, segmentID, buildID int64,
 
 func GenAndSaveIndex(collectionID, partitionID, segmentID, fieldID int64, msgLength int, indexType, metricType string, cm storage.ChunkManager) (*querypb.FieldIndexInfo, error) {
 	typeParams, indexParams := genIndexParams(indexType, metricType)
-
+	indexParams[common.LoadPriorityKey] = "HIGH"
 	index, err := indexcgowrapper.NewCgoIndex(schemapb.DataType_FloatVector, typeParams, indexParams)
 	if err != nil {
 		return nil, err
@@ -1003,7 +1006,7 @@ func genDSLByIndexType(schema *schemapb.CollectionSchema, indexType string) (str
 	} else if indexType == IndexHNSW {
 		return genHNSWDSL(schema, ef, defaultTopK, defaultRoundDecimal)
 	}
-	return "", fmt.Errorf("Invalid indexType")
+	return "", errors.New("Invalid indexType")
 }
 
 func genBruteForceDSL(schema *schemapb.CollectionSchema, topK int64, roundDecimal int64) (string, error) {
@@ -1094,7 +1097,7 @@ func CheckSearchResult(ctx context.Context, nq int64, plan *segcore.SearchPlan, 
 			return err
 		}
 		if len(blob) == 0 {
-			return fmt.Errorf("wrong search result data blobs when checkSearchResult")
+			return errors.New("wrong search result data blobs when checkSearchResult")
 		}
 
 		result := &schemapb.SearchResultData{}
@@ -1104,17 +1107,17 @@ func CheckSearchResult(ctx context.Context, nq int64, plan *segcore.SearchPlan, 
 		}
 
 		if result.TopK != sliceTopKs[i] {
-			return fmt.Errorf("unexpected topK when checkSearchResult")
+			return errors.New("unexpected topK when checkSearchResult")
 		}
 		if result.NumQueries != sInfo.SliceNQs[i] {
-			return fmt.Errorf("unexpected nq when checkSearchResult")
+			return errors.New("unexpected nq when checkSearchResult")
 		}
 		// search empty segment, return empty result.IDs
 		if len(result.Ids.IdField.(*schemapb.IDs_IntId).IntId.Data) <= 0 {
-			return fmt.Errorf("unexpected Ids when checkSearchResult")
+			return errors.New("unexpected Ids when checkSearchResult")
 		}
 		if len(result.Scores) <= 0 {
-			return fmt.Errorf("unexpected Scores when checkSearchResult")
+			return errors.New("unexpected Scores when checkSearchResult")
 		}
 	}
 
@@ -1240,7 +1243,7 @@ func GenSimpleRetrievePlan(collection *segcore.CCollection) (*segcore.RetrievePl
 		return nil, err
 	}
 
-	plan, err2 := segcore.NewRetrievePlan(collection, planBytes, timestamp, 100)
+	plan, err2 := segcore.NewRetrievePlan(collection, planBytes, timestamp, 100, 0, 0)
 	return plan, err2
 }
 

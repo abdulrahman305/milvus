@@ -26,7 +26,6 @@
 #include "index/StringIndexMarisa.h"
 #include "index/InvertedIndexTantivy.h"
 #include "storage/FileManager.h"
-#include "storage/DiskFileManagerImpl.h"
 #include "storage/MemFileManagerImpl.h"
 
 namespace milvus {
@@ -42,6 +41,7 @@ template <typename T>
 class HybridScalarIndex : public ScalarIndex<T> {
  public:
     explicit HybridScalarIndex(
+        uint32_t tantivy_index_version,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 
@@ -104,11 +104,19 @@ class HybridScalarIndex : public ScalarIndex<T> {
         return internal_index_->Query(dataset);
     }
 
+    bool
+    SupportPatternMatch() const override {
+        return internal_index_->SupportPatternMatch();
+    }
+
     const TargetBitmap
-    PatternMatch(const std::string& pattern) override {
-        PatternMatchTranslator translator;
-        auto regex_pattern = translator(pattern);
-        return RegexQuery(regex_pattern);
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) override {
+        return internal_index_->PatternMatch(pattern, op);
+    }
+
+    bool
+    TryUseRegexQuery() const override {
+        return internal_index_->TryUseRegexQuery();
     }
 
     bool
@@ -193,6 +201,13 @@ class HybridScalarIndex : public ScalarIndex<T> {
     std::shared_ptr<ScalarIndex<T>> internal_index_{nullptr};
     storage::FileManagerContext file_manager_context_;
     std::shared_ptr<storage::MemFileManagerImpl> mem_file_manager_{nullptr};
+
+    // `tantivy_index_version_` is used to control which kind of tantivy index should be used.
+    // There could be the case where milvus version of read node is lower than the version of index builder node(and read node
+    // may not be upgraded to a higher version in a predictable time), so we are using a lower version of tantivy to read index
+    // built from a higher version of tantivy which is not supported.
+    // Therefore, we should provide a way to allow higher version of milvus to build tantivy index with low version.
+    uint32_t tantivy_index_version_{0};
 };
 
 }  // namespace index

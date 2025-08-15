@@ -22,14 +22,18 @@ namespace exec {
 PhyMvccNode::PhyMvccNode(int32_t operator_id,
                          DriverContext* driverctx,
                          const std::shared_ptr<const plan::MvccNode>& mvcc_node)
-    : Operator(
-          driverctx, mvcc_node->output_type(), operator_id, mvcc_node->id()) {
+    : Operator(driverctx,
+               mvcc_node->output_type(),
+               operator_id,
+               mvcc_node->id(),
+               "PhyIterativeFilterNode") {
     ExecContext* exec_context = operator_context_->get_exec_context();
     QueryContext* query_context = exec_context->get_query_context();
     segment_ = query_context->get_segment();
     query_timestamp_ = query_context->get_query_timestamp();
     active_count_ = query_context->get_active_count();
     is_source_node_ = mvcc_node->sources().size() == 0;
+    collection_ttl_timestamp_ = query_context->get_collection_ttl();
 }
 
 void
@@ -60,7 +64,8 @@ PhyMvccNode::GetOutput() {
 
     TargetBitmapView data(col_input->GetRawData(), col_input->size());
     // need to expose null?
-    segment_->mask_with_timestamps(data, query_timestamp_);
+    segment_->mask_with_timestamps(
+        data, query_timestamp_, collection_ttl_timestamp_);
     segment_->mask_with_delete(data, active_count_, query_timestamp_);
     is_finished_ = true;
 

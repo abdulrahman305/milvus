@@ -5,30 +5,72 @@ package milvus.proto.index;
 option go_package = "github.com/milvus-io/milvus/pkg/v2/proto/workerpb";
 
 import "common.proto";
-import "internal.proto";
-import "milvus.proto";
 import "schema.proto";
 import "data_coord.proto";
 import "index_coord.proto";
 
 
 service IndexNode {
-  rpc CreateJob(CreateJobRequest) returns (common.Status) {
-  }
-  rpc QueryJobs(QueryJobsRequest) returns (QueryJobsResponse) {
-  }
-  rpc DropJobs(DropJobsRequest) returns (common.Status) {
-  }
-  rpc GetJobStats(GetJobStatsRequest) returns (GetJobStatsResponse) {
-  }
-  rpc CreateJobV2(CreateJobV2Request) returns (common.Status) {
-  }
-  rpc QueryJobsV2(QueryJobsV2Request) returns (QueryJobsV2Response) {
-  }
-  rpc DropJobsV2(DropJobsV2Request) returns (common.Status) {
-  }
+  // Deprecated
+  rpc CreateJob(CreateJobRequest) returns (common.Status) {}
+  // Deprecated
+  rpc QueryJobs(QueryJobsRequest) returns (QueryJobsResponse) {}
+  // Deprecated
+  rpc DropJobs(DropJobsRequest) returns (common.Status) {}
+  // Deprecated
+  rpc GetJobStats(GetJobStatsRequest) returns (GetJobStatsResponse) {}
+  // Deprecated
+  rpc CreateJobV2(CreateJobV2Request) returns (common.Status) {}
+  // Deprecated
+  rpc QueryJobsV2(QueryJobsV2Request) returns (QueryJobsV2Response) {}
+  // Deprecated
+  rpc DropJobsV2(DropJobsV2Request) returns (common.Status) {}
+
+  rpc CreateTask(CreateTaskRequest) returns (common.Status) {}
+  rpc QueryTask(QueryTaskRequest) returns (QueryTaskResponse) {}
+  rpc DropTask(DropTaskRequest) returns (common.Status) {}
 }
 
+message CreateTaskRequest {
+  // request body
+  bytes payload                  = 1;
+
+  // request properties, must contain:
+  // - clusterID
+  // - taskID
+  // - taskType
+  // - taskSlot
+  map<string, string> properties = 2;
+}
+
+message QueryTaskRequest {
+  // request properties, which contain:
+  // - clusterID
+  // - taskID
+  // - taskType
+  map<string, string> properties = 1;
+}
+
+message QueryTaskResponse {
+  common.Status status           = 1;
+
+  // response body
+  bytes payload                  = 2;
+
+  // response properties, which contain:
+  // - taskState
+  map<string, string> properties = 3;
+}
+
+message DropTaskRequest {
+  // request properties, which contain:
+  // - clusterID
+  // - taskID
+  // - taskType
+  map<string, string> properties = 1;
+}
+
+// CreateJobRequest is CreateIndexRequest
 message CreateJobRequest {
   string clusterID = 1;
   string index_file_prefix = 2;
@@ -57,11 +99,15 @@ message CreateJobRequest {
   schema.FieldSchema field = 25;
   bool partition_key_isolation = 26;
   int32 current_scalar_index_version = 27;
+  int64 task_slot = 28;
+  int64 storage_version = 29;
+  int64 lack_binlog_rows = 30;
+  repeated data.FieldBinlog insert_logs = 31;
 }
 
 message QueryJobsRequest {
   string clusterID = 1;
-  repeated int64 buildIDs = 2;
+  repeated int64 taskIDs = 2;
 }
 
 message QueryJobsResponse {
@@ -72,7 +118,7 @@ message QueryJobsResponse {
 
 message DropJobsRequest {
   string clusterID = 1;
-  repeated int64 buildIDs = 2;
+  repeated int64 taskIDs = 2;
 }
 
 message GetJobStatsRequest {
@@ -83,9 +129,11 @@ message GetJobStatsResponse {
   int64 total_job_num = 2;
   int64 in_progress_job_num = 3;
   int64 enqueue_job_num = 4;
-  int64 task_slots = 5;
+  int64 available_slots = 5;
   repeated index.JobInfo job_infos = 6;
+  // deprecated
   bool enable_disk = 7;
+  int64 total_slots = 8;
 }
 
 message AnalyzeRequest {
@@ -106,6 +154,7 @@ message AnalyzeRequest {
   double min_cluster_size_ratio = 15;
   double max_cluster_size_ratio = 16;
   int64 max_cluster_size = 17;
+  int64 task_slot = 18;
 }
 
 message CreateStatsRequest {
@@ -116,6 +165,7 @@ message CreateStatsRequest {
   string insert_channel = 5;
   int64 segmentID = 6;
   repeated data.FieldBinlog insert_logs = 7;
+  // deprecated, after sort stats moved, its not used.
   repeated data.FieldBinlog delta_logs = 8;
   index.StorageConfig storage_config = 9;
   schema.CollectionSchema schema = 10;
@@ -124,10 +174,21 @@ message CreateStatsRequest {
   int64 startLogID = 13;
   int64 endLogID = 14;
   int64 num_rows = 15;
+  // deprecated, after sort stats moved, its not used.
   int64 collection_ttl = 16;
+  // deprecated, after sort stats moved, its not used.
   uint64 current_ts = 17;
   int64 task_version = 18;
+  // deprecated, after sort stats moved, its not used.
   uint64 binlogMaxSize = 19;
+  bool enable_json_key_stats = 20;
+  int64 json_key_stats_tantivy_memory = 21;
+  int64 json_key_stats_data_format = 22;
+  // deprecated, the sort logic has been moved into the compaction process.
+  bool enable_json_key_stats_in_sort = 23; 
+  int64 task_slot = 24;
+  int64 storage_version = 25;
+  int32 current_scalar_index_version = 26;
 }
 
 message CreateJobV2Request {
@@ -187,6 +248,7 @@ message StatsResult {
   map<int64, data.TextIndexStats> text_stats_logs = 10;
   int64 num_rows = 11;
   repeated data.FieldBinlog bm25_logs = 12;
+  map<int64, data.JsonKeyStats> json_key_stats_logs = 13;
 }
 
 message StatsResults {

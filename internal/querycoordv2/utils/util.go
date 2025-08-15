@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"go.uber.org/multierr"
+	"github.com/blang/semver/v4"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
@@ -48,32 +48,32 @@ func CheckDelegatorDataReady(nodeMgr *session.NodeManager, targetMgr meta.Target
 	log := log.Ctx(context.TODO()).
 		WithRateGroup(fmt.Sprintf("util.CheckDelegatorDataReady-%d", leader.CollectionID), 1, 60).
 		With(zap.Int64("leaderID", leader.ID), zap.Int64("collectionID", leader.CollectionID))
-	info := nodeMgr.Get(leader.ID)
 
 	// Check whether leader is online
-	err := CheckNodeAvailable(leader.ID, info)
-	if err != nil {
+	info := nodeMgr.Get(leader.ID)
+	if info == nil {
+		err := merr.WrapErrNodeOffline(leader.ID)
 		log.Info("leader is not available", zap.Error(err))
 		return fmt.Errorf("leader not available: %w", err)
 	}
 
-	for id, version := range leader.Segments {
-		info := nodeMgr.Get(version.GetNodeID())
-		err = CheckNodeAvailable(version.GetNodeID(), info)
-		if err != nil {
-			log.Info("leader is not available due to QueryNode unavailable",
-				zap.Int64("segmentID", id),
-				zap.Error(err))
-			return err
-		}
-	}
 	segmentDist := targetMgr.GetSealedSegmentsByChannel(context.TODO(), leader.CollectionID, leader.Channel, scope)
 	// Check whether segments are fully loaded
 	for segmentID := range segmentDist {
-		_, exist := leader.Segments[segmentID]
+		version, exist := leader.Segments[segmentID]
 		if !exist {
 			log.RatedInfo(10, "leader is not available due to lack of segment", zap.Int64("segmentID", segmentID))
 			return merr.WrapErrSegmentLack(segmentID)
+		}
+
+		// Check whether segment's worker node is online
+		info := nodeMgr.Get(version.GetNodeID())
+		if info == nil {
+			err := merr.WrapErrNodeOffline(leader.ID)
+			log.Info("leader is not available due to QueryNode unavailable",
+				zap.Int64("segmentID", segmentID),
+				zap.Error(err))
+			return err
 		}
 	}
 	return nil
@@ -101,54 +101,43 @@ func checkLoadStatus(ctx context.Context, m *meta.Meta, collectionID int64) erro
 	return nil
 }
 
-func GetShardLeadersWithChannels(ctx context.Context, m *meta.Meta, targetMgr meta.TargetManagerInterface, dist *meta.DistributionManager,
-	nodeMgr *session.NodeManager, collectionID int64, channels map[string]*meta.DmChannel,
+func GetShardLeadersWithChannels(
+	ctx context.Context,
+	m *meta.Meta,
+	dist *meta.DistributionManager,
+	nodeMgr *session.NodeManager,
+	collectionID int64,
+	channels map[string]*meta.DmChannel,
+	withUnserviceableShards bool,
 ) ([]*querypb.ShardLeadersList, error) {
 	ret := make([]*querypb.ShardLeadersList, 0)
+
+	replicas := m.ReplicaManager.GetByCollection(ctx, collectionID)
 	for _, channel := range channels {
-		log := log.With(zap.String("channel", channel.GetChannelName()))
+		log := log.Ctx(ctx).With(zap.String("channel", channel.GetChannelName()))
 
-		var channelErr error
-		leaders := dist.LeaderViewManager.GetByFilter(meta.WithChannelName2LeaderView(channel.GetChannelName()))
-		if len(leaders) == 0 {
-			channelErr = merr.WrapErrChannelLack(channel.GetChannelName(), "channel not subscribed")
-		}
-
-		readableLeaders := make(map[int64]*meta.LeaderView)
-		for _, leader := range leaders {
-			if leader.UnServiceableError != nil {
-				multierr.AppendInto(&channelErr, leader.UnServiceableError)
+		ids := make([]int64, 0, len(replicas))
+		addrs := make([]string, 0, len(replicas))
+		serviceable := make([]bool, 0, len(replicas))
+		for _, replica := range replicas {
+			leader := dist.ChannelDistManager.GetShardLeader(channel.GetChannelName(), replica)
+			if leader == nil || (!withUnserviceableShards && !leader.IsServiceable()) {
+				log.WithRateGroup("util.GetShardLeaders", 1, 60).
+					Warn("leader is not available in replica", zap.String("channel", channel.GetChannelName()), zap.Int64("replicaID", replica.GetID()))
 				continue
 			}
-			readableLeaders[leader.ID] = leader
-		}
-
-		if len(readableLeaders) == 0 {
-			msg := fmt.Sprintf("channel %s is not available in any replica", channel.GetChannelName())
-			log.Warn(msg, zap.Error(channelErr))
-			err := merr.WrapErrChannelNotAvailable(channel.GetChannelName(), channelErr.Error())
-			return nil, err
-		}
-
-		readableLeaders = filterDupLeaders(ctx, m.ReplicaManager, readableLeaders)
-		ids := make([]int64, 0, len(leaders))
-		addrs := make([]string, 0, len(leaders))
-		for _, leader := range readableLeaders {
-			info := nodeMgr.Get(leader.ID)
+			info := nodeMgr.Get(leader.Node)
 			if info != nil {
 				ids = append(ids, info.ID())
 				addrs = append(addrs, info.Addr())
+				serviceable = append(serviceable, leader.IsServiceable())
 			}
 		}
 
-		// to avoid node down during GetShardLeaders
-		if len(ids) == 0 {
-			if channelErr == nil {
-				channelErr = merr.WrapErrChannelNotAvailable(channel.GetChannelName())
-			}
+		if len(ids) == 0 && !withUnserviceableShards {
+			err := merr.WrapErrChannelNotAvailable(channel.GetChannelName())
 			msg := fmt.Sprintf("channel %s is not available in any replica", channel.GetChannelName())
-			log.Warn(msg, zap.Error(channelErr))
-			err := merr.WrapErrChannelNotAvailable(channel.GetChannelName(), channelErr.Error())
+			log.Warn(msg, zap.Error(err))
 			return nil, err
 		}
 
@@ -156,13 +145,22 @@ func GetShardLeadersWithChannels(ctx context.Context, m *meta.Meta, targetMgr me
 			ChannelName: channel.GetChannelName(),
 			NodeIds:     ids,
 			NodeAddrs:   addrs,
+			Serviceable: serviceable,
 		})
 	}
 
 	return ret, nil
 }
 
-func GetShardLeaders(ctx context.Context, m *meta.Meta, targetMgr meta.TargetManagerInterface, dist *meta.DistributionManager, nodeMgr *session.NodeManager, collectionID int64) ([]*querypb.ShardLeadersList, error) {
+func GetShardLeaders(ctx context.Context,
+	m *meta.Meta,
+	targetMgr meta.TargetManagerInterface,
+	dist *meta.DistributionManager,
+	nodeMgr *session.NodeManager,
+	collectionID int64,
+	withUnserviceableShards bool,
+) ([]*querypb.ShardLeadersList, error) {
+	// skip check load status if withUnserviceableShards is true
 	if err := checkLoadStatus(ctx, m, collectionID); err != nil {
 		return nil, err
 	}
@@ -174,7 +172,7 @@ func GetShardLeaders(ctx context.Context, m *meta.Meta, targetMgr meta.TargetMan
 		log.Ctx(ctx).Warn("failed to get channels", zap.Error(err))
 		return nil, err
 	}
-	return GetShardLeadersWithChannels(ctx, m, targetMgr, dist, nodeMgr, collectionID, channels)
+	return GetShardLeadersWithChannels(ctx, m, dist, nodeMgr, collectionID, channels, withUnserviceableShards)
 }
 
 // CheckCollectionsQueryable check all channels are watched and all segments are loaded for this collection
@@ -213,7 +211,7 @@ func checkCollectionQueryable(ctx context.Context, m *meta.Meta, targetMgr meta.
 		return err
 	}
 
-	shardList, err := GetShardLeadersWithChannels(ctx, m, targetMgr, dist, nodeMgr, collectionID, channels)
+	shardList, err := GetShardLeadersWithChannels(ctx, m, dist, nodeMgr, collectionID, channels, false)
 	if err != nil {
 		return err
 	}
@@ -251,4 +249,29 @@ func filterDupLeaders(ctx context.Context, replicaManager *meta.ReplicaManager, 
 		result[v.ID] = v
 	}
 	return result
+}
+
+// GetChannelRWAndRONodesFor260 gets the RW and RO nodes of the channel.
+func GetChannelRWAndRONodesFor260(replica *meta.Replica, nodeManager *session.NodeManager) ([]int64, []int64) {
+	rwNodes, roNodes := replica.GetRWSQNodes(), replica.GetROSQNodes()
+	if rwQueryNodesLessThan260 := filterNodeLessThan260(replica.GetRWNodes(), nodeManager); len(rwQueryNodesLessThan260) > 0 {
+		// Add rwNodes to roNodes to balance channels from querynode to streamingnode forcely.
+		roNodes = append(roNodes, rwQueryNodesLessThan260...)
+		log.Debug("find querynode need to balance channel to streamingnode", zap.Int64s("rwQueryNodesLessThan260", rwQueryNodesLessThan260))
+	}
+	roNodes = append(roNodes, replica.GetRONodes()...)
+	return rwNodes, roNodes
+}
+
+// filterNodeLessThan260 filter the query nodes that version is less than 2.6.0
+func filterNodeLessThan260(nodes []int64, nodeManager *session.NodeManager) []int64 {
+	checker := semver.MustParseRange(">=2.6.0-dev")
+	filteredNodes := make([]int64, 0)
+	for _, nodeID := range nodes {
+		if session := nodeManager.Get(nodeID); session != nil && checker(session.Version()) {
+			continue
+		}
+		filteredNodes = append(filteredNodes, nodeID)
+	}
+	return filteredNodes
 }

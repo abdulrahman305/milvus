@@ -15,7 +15,8 @@
 #include "log/Log.h"
 #include "segcore/SegcoreConfig.h"
 #include "segcore/segcore_init_c.h"
-
+#include "cachinglayer/Manager.h"
+#include "cachinglayer/Utils.h"
 namespace milvus::segcore {
 
 std::once_flag close_glog_once;
@@ -34,7 +35,7 @@ SegcoreSetChunkRows(const int64_t value) {
 }
 
 extern "C" void
-SegcoreSetEnableTempSegmentIndex(const bool value) {
+SegcoreSetEnableInterminSegmentIndex(const bool value) {
     milvus::segcore::SegcoreConfig& config =
         milvus::segcore::SegcoreConfig::default_config();
     config.set_enable_interim_segment_index(value);
@@ -52,6 +53,57 @@ SegcoreSetNprobe(const int64_t value) {
     milvus::segcore::SegcoreConfig& config =
         milvus::segcore::SegcoreConfig::default_config();
     config.set_nprobe(value);
+}
+
+extern "C" CStatus
+SegcoreSetDenseVectorInterminIndexType(const char* value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    try {
+        config.set_dense_vector_intermin_index_type(std::string(value));
+        auto status = CStatus();
+        status.error_code = Success;
+        status.error_msg = "";
+        return status;
+    } catch (std::exception& e) {
+        return milvus::FailureCStatus(&e);
+    }
+}
+
+extern "C" CStatus
+SegcoreSetDenseVectorInterminIndexRefineQuantType(const char* value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    try {
+        config.set_refine_quant_type(std::string(value));
+        auto status = CStatus();
+        status.error_code = Success;
+        status.error_msg = "";
+        return status;
+    } catch (std::exception& e) {
+        return milvus::FailureCStatus(&e);
+    }
+}
+
+extern "C" void
+SegcoreSetDenseVectorInterminIndexRefineWithQuantFlag(const bool value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_refine_with_quant_flag(value);
+}
+
+extern "C" void
+SegcoreSetSubDim(const int64_t value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_sub_dim(value);
+}
+
+extern "C" void
+SegcoreSetRefineRatio(const float value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_refine_ratio(value);
 }
 
 extern "C" void
@@ -106,6 +158,11 @@ GetMinimalIndexVersion() {
     return milvus::config::GetMinimalIndexVersion();
 }
 
+extern "C" int32_t
+GetMaximumIndexVersion() {
+    return milvus::config::GetMaximumIndexVersion();
+}
+
 extern "C" void
 SetThreadName(const char* name) {
 #ifdef __linux__
@@ -113,6 +170,47 @@ SetThreadName(const char* name) {
 #elif __APPLE__
     pthread_setname_np(name);
 #endif
+}
+
+extern "C" void
+ConfigureTieredStorage(const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
+                       const CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+                       const CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
+                       const CacheWarmupPolicy vectorIndexCacheWarmupPolicy,
+                       const int64_t memory_low_watermark_bytes,
+                       const int64_t memory_high_watermark_bytes,
+                       const int64_t memory_max_bytes,
+                       const int64_t disk_low_watermark_bytes,
+                       const int64_t disk_high_watermark_bytes,
+                       const int64_t disk_max_bytes,
+                       const bool evictionEnabled,
+                       const int64_t cache_touch_window_ms,
+                       const int64_t eviction_interval_ms,
+                       const int64_t cache_cell_unaccessed_survival_time,
+                       const float overloaded_memory_threshold_percentage,
+                       const float loading_memory_factor,
+                       const float max_disk_usage_percentage,
+                       const char* disk_path) {
+    std::string disk_path_str(disk_path);
+    milvus::cachinglayer::Manager::ConfigureTieredStorage(
+        {scalarFieldCacheWarmupPolicy,
+         vectorFieldCacheWarmupPolicy,
+         scalarIndexCacheWarmupPolicy,
+         vectorIndexCacheWarmupPolicy},
+        {memory_low_watermark_bytes,
+         memory_high_watermark_bytes,
+         memory_max_bytes,
+         disk_low_watermark_bytes,
+         disk_high_watermark_bytes,
+         disk_max_bytes},
+        evictionEnabled,
+        {cache_touch_window_ms,
+         eviction_interval_ms,
+         cache_cell_unaccessed_survival_time,
+         overloaded_memory_threshold_percentage,
+         max_disk_usage_percentage,
+         disk_path_str,
+         loading_memory_factor});
 }
 
 }  // namespace milvus::segcore

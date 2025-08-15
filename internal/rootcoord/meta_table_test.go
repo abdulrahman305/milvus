@@ -32,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
@@ -708,19 +709,21 @@ func TestMetaTable_AlterCollection(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
+			mock.Anything,
 		).Return(errors.New("error"))
 		meta := &MetaTable{
 			catalog:     catalog,
 			collID2Meta: map[typeutil.UniqueID]*model.Collection{},
 		}
 		ctx := context.Background()
-		err := meta.AlterCollection(ctx, nil, nil, 0)
+		err := meta.AlterCollection(ctx, nil, nil, 0, false)
 		assert.Error(t, err)
 	})
 
 	t.Run("alter collection ok", func(t *testing.T) {
 		catalog := mocks.NewRootCoordCatalog(t)
 		catalog.On("AlterCollection",
+			mock.Anything,
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
@@ -735,7 +738,7 @@ func TestMetaTable_AlterCollection(t *testing.T) {
 
 		oldColl := &model.Collection{CollectionID: 1}
 		newColl := &model.Collection{CollectionID: 1}
-		err := meta.AlterCollection(ctx, oldColl, newColl, 0)
+		err := meta.AlterCollection(ctx, oldColl, newColl, 0, false)
 		assert.NoError(t, err)
 		assert.Equal(t, meta.collID2Meta[1], newColl)
 	})
@@ -1080,6 +1083,8 @@ func TestMetaTable_RemoveCollection(t *testing.T) {
 				100: {Name: "collection"},
 			},
 		}
+		channel.ResetStaticPChannelStatsManager()
+		channel.RecoverPChannelStatsManager([]string{})
 		meta.names.insert("", "collection", 100)
 		meta.names.insert("", "alias1", 100)
 		meta.names.insert("", "alias2", 100)
@@ -1191,6 +1196,7 @@ func TestMetaTable_reload(t *testing.T) {
 					nil)
 			},
 		)
+		channel.ResetStaticPChannelStatsManager()
 		err := meta.reload()
 		assert.NoError(t, err)
 		assert.NoError(t, err)
@@ -1224,6 +1230,7 @@ func TestMetaTable_reload(t *testing.T) {
 			nil)
 
 		meta := &MetaTable{catalog: catalog}
+		channel.ResetStaticPChannelStatsManager()
 		err := meta.reload()
 		assert.NoError(t, err)
 		assert.NoError(t, err)
@@ -1257,6 +1264,7 @@ func TestMetaTable_reload(t *testing.T) {
 			},
 		)
 
+		channel.ResetStaticPChannelStatsManager()
 		err := meta.reload()
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(meta.collID2Meta))
@@ -1354,6 +1362,7 @@ func TestMetaTable_ChangeCollectionState(t *testing.T) {
 			mock.Anything, // *model.Collection
 			mock.Anything, // metastore.AlterType
 			mock.AnythingOfType("uint64"),
+			mock.Anything,
 		).Return(errors.New("error mock AlterCollection"))
 		meta := &MetaTable{
 			catalog: catalog,
@@ -1373,6 +1382,7 @@ func TestMetaTable_ChangeCollectionState(t *testing.T) {
 			mock.Anything, // *model.Collection
 			mock.Anything, // metastore.AlterType
 			mock.AnythingOfType("uint64"),
+			mock.Anything,
 		).Return(nil)
 		meta := &MetaTable{
 			catalog:     catalog,
@@ -1393,6 +1403,7 @@ func TestMetaTable_ChangeCollectionState(t *testing.T) {
 			mock.Anything, // *model.Collection
 			mock.Anything, // metastore.AlterType
 			mock.AnythingOfType("uint64"),
+			mock.Anything,
 		).Return(nil)
 		meta := &MetaTable{
 			catalog: catalog,
@@ -1550,8 +1561,7 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 
 	t.Run("alter collection fail", func(t *testing.T) {
 		catalog := mocks.NewRootCoordCatalog(t)
-		catalog.On("AlterCollection",
-			mock.Anything,
+		catalog.On("AlterCollectionDB",
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
@@ -1645,8 +1655,7 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 
 	t.Run("alter collection ok", func(t *testing.T) {
 		catalog := mocks.NewRootCoordCatalog(t)
-		catalog.On("AlterCollection",
-			mock.Anything,
+		catalog.On("AlterCollectionDB",
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
@@ -1674,6 +1683,50 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 		}
 		meta.names.insert(util.DefaultDBName, "old", 1)
 		err := meta.RenameCollection(context.TODO(), util.DefaultDBName, "old", "", "new", 1000)
+		assert.NoError(t, err)
+
+		id, ok := meta.names.get(util.DefaultDBName, "new")
+		assert.True(t, ok)
+		assert.Equal(t, int64(1), id)
+
+		coll, ok := meta.collID2Meta[1]
+		assert.True(t, ok)
+		assert.Equal(t, "new", coll.Name)
+	})
+
+	t.Run("rename collection ok", func(t *testing.T) {
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("AlterCollection",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+		catalog.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil, merr.WrapErrCollectionNotFound("error"))
+		meta := &MetaTable{
+			dbName2Meta: map[string]*model.Database{
+				util.DefaultDBName: model.NewDefaultDatabase(nil),
+			},
+			catalog: catalog,
+			names:   newNameDb(),
+			aliases: newNameDb(),
+			collID2Meta: map[typeutil.UniqueID]*model.Collection{
+				1: {
+					CollectionID: 1,
+					DBID:         1,
+					Name:         "old",
+				},
+			},
+		}
+		meta.names.insert(util.DefaultDBName, "old", 1)
+		err := meta.RenameCollection(context.TODO(), util.DefaultDBName, "old", util.DefaultDBName, "new", 1000)
 		assert.NoError(t, err)
 
 		id, ok := meta.names.get(util.DefaultDBName, "new")

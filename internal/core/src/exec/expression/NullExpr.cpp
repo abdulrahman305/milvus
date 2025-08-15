@@ -76,7 +76,7 @@ PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
             break;
         }
         default:
-            PanicInfo(DataTypeInvalid,
+            ThrowInfo(DataTypeInvalid,
                       "unsupported data type: {}",
                       expr_->column_.data_type_);
     }
@@ -118,10 +118,6 @@ PhyNullExpr::PreCheckNullable(OffsetVector* input) {
                          : batch_size_;
         precheck_pos_ += batch_size;
     }
-    if (cached_precheck_res_ != nullptr &&
-        cached_precheck_res_->size() == batch_size) {
-        return cached_precheck_res_;
-    }
 
     auto res_vec = std::make_shared<ColumnVector>(TargetBitmap(batch_size),
                                                   TargetBitmap(batch_size));
@@ -138,12 +134,11 @@ PhyNullExpr::PreCheckNullable(OffsetVector* input) {
             break;
         }
         default:
-            PanicInfo(ExprInvalid,
+            ThrowInfo(ExprInvalid,
                       "unsupported null expr type {}",
                       proto::plan::NullExpr_NullOp_Name(expr_->op_));
     }
-    cached_precheck_res_ = res_vec;
-    return cached_precheck_res_;
+    return res_vec;
 }
 
 }  //namespace exec

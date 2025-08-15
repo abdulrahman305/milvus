@@ -7,6 +7,8 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/cockroachdb/errors"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
@@ -253,6 +255,12 @@ func combineBinaryArithExpr(op planpb.OpType, arithOp planpb.ArithOpType, arithE
 		}
 	}
 
+	if arithOp == planpb.ArithOpType_Div || arithOp == planpb.ArithOpType_Mod {
+		if (IsInteger(operand) && operand.GetInt64Val() == 0) || (IsFloating(operand) && operand.GetFloatVal() == 0) {
+			return nil, errors.New("division or modulus by zero")
+		}
+	}
+
 	return &planpb.Expr{
 		Expr: &planpb.Expr_BinaryArithOpEvalRangeExpr{
 			BinaryArithOpEvalRangeExpr: &planpb.BinaryArithOpEvalRangeExpr{
@@ -294,12 +302,12 @@ func handleBinaryArithExpr(op planpb.OpType, arithExpr *planpb.BinaryArithExpr, 
 
 	if leftExpr != nil && rightExpr != nil {
 		// a + b == 3
-		return nil, fmt.Errorf("not supported to do arithmetic operations between multiple fields")
+		return nil, errors.New("not supported to do arithmetic operations between multiple fields")
 	}
 
 	if leftValue != nil && rightValue != nil {
 		// 2 + 1 == 3
-		return nil, fmt.Errorf("unexpected, should be optimized already")
+		return nil, errors.New("unexpected, should be optimized already")
 	}
 
 	if leftExpr != nil && rightValue != nil {
@@ -320,11 +328,11 @@ func handleBinaryArithExpr(op planpb.OpType, arithExpr *planpb.BinaryArithExpr, 
 		case planpb.ArithOpType_Add, planpb.ArithOpType_Mul:
 			return combineBinaryArithExpr(op, arithOp, arithExprDataType, rightExpr.GetInfo(), leftValue, valueExpr)
 		default:
-			return nil, fmt.Errorf("module field is not yet supported")
+			return nil, errors.New("module field is not yet supported")
 		}
 	} else {
 		// (a + b) / 2 == 3
-		return nil, fmt.Errorf("complicated arithmetic operations are not supported")
+		return nil, errors.New("complicated arithmetic operations are not supported")
 	}
 }
 
@@ -348,7 +356,7 @@ func handleCompareRightValue(op planpb.OpType, left *ExprWithType, right *planpb
 
 	columnInfo := toColumnInfo(left)
 	if columnInfo == nil {
-		return nil, fmt.Errorf("not supported to combine multiple fields")
+		return nil, errors.New("not supported to combine multiple fields")
 	}
 	expr := &planpb.Expr{
 		Expr: &planpb.Expr_UnaryRangeExpr{
@@ -388,7 +396,12 @@ func handleCompare(op planpb.OpType, left *ExprWithType, right *ExprWithType) (*
 	}
 
 	if leftColumnInfo == nil || rightColumnInfo == nil {
-		return nil, fmt.Errorf("only comparison between two fields is supported")
+		return nil, errors.New("only comparison between two fields is supported")
+	}
+
+	// Check if both left and right are non-JSON types
+	if typeutil.IsJSONType(leftColumnInfo.GetDataType()) || typeutil.IsJSONType(rightColumnInfo.GetDataType()) {
+		return nil, errors.New("two column comparison with JSON type is not supported")
 	}
 
 	expr := &planpb.Expr{
@@ -558,8 +571,9 @@ func convertEscapeSingle(literal string) (string, error) {
 
 func canArithmeticDataType(left, right schemapb.DataType) bool {
 	switch left {
-	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32, schemapb.DataType_Int64,
-		schemapb.DataType_Float, schemapb.DataType_Double:
+	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32, schemapb.DataType_Int64:
+		return typeutil.IsIntegerType(right) || typeutil.IsJSONType(right)
+	case schemapb.DataType_Float, schemapb.DataType_Double:
 		return typeutil.IsArithmetic(right) || typeutil.IsJSONType(right)
 	case schemapb.DataType_JSON:
 		return typeutil.IsArithmetic(right)
@@ -581,17 +595,20 @@ func canArithmeticDataType(left, right schemapb.DataType) bool {
 //	return canArithmeticDataType(left.dataType, getArrayElementType(right))
 //}
 
-func canArithmetic(left, leftElement, right, rightElement schemapb.DataType) bool {
-	if !typeutil.IsArrayType(left) && !typeutil.IsArrayType(right) {
-		return canArithmeticDataType(left, right)
-	}
-	if typeutil.IsArrayType(left) && typeutil.IsArrayType(right) {
-		return canArithmeticDataType(leftElement, rightElement)
-	}
+func canArithmetic(left, leftElement, right, rightElement schemapb.DataType, reverse bool) error {
 	if typeutil.IsArrayType(left) {
-		return canArithmeticDataType(leftElement, right)
+		left = leftElement
 	}
-	return canArithmeticDataType(left, rightElement)
+	if typeutil.IsArrayType(right) {
+		right = rightElement
+	}
+	if reverse {
+		left, right = right, left
+	}
+	if !canArithmeticDataType(left, right) {
+		return fmt.Errorf("cannot perform arithmetic between %s field and %s", left.String(), right.String())
+	}
+	return nil
 }
 
 func canConvertToIntegerType(dataType, elementType schemapb.DataType) bool {
@@ -629,7 +646,7 @@ func checkValidModArith(tokenType planpb.ArithOpType, leftType, leftElementType,
 	switch tokenType {
 	case planpb.ArithOpType_Mod:
 		if !canConvertToIntegerType(leftType, leftElementType) || !canConvertToIntegerType(rightType, rightElementType) {
-			return fmt.Errorf("modulo can only apply on integer types")
+			return errors.New("modulo can only apply on integer types")
 		}
 	default:
 	}
@@ -640,17 +657,17 @@ func castRangeValue(dataType schemapb.DataType, value *planpb.GenericValue) (*pl
 	switch dataType {
 	case schemapb.DataType_String, schemapb.DataType_VarChar:
 		if !IsString(value) {
-			return nil, fmt.Errorf("invalid range operations")
+			return nil, errors.New("invalid range operations")
 		}
 	case schemapb.DataType_Bool:
-		return nil, fmt.Errorf("invalid range operations on boolean expr")
+		return nil, errors.New("invalid range operations on boolean expr")
 	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32, schemapb.DataType_Int64:
 		if !IsInteger(value) {
-			return nil, fmt.Errorf("invalid range operations")
+			return nil, errors.New("invalid range operations")
 		}
 	case schemapb.DataType_Float, schemapb.DataType_Double:
 		if !IsNumber(value) {
-			return nil, fmt.Errorf("invalid range operations")
+			return nil, errors.New("invalid range operations")
 		}
 		if IsInteger(value) {
 			return NewFloat(float64(value.GetInt64Val())), nil

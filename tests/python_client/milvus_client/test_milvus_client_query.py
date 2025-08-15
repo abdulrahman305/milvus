@@ -1,5 +1,4 @@
 import pytest
-
 from base.client_v2_base import TestMilvusClientV2Base
 from utils.util_log import test_log as log
 from common import common_func as cf
@@ -57,7 +56,7 @@ class TestMilvusClientQueryInvalid(TestMilvusClientV2Base):
         expected: search/query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         collections = self.list_collections(client)[0]
@@ -103,7 +102,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: search/query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -116,13 +115,13 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows,
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name})
+                                "pk_name": default_primary_key_field_name})
         # 4. query using filter
         self.query(client, collection_name, filter=default_search_exp,
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows,
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name})
+                                "pk_name": default_primary_key_field_name})
         self.drop_collection(client, collection_name)
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -133,7 +132,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: search/query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -146,7 +145,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows,
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name})
+                                "pk_name": default_primary_key_field_name})
         # 4. query using filter
         res = self.query(client, collection_name, filter=default_search_exp,
                          output_fields=[default_primary_key_field_name, default_float_field_name,
@@ -154,9 +153,52 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                          check_task=CheckTasks.check_query_results,
                          check_items={exp_res: rows,
                                       "with_vec": True,
-                                      "primary_field": default_primary_key_field_name})[0]
+                                      "pk_name": default_primary_key_field_name})[0]
         assert set(res[0].keys()) == {default_primary_key_field_name, default_vector_field_name,
                                       default_float_field_name, default_string_field_name}
+        self.drop_collection(client, collection_name)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_milvus_client_query_output_fields_dynamic_name(self):
+        """
+        target: test query (high level api) normal case
+        method: create connection, collection, insert, add field name(same as dynamic name) and query
+        expected: query successfully
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        dim = 8
+        # 1. create collection
+        schema = self.create_schema(client, enable_dynamic_field=True)[0]
+        schema.add_field(default_primary_key_field_name, DataType.INT64, max_length=64, is_primary=True, auto_id=False)
+        schema.add_field(default_vector_field_name, DataType.FLOAT_VECTOR, dim=dim)
+        schema.add_field(default_float_field_name, DataType.FLOAT, nullable=True)
+        index_params = self.prepare_index_params(client)[0]
+        index_params.add_index(default_vector_field_name, metric_type="COSINE")
+        self.create_collection(client, collection_name, dimension=dim, schema=schema, index_params=index_params)
+        # 2. insert
+        rng = np.random.default_rng(seed=19530)
+        rows = [{default_primary_key_field_name: i, default_vector_field_name: list(rng.random((1, dim))[0]),
+                 default_float_field_name: i * 1.0, default_string_field_name: str(i)} for i in range(default_nb)]
+        self.insert(client, collection_name, rows)
+        self.add_collection_field(client, collection_name, field_name=default_string_field_name,
+                                  data_type=DataType.VARCHAR, nullable=True, default_value="default", max_length=64)
+        for row in rows:
+            row[default_string_field_name] = "default"
+        # 3. query using ids
+        self.query(client, collection_name, ids=[i for i in range(default_nb)],
+                   check_task=CheckTasks.check_query_results,
+                   check_items={exp_res: rows,
+                                "with_vec": True,
+                                "pk_name": default_primary_key_field_name})
+        # 4. query using filter
+        res = self.query(client, collection_name, filter=default_search_exp,
+                         output_fields=[f'$meta["{default_string_field_name}"]'],
+                         check_task=CheckTasks.check_query_results,
+                         check_items={exp_res: [{"id": item["id"]} for item in rows],
+                                      "with_vec": True,
+                                      "pk_name": default_primary_key_field_name})[0]
+        assert set(res[0].keys()) == {default_primary_key_field_name}
         self.drop_collection(client, collection_name)
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -167,7 +209,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: search/query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -180,14 +222,14 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows,
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name})
+                                "pk_name": default_primary_key_field_name})
         # 4. query using filter
         res = self.query(client, collection_name, filter=default_search_exp,
                          output_fields=["*"],
                          check_task=CheckTasks.check_query_results,
                          check_items={exp_res: rows,
                                       "with_vec": True,
-                                      "primary_field": default_primary_key_field_name})[0]
+                                      "pk_name": default_primary_key_field_name})[0]
         assert set(res[0].keys()) == {default_primary_key_field_name, default_vector_field_name,
                                       default_float_field_name, default_string_field_name}
         self.drop_collection(client, collection_name)
@@ -200,7 +242,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: search/query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -215,14 +257,14 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows[:limit],
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name[:limit]})
+                                "pk_name": default_primary_key_field_name[:limit]})
         # 4. query using filter
         self.query(client, collection_name, filter=default_search_exp,
                    limit=limit,
                    check_task=CheckTasks.check_query_results,
                    check_items={exp_res: rows[:limit],
                                 "with_vec": True,
-                                "primary_field": default_primary_key_field_name[:limit]})
+                                "pk_name": default_primary_key_field_name[:limit]})
         self.drop_collection(client, collection_name)
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -234,7 +276,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -269,7 +311,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         expected: query successfully
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -290,6 +332,133 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
                  ct.err_msg: "the sample factor should be between 0 and 1 and not too close to 0 or 1"}
         self.query(client, collection_name, filter=expr,
                    check_task=CheckTasks.err_res, check_items=error)
+    
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_client_query_json_modulo_operator(self):
+        """
+        target: test query with modulo operator on JSON field values
+        method: create collection with JSON field, insert data with numeric values, test modulo filters
+        expected: modulo operations should work correctly and return all matching results
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        # 1. create collection with JSON field
+        schema, _ = self.create_schema(client, enable_dynamic_field=False)
+        schema.add_field(default_primary_key_field_name, DataType.INT64, is_primary=True, auto_id=False)
+        schema.add_field(default_vector_field_name, DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field("json_field", DataType.JSON, nullable=True)
+        index_params, _ = self.prepare_index_params(client)
+        index_params.add_index(default_vector_field_name, metric_type="COSINE")
+        self.create_collection(client, collection_name, schema=schema, index_params=index_params, consistency_level="Strong")
+        
+        # 2. insert 3000 rows with various numeric values
+        nb = 3000
+        rng = np.random.default_rng(seed=19530)
+        
+        # Store original data for verification
+        rows = []
+        all_numbers = []
+        all_nested_numbers = []
+        
+        for i in range(nb):
+            # Generate diverse numeric values
+            if i % 5 == 0:
+                # Some large numbers
+                numeric_value = random.randint(100000, 999999)
+            elif i % 3 == 0:
+                # Some medium numbers
+                numeric_value = random.randint(1000, 9999)
+            else:
+                # Regular sequential numbers
+                numeric_value = i
+            
+            nested_value = i * 7 + (i % 13)  # Different pattern for nested
+            
+            all_numbers.append(numeric_value)
+            all_nested_numbers.append(nested_value)
+            
+            rows.append({
+                default_primary_key_field_name: i,
+                default_vector_field_name: list(rng.random((1, default_dim))[0]),
+                "json_field": {
+                    "number": numeric_value,
+                    "index": i,
+                    "data": {"nested_number": nested_value}
+                }
+            })
+        
+        self.insert(client, collection_name, rows)
+        
+        # 3. Test modulo operations with different modulo values and remainders
+        test_cases = [
+            (10, list(range(10))),  # mod 10 - all remainders 0-9
+            (2, [0, 1]),  # mod 2 - even/odd
+            (3, [0, 1, 2]),  # mod 3
+            (7, list(range(7))),  # mod 7 - all remainders 0-6
+            (13, [0, 5, 12]),  # mod 13 - selected remainders
+        ]
+        
+        for modulo, remainders in test_cases:
+            log.info(f"\nTesting modulo {modulo}")
+            
+            for remainder in remainders:
+                # Calculate expected results from original data
+                expected_ids = [i for i, num in enumerate(all_numbers) if num % modulo == remainder]
+                expected_count = len(expected_ids)
+                
+                # Query and get results
+                filter_expr = f'json_field["number"] % {modulo} == {remainder}'
+                res, _ = self.query(client, collection_name, filter=filter_expr, 
+                                    output_fields=["json_field", default_primary_key_field_name])
+                
+                # Extract actual IDs from results
+                actual_ids = sorted([item[default_primary_key_field_name] for item in res])
+                expected_ids_sorted = sorted(expected_ids)
+                
+                log.info(f"Modulo {modulo} remainder {remainder}: expected {expected_count}, got {len(res)} results")
+                
+                # Verify we got exactly the expected results
+                assert len(res) == expected_count, \
+                    f"Expected {expected_count} results for % {modulo} == {remainder}, got {len(res)}"
+                assert actual_ids == expected_ids_sorted, \
+                    f"Result IDs don't match expected IDs for % {modulo} == {remainder}"
+                
+                # Also verify each result is correct
+                for item in res:
+                    actual_remainder = item["json_field"]["number"] % modulo
+                    assert actual_remainder == remainder, \
+                        f"Number {item['json_field']['number']} % {modulo} = {actual_remainder}, expected {remainder}"
+                
+                # Test nested field
+                expected_nested_ids = [i for i, num in enumerate(all_nested_numbers) if num % modulo == remainder]
+                nested_filter = f'json_field["data"]["nested_number"] % {modulo} == {remainder}'
+                nested_res, _ = self.query(client, collection_name, filter=nested_filter,
+                                          output_fields=["json_field", default_primary_key_field_name])
+                
+                actual_nested_ids = sorted([item[default_primary_key_field_name] for item in nested_res])
+                expected_nested_ids_sorted = sorted(expected_nested_ids)
+                
+                assert len(nested_res) == len(expected_nested_ids), \
+                    f"Expected {len(expected_nested_ids)} nested results for % {modulo} == {remainder}, got {len(nested_res)}"
+                assert actual_nested_ids == expected_nested_ids_sorted, \
+                    f"Nested result IDs don't match expected IDs for % {modulo} == {remainder}"
+        
+        
+        # Test combining modulo with other conditions
+        combined_expr = 'json_field["number"] % 2 == 0 && json_field["index"] < 100'
+        expected_combined = [i for i in range(min(100, nb)) if all_numbers[i] % 2 == 0]
+        res_combined, _ = self.query(client, collection_name, filter=combined_expr,
+                                    output_fields=["json_field", default_primary_key_field_name])
+        actual_combined_ids = sorted([item[default_primary_key_field_name] for item in res_combined])
+        
+        assert len(res_combined) == len(expected_combined), \
+            f"Expected {len(expected_combined)} results for combined filter, got {len(res_combined)}"
+        assert actual_combined_ids == sorted(expected_combined), \
+            "Results for combined filter don't match expected"
+        
+        log.info(f"All modulo tests passed! Combined filter returned {len(res_combined)} results")
+        
+        self.drop_collection(client, collection_name)
 
 
 class TestMilvusClientGetInvalid(TestMilvusClientV2Base):
@@ -312,7 +481,7 @@ class TestMilvusClientGetInvalid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -336,7 +505,7 @@ class TestMilvusClientGetInvalid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -362,7 +531,7 @@ class TestMilvusClientGetInvalid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -403,7 +572,7 @@ class TestMilvusClientGetValid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -428,7 +597,7 @@ class TestMilvusClientGetValid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
         # 2. insert
@@ -458,7 +627,7 @@ class TestMilvusClientGetValid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, id_type="string", max_length=ct.default_length)
         # 2. insert
@@ -485,7 +654,7 @@ class TestMilvusClientGetValid(TestMilvusClientV2Base):
         expected: search/query successfully without deleted data
         """
         client = self._client()
-        collection_name = cf.gen_unique_str(prefix)
+        collection_name = cf.gen_collection_name_by_testcase_name()
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, id_type="string", max_length=ct.default_length)
         # 2. insert
@@ -505,3 +674,151 @@ class TestMilvusClientGetValid(TestMilvusClientV2Base):
         assert first_pk_data == first_pk_data_1
         assert len(first_pk_data_1[0]) == len(output_fields_array)
         self.drop_collection(client, collection_name)
+
+
+class TestMilvusClientQueryJsonPathIndex(TestMilvusClientV2Base):
+    """ Test case of search interface """
+
+    @pytest.fixture(scope="function", params=["INVERTED"])
+    def supported_varchar_scalar_index(self, request):
+        yield request.param
+
+    # @pytest.fixture(scope="function", params=["DOUBLE", "VARCHAR", "json"", "bool"])
+    @pytest.fixture(scope="function", params=["DOUBLE"])
+    def supported_json_cast_type(self, request):
+        yield request.param
+
+    """
+    ******************************************************************
+    #  The following are valid base cases
+    ******************************************************************
+    """
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("enable_dynamic_field", [True, False])
+    @pytest.mark.parametrize("is_flush", [True, False])
+    @pytest.mark.parametrize("is_release", [True, False])
+    @pytest.mark.parametrize("single_data_num", [50])
+    def test_milvus_client_search_json_path_index_all_expressions(self, enable_dynamic_field, supported_json_cast_type,
+                                                                  supported_varchar_scalar_index, is_flush, is_release,
+                                                                  single_data_num):
+        """
+        target: test query after json path index with all supported basic expressions
+        method: Query after json path index with all supported basic expressions
+        step: 1. create collection
+              2. insert with different data distribution
+              3. flush if specified
+              4. query when there is no json path index under all expressions
+              5. release if specified
+              6. prepare index params with json path index
+              7. create json path index
+              8. create same json index twice
+              9. reload collection if released before to make sure the new index load successfully
+              10. sleep for 60s to make sure the new index load successfully without release and reload operations
+              11. query after there is json path index under all expressions which should get the same result
+                  with that without json path index
+        expected: query successfully after there is json path index under all expressions which should get the same result
+                  with that without json path index
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        # 1. create collection
+        json_field_name = "json_field"
+        schema = self.create_schema(client, enable_dynamic_field=enable_dynamic_field)[0]
+        schema.add_field(default_primary_key_field_name, DataType.INT64, is_primary=True, auto_id=False)
+        schema.add_field(default_vector_field_name, DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field(default_string_field_name, DataType.VARCHAR, max_length=64)
+        if not enable_dynamic_field:
+            schema.add_field(json_field_name, DataType.JSON, nullable=True)
+        index_params = self.prepare_index_params(client)[0]
+        index_params.add_index(default_vector_field_name, metric_type="COSINE")
+        self.create_collection(client, collection_name, schema=schema, index_params=index_params)
+        # 2. insert with different data distribution
+        vectors = cf.gen_vectors(default_nb+60, default_dim)
+        inserted_data_distribution = ct.get_all_kind_data_distribution
+        nb_single = single_data_num
+        for i in range(len(inserted_data_distribution)):
+            rows = [{default_primary_key_field_name: j, default_vector_field_name: vectors[j],
+                     default_string_field_name: f"{j}", json_field_name: inserted_data_distribution[i]} for j in
+                    range(i * nb_single, (i + 1) * nb_single)]
+            assert len(rows) == nb_single
+            self.insert(client, collection_name=collection_name, data=rows)
+            log.info(f"inserted {nb_single} {inserted_data_distribution[i]}")
+        # 3. flush if specified
+        if is_flush:
+            self.flush(client, collection_name)
+        # 4. query when there is no json path index under all expressions
+        # skip negative expression for issue 40685
+        # "my_json['a'] != 1", "my_json['a'] != 1.0", "my_json['a'] != '1'", "my_json['a'] != 1.1", "my_json['a'] not in [1]"
+        express_list = cf.gen_json_field_expressions_all_single_operator()
+        compare_dict = {}
+        for i in range(len(express_list)):
+            json_list = []
+            id_list = []
+            log.info(f"query with filter {express_list[i]} before json path index is:")
+            res = self.query(client, collection_name=collection_name, filter=express_list[i], output_fields=["count(*)"])[0]
+            count = res[0]['count(*)']
+            log.info(f"The count(*) after query with filter {express_list[i]} before json path index is: {count}")
+            res = self.query(client, collection_name=collection_name, filter=express_list[i], output_fields=[f"{json_field_name}"])[0]
+            for single in res:
+                id_list.append(single[f"{default_primary_key_field_name}"])
+                json_list.append(single[f"{json_field_name}"])
+            assert count == len(id_list)
+            assert count == len(json_list)
+            compare_dict.setdefault(f'{i}', {})
+            compare_dict[f'{i}']["id_list"] = id_list
+            compare_dict[f'{i}']["json_list"] = json_list
+        # 5. release if specified
+        if is_release:
+            self.release_collection(client, collection_name)
+            self.drop_index(client, collection_name, default_vector_field_name)
+        # 6. prepare index params with json path index
+        index_name = "json_index"
+        index_params = self.prepare_index_params(client)[0]
+        json_path_list = [f"{json_field_name}", f"{json_field_name}[0]", f"{json_field_name}[1]",
+                          f"{json_field_name}[6]", f"{json_field_name}['a']", f"{json_field_name}['a']['b']",
+                          f"{json_field_name}['a'][0]", f"{json_field_name}['a'][6]", f"{json_field_name}['a'][0]['b']",
+                          f"{json_field_name}['a']['b']['c']", f"{json_field_name}['a']['b'][0]['d']",
+                          f"{json_field_name}[10000]", f"{json_field_name}['a']['c'][0]['d']"]
+        index_params.add_index(field_name=default_vector_field_name, index_type="AUTOINDEX", metric_type="COSINE")
+        for i in range(len(json_path_list)):
+            index_params.add_index(field_name=json_field_name, index_name=index_name + f'{i}',
+                                   index_type=supported_varchar_scalar_index,
+                                   params={"json_cast_type": supported_json_cast_type,
+                                           "json_path": json_path_list[i]})
+        # 7. create json path index
+        self.create_index(client, collection_name, index_params)
+        # 8. create same json index twice
+        self.create_index(client, collection_name, index_params)
+        # 9. reload collection if released before to make sure the new index load successfully
+        if is_release:
+            self.load_collection(client, collection_name)
+        else:
+            # 10. sleep for 60s to make sure the new index load successfully without release and reload operations
+            time.sleep(60)
+        # 11. query after there is json path index under all expressions which should get the same result
+        # with that without json path index
+        for i in range(len(express_list)):
+            json_list = []
+            id_list = []
+            log.info(f"query with filter {express_list[i]} after json path index is:")
+            count = self.query(client, collection_name=collection_name, filter=express_list[i],
+                               output_fields=["count(*)"])[0]
+            log.info(f"The count(*) after query with filter {express_list[i]} after json path index is: {count}")
+            res = self.query(client, collection_name=collection_name, filter=express_list[i],
+                             output_fields=[f"{json_field_name}"])[0]
+            for single in res:
+                id_list.append(single[f"{default_primary_key_field_name}"])
+                json_list.append(single[f"{json_field_name}"])
+            if len(json_list) != len(compare_dict[f'{i}']["json_list"]):
+                log.debug(f"json field after json path index under expression {express_list[i]} is:")
+                log.debug(json_list)
+                log.debug(f"json field before json path index to be compared under expression {express_list[i]} is:")
+                log.debug(compare_dict[f'{i}']["json_list"])
+            assert json_list == compare_dict[f'{i}']["json_list"]
+            if len(id_list) != len(compare_dict[f'{i}']["id_list"]):
+                log.debug(f"primary key field after json path index under expression {express_list[i]} is:")
+                log.debug(id_list)
+                log.debug(f"primary key field before json path index to be compared under expression {express_list[i]} is:")
+                log.debug(compare_dict[f'{i}']["id_list"])
+            assert id_list == compare_dict[f'{i}']["id_list"]
+            log.info(f"PASS with expression {express_list[i]}")

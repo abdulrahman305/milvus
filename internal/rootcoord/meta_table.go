@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -66,6 +67,9 @@ type IMetaTable interface {
 	GetCollectionByIDWithMaxTs(ctx context.Context, collectionID UniqueID) (*model.Collection, error)
 	ListCollections(ctx context.Context, dbName string, ts Timestamp, onlyAvail bool) ([]*model.Collection, error)
 	ListAllAvailCollections(ctx context.Context) map[int64][]int64
+	// ListAllAvailPartitions returns the partition ids of all available collections.
+	// The key of the map is the database id, and the value is a map of collection id to partition ids.
+	ListAllAvailPartitions(ctx context.Context) map[int64]map[int64][]int64
 	ListCollectionPhysicalChannels(ctx context.Context) map[typeutil.UniqueID][]string
 	GetCollectionVirtualChannels(ctx context.Context, colID int64) []string
 	GetPChannelInfo(ctx context.Context, pchannel string) *rootcoordpb.GetPChannelInfoResponse
@@ -77,7 +81,7 @@ type IMetaTable interface {
 	AlterAlias(ctx context.Context, dbName string, alias string, collectionName string, ts Timestamp) error
 	DescribeAlias(ctx context.Context, dbName string, alias string, ts Timestamp) (string, error)
 	ListAliases(ctx context.Context, dbName string, collectionName string, ts Timestamp) ([]string, error)
-	AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp) error
+	AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp, fieldModify bool) error
 	RenameCollection(ctx context.Context, dbName string, oldName string, newDBName string, newName string, ts Timestamp) error
 	GetGeneralCount(ctx context.Context) int
 
@@ -232,6 +236,16 @@ func (mt *MetaTable) reload() error {
 			mt.aliases.insert(dbName, alias.Name, alias.CollectionID)
 		}
 	}
+
+	log.Ctx(mt.ctx).Info("rootcoord start to recover the channel stats for streaming coord balancer")
+	vchannels := make([]string, 0, len(mt.collID2Meta)*2)
+	for _, coll := range mt.collID2Meta {
+		if coll.Available() {
+			vchannels = append(vchannels, coll.VirtualChannelNames...)
+		}
+	}
+	channel.RecoverPChannelStatsManager(vchannels)
+
 	log.Ctx(mt.ctx).Info("RootCoord meta table reload done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
@@ -322,7 +336,7 @@ func (mt *MetaTable) AlterDatabase(ctx context.Context, oldDB *model.Database, n
 	defer mt.ddLock.Unlock()
 
 	if oldDB.Name != newDB.Name || oldDB.ID != newDB.ID || oldDB.State != newDB.State {
-		return fmt.Errorf("alter database name/id is not supported!")
+		return errors.New("alter database name/id is not supported!")
 	}
 
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
@@ -339,7 +353,7 @@ func (mt *MetaTable) DropDatabase(ctx context.Context, dbName string, ts typeuti
 	defer mt.ddLock.Unlock()
 
 	if dbName == util.DefaultDBName {
-		return fmt.Errorf("can not drop default database")
+		return errors.New("can not drop default database")
 	}
 
 	db, err := mt.getDatabaseByNameInternal(ctx, dbName, typeutil.MaxTimestamp)
@@ -436,6 +450,7 @@ func (mt *MetaTable) AddCollection(ctx context.Context, coll *model.Collection) 
 	mt.collID2Meta[coll.CollectionID] = coll.Clone()
 	mt.names.insert(db.Name, coll.Name, coll.CollectionID)
 
+	channel.StaticPChannelStatsManager.MustGet().AddVChannel(coll.VirtualChannelNames...)
 	log.Ctx(ctx).Info("add collection to meta table",
 		zap.Int64("dbID", coll.DBID),
 		zap.String("collection", coll.Name),
@@ -456,7 +471,7 @@ func (mt *MetaTable) ChangeCollectionState(ctx context.Context, collectionID Uni
 	clone := coll.Clone()
 	clone.State = state
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
-	if err := mt.catalog.AlterCollection(ctx1, coll, clone, metastore.MODIFY, ts); err != nil {
+	if err := mt.catalog.AlterCollection(ctx1, coll, clone, metastore.MODIFY, ts, false); err != nil {
 		return err
 	}
 	mt.collID2Meta[collectionID] = clone
@@ -475,6 +490,7 @@ func (mt *MetaTable) ChangeCollectionState(ctx context.Context, collectionID Uni
 		metrics.RootCoordNumOfPartitions.WithLabelValues().Add(float64(pn))
 	case pb.CollectionState_CollectionDropping:
 		mt.generalCnt -= pn * int(coll.ShardsNum)
+		channel.StaticPChannelStatsManager.MustGet().RemoveVChannel(coll.VirtualChannelNames...)
 		metrics.RootCoordNumOfCollections.WithLabelValues(db.Name).Dec()
 		metrics.RootCoordNumOfPartitions.WithLabelValues().Sub(float64(pn))
 	}
@@ -527,11 +543,12 @@ func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
 	aliases := mt.listAliasesByID(collectionID)
 	newColl := &model.Collection{
-		CollectionID: collectionID,
-		Partitions:   model.ClonePartitions(coll.Partitions),
-		Fields:       model.CloneFields(coll.Fields),
-		Aliases:      aliases,
-		DBID:         coll.DBID,
+		CollectionID:      collectionID,
+		Partitions:        model.ClonePartitions(coll.Partitions),
+		Fields:            model.CloneFields(coll.Fields),
+		StructArrayFields: model.CloneStructArrayFields(coll.StructArrayFields),
+		Aliases:           aliases,
+		DBID:              coll.DBID,
 	}
 	if err := mt.catalog.DropCollection(ctx1, newColl, ts); err != nil {
 		return err
@@ -550,7 +567,6 @@ func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID
 		zap.Int64("id", collectionID),
 		zap.Strings("aliases", aliases),
 	)
-
 	return nil
 }
 
@@ -740,6 +756,31 @@ func (mt *MetaTable) ListAllAvailCollections(ctx context.Context) map[int64][]in
 	return ret
 }
 
+func (mt *MetaTable) ListAllAvailPartitions(ctx context.Context) map[int64]map[int64][]int64 {
+	mt.ddLock.RLock()
+	defer mt.ddLock.RUnlock()
+
+	ret := make(map[int64]map[int64][]int64, len(mt.dbName2Meta))
+	for _, dbMeta := range mt.dbName2Meta {
+		// Database may not have available collections.
+		ret[dbMeta.ID] = make(map[int64][]int64, 64)
+	}
+	for _, collMeta := range mt.collID2Meta {
+		if !collMeta.Available() {
+			continue
+		}
+		dbID := collMeta.DBID
+		if dbID == util.NonDBID {
+			dbID = util.DefaultDBID
+		}
+		if _, ok := ret[dbID]; !ok {
+			ret[dbID] = make(map[int64][]int64, 64)
+		}
+		ret[dbID][collMeta.CollectionID] = lo.Map(collMeta.Partitions, func(part *model.Partition, _ int) int64 { return part.PartitionID })
+	}
+	return ret
+}
+
 func (mt *MetaTable) ListCollections(ctx context.Context, dbName string, ts Timestamp, onlyAvail bool) ([]*model.Collection, error) {
 	mt.ddLock.RLock()
 	defer mt.ddLock.RUnlock()
@@ -809,12 +850,12 @@ func (mt *MetaTable) ListCollectionPhysicalChannels(ctx context.Context) map[typ
 	return chanMap
 }
 
-func (mt *MetaTable) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp) error {
+func (mt *MetaTable) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp, fieldModify bool) error {
 	mt.ddLock.Lock()
 	defer mt.ddLock.Unlock()
 
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
-	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, ts); err != nil {
+	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, ts, fieldModify); err != nil {
 		return err
 	}
 	mt.collID2Meta[oldColl.CollectionID] = newColl
@@ -885,14 +926,23 @@ func (mt *MetaTable) RenameCollection(ctx context.Context, dbName string, oldNam
 	// unsupported rename collection while the collection has aliases
 	aliases := mt.listAliasesByID(oldColl.CollectionID)
 	if len(aliases) > 0 && oldColl.DBID != targetDB.ID {
-		return fmt.Errorf("fail to rename db name, must drop all aliases of this collection before rename")
+		return errors.New("fail to rename db name, must drop all aliases of this collection before rename")
 	}
 
 	newColl := oldColl.Clone()
 	newColl.Name = newName
+	newColl.DBName = dbName
 	newColl.DBID = targetDB.ID
-	if err := mt.catalog.AlterCollection(ctx, oldColl, newColl, metastore.MODIFY, ts); err != nil {
-		return err
+	if oldColl.DBID == newColl.DBID {
+		if err := mt.catalog.AlterCollection(ctx, oldColl, newColl, metastore.MODIFY, ts, false); err != nil {
+			log.Warn("alter collection by catalog failed", zap.Error(err))
+			return err
+		}
+	} else {
+		if err := mt.catalog.AlterCollectionDB(ctx, oldColl, newColl, ts); err != nil {
+			log.Warn("alter collectionDB by catalog failed", zap.Error(err))
+			return err
+		}
 	}
 
 	mt.names.insert(newDBName, newName, oldColl.CollectionID)
@@ -925,9 +975,10 @@ func (mt *MetaTable) GetPChannelInfo(ctx context.Context, pchannel string) *root
 		Collections: make([]*rootcoordpb.CollectionInfoOnPChannel, 0),
 	}
 	for _, collInfo := range mt.collID2Meta {
-		if collInfo.State != pb.CollectionState_CollectionCreated {
-			// streamingnode, skip non-created collections when recovering
+		if collInfo.State != pb.CollectionState_CollectionCreated && collInfo.State != pb.CollectionState_CollectionDropping {
 			// streamingnode will receive the createCollectionMessage to recover if the collection is creating.
+			// streamingnode use it to recover the collection state at first time streaming arch enabled.
+			// streamingnode will get the dropping collection and drop it before streaming arch enabled.
 			continue
 		}
 		if idx := lo.IndexOf(collInfo.PhysicalChannelNames, pchannel); idx >= 0 {
@@ -941,6 +992,7 @@ func (mt *MetaTable) GetPChannelInfo(ctx context.Context, pchannel string) *root
 				CollectionId: collInfo.CollectionID,
 				Partitions:   partitions,
 				Vchannel:     collInfo.VirtualChannelNames[idx],
+				State:        collInfo.State,
 			})
 		}
 	}
@@ -1053,7 +1105,7 @@ func (mt *MetaTable) CreateAlias(ctx context.Context, dbName string, alias strin
 	if collID, ok := mt.names.get(dbName, alias); ok {
 		coll, ok := mt.collID2Meta[collID]
 		if !ok {
-			return fmt.Errorf("meta error, name mapped non-exist collection id")
+			return errors.New("meta error, name mapped non-exist collection id")
 		}
 		// allow alias with dropping&dropped
 		if coll.State != pb.CollectionState_CollectionDropping && coll.State != pb.CollectionState_CollectionDropped {
@@ -1308,7 +1360,7 @@ func (mt *MetaTable) GetGeneralCount(ctx context.Context) int {
 // AddCredential add credential
 func (mt *MetaTable) AddCredential(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 	if credInfo.Username == "" {
-		return fmt.Errorf("username is empty")
+		return errors.New("username is empty")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1337,7 +1389,7 @@ func (mt *MetaTable) AddCredential(ctx context.Context, credInfo *internalpb.Cre
 // AlterCredential update credential
 func (mt *MetaTable) AlterCredential(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 	if credInfo.Username == "" {
-		return fmt.Errorf("username is empty")
+		return errors.New("username is empty")
 	}
 
 	mt.permissionLock.Lock()
@@ -1382,7 +1434,7 @@ func (mt *MetaTable) ListCredentialUsernames(ctx context.Context) (*milvuspb.Lis
 // CreateRole create role
 func (mt *MetaTable) CreateRole(ctx context.Context, tenant string, entity *milvuspb.RoleEntity) error {
 	if funcutil.IsEmptyString(entity.Name) {
-		return fmt.Errorf("the role name in the role info is empty")
+		return errors.New("the role name in the role info is empty")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1418,10 +1470,10 @@ func (mt *MetaTable) DropRole(ctx context.Context, tenant string, roleName strin
 // OperateUserRole operate the relationship between a user and a role, including adding a user to a role and removing a user from a role
 func (mt *MetaTable) OperateUserRole(ctx context.Context, tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error {
 	if funcutil.IsEmptyString(userEntity.Name) {
-		return fmt.Errorf("username in the user entity is empty")
+		return errors.New("username in the user entity is empty")
 	}
 	if funcutil.IsEmptyString(roleEntity.Name) {
-		return fmt.Errorf("role name in the role entity is empty")
+		return errors.New("role name in the role entity is empty")
 	}
 
 	mt.permissionLock.Lock()
@@ -1453,25 +1505,25 @@ func (mt *MetaTable) SelectUser(ctx context.Context, tenant string, entity *milv
 // OperatePrivilege grant or revoke privilege by setting the operateType param
 func (mt *MetaTable) OperatePrivilege(ctx context.Context, tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error {
 	if funcutil.IsEmptyString(entity.ObjectName) {
-		return fmt.Errorf("the object name in the grant entity is empty")
+		return errors.New("the object name in the grant entity is empty")
 	}
 	if entity.Object == nil || funcutil.IsEmptyString(entity.Object.Name) {
-		return fmt.Errorf("the object entity in the grant entity is invalid")
+		return errors.New("the object entity in the grant entity is invalid")
 	}
 	if entity.Role == nil || funcutil.IsEmptyString(entity.Role.Name) {
-		return fmt.Errorf("the role entity in the grant entity is invalid")
+		return errors.New("the role entity in the grant entity is invalid")
 	}
 	if entity.Grantor == nil {
-		return fmt.Errorf("the grantor in the grant entity is empty")
+		return errors.New("the grantor in the grant entity is empty")
 	}
 	if entity.Grantor.Privilege == nil || funcutil.IsEmptyString(entity.Grantor.Privilege.Name) {
-		return fmt.Errorf("the privilege name in the grant entity is empty")
+		return errors.New("the privilege name in the grant entity is empty")
 	}
 	if entity.Grantor.User == nil || funcutil.IsEmptyString(entity.Grantor.User.Name) {
-		return fmt.Errorf("the grantor name in the grant entity is empty")
+		return errors.New("the grantor name in the grant entity is empty")
 	}
 	if !funcutil.IsRevoke(operateType) && !funcutil.IsGrant(operateType) {
-		return fmt.Errorf("the operate type in the grant entity is invalid")
+		return errors.New("the operate type in the grant entity is invalid")
 	}
 	if entity.DbName == "" {
 		entity.DbName = util.DefaultDBName
@@ -1489,11 +1541,11 @@ func (mt *MetaTable) OperatePrivilege(ctx context.Context, tenant string, entity
 func (mt *MetaTable) SelectGrant(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
 	var entities []*milvuspb.GrantEntity
 	if entity == nil {
-		return entities, fmt.Errorf("the grant entity is nil")
+		return entities, errors.New("the grant entity is nil")
 	}
 
 	if entity.Role == nil || funcutil.IsEmptyString(entity.Role.Name) {
-		return entities, fmt.Errorf("the role entity in the grant entity is invalid")
+		return entities, errors.New("the role entity in the grant entity is invalid")
 	}
 	if entity.DbName == "" {
 		entity.DbName = util.DefaultDBName
@@ -1507,7 +1559,7 @@ func (mt *MetaTable) SelectGrant(ctx context.Context, tenant string, entity *mil
 
 func (mt *MetaTable) DropGrant(ctx context.Context, tenant string, role *milvuspb.RoleEntity) error {
 	if role == nil || funcutil.IsEmptyString(role.Name) {
-		return fmt.Errorf("the role entity is invalid when dropping the grant")
+		return errors.New("the role entity is invalid when dropping the grant")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1559,7 +1611,7 @@ func (mt *MetaTable) IsCustomPrivilegeGroup(ctx context.Context, groupName strin
 
 func (mt *MetaTable) CreatePrivilegeGroup(ctx context.Context, groupName string) error {
 	if funcutil.IsEmptyString(groupName) {
-		return fmt.Errorf("the privilege group name is empty")
+		return errors.New("the privilege group name is empty")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1583,7 +1635,7 @@ func (mt *MetaTable) CreatePrivilegeGroup(ctx context.Context, groupName string)
 
 func (mt *MetaTable) DropPrivilegeGroup(ctx context.Context, groupName string) error {
 	if funcutil.IsEmptyString(groupName) {
-		return fmt.Errorf("the privilege group name is empty")
+		return errors.New("the privilege group name is empty")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1629,7 +1681,7 @@ func (mt *MetaTable) ListPrivilegeGroups(ctx context.Context) ([]*milvuspb.Privi
 
 func (mt *MetaTable) OperatePrivilegeGroup(ctx context.Context, groupName string, privileges []*milvuspb.PrivilegeEntity, operateType milvuspb.OperatePrivilegeGroupType) error {
 	if funcutil.IsEmptyString(groupName) {
-		return fmt.Errorf("the privilege group name is empty")
+		return errors.New("the privilege group name is empty")
 	}
 	mt.permissionLock.Lock()
 	defer mt.permissionLock.Unlock()
@@ -1699,7 +1751,7 @@ func (mt *MetaTable) OperatePrivilegeGroup(ctx context.Context, groupName string
 
 func (mt *MetaTable) GetPrivilegeGroupRoles(ctx context.Context, groupName string) ([]*milvuspb.RoleEntity, error) {
 	if funcutil.IsEmptyString(groupName) {
-		return nil, fmt.Errorf("the privilege group name is empty")
+		return nil, errors.New("the privilege group name is empty")
 	}
 	mt.permissionLock.RLock()
 	defer mt.permissionLock.RUnlock()

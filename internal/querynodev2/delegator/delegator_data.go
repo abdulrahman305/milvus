@@ -19,7 +19,6 @@ package delegator
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"runtime"
 	"time"
 
@@ -32,25 +31,18 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator/deletebuffer"
 	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	mqcommon "github.com/milvus-io/milvus/pkg/v2/mq/common"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/adaptor"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
@@ -105,6 +97,7 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 			growing, err = segments.NewSegment(
 				context.Background(),
 				sd.collection,
+				sd.segmentManager,
 				segments.SegmentTypeGrowing,
 				0,
 				&querypb.SegmentLoadInfo{
@@ -116,7 +109,6 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 					DeltaPosition: insertData.StartPosition,
 					Level:         datapb.SegmentLevel_L1,
 				},
-				nil,
 			)
 			if err != nil {
 				log.Error("failed to create new segment",
@@ -145,7 +137,13 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 		if newGrowingSegment {
 			sd.growingSegmentLock.Lock()
 			// check whether segment has been excluded
-			if ok := sd.VerifyExcludedSegments(segmentID, typeutil.MaxTimestamp); !ok {
+			// all segment in excluded segment should not be add again
+			// don not check excluded ts
+			// because dropped segment in excluded segment may use wrong excluded ts
+			// which use checkpoint ts as excluded ts
+			// but checkpoint_ts < segment_end_ts cause exclueded data is not filtered out at filter node
+			// should be excluded here
+			if ok := sd.VerifyExcludedSegments(segmentID, 0); !ok {
 				log.Warn("try to insert data into released segment, skip it", zap.Int64("segmentID", segmentID))
 				sd.growingSegmentLock.Unlock()
 				growing.Release(context.Background())
@@ -335,7 +333,7 @@ func (sd *shardDelegator) applyDelete(ctx context.Context,
 
 // markSegmentOffline makes segment go offline and waits for QueryCoord to fix.
 func (sd *shardDelegator) markSegmentOffline(segmentIDs ...int64) {
-	sd.distribution.AddOfflines(segmentIDs...)
+	sd.distribution.MarkOfflineSegments(segmentIDs...)
 }
 
 // addGrowing add growing segment record for delegator.
@@ -413,6 +411,18 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	if req.GetInfos()[0].GetLevel() == datapb.SegmentLevel_L0 {
 		return merr.WrapErrServiceInternal("load L0 segment is not supported, l0 segment should only be loaded by watchChannel")
 	}
+
+	// pin all segments to prevent delete buffer has been cleaned up during worker load segments
+	// Note: if delete records is pinned, it will skip cleanup during SyncTargetVersion
+	// which means after segment is loaded, then delete buffer will be cleaned up by next SyncTargetVersion call
+	for _, info := range req.GetInfos() {
+		sd.deleteBuffer.Pin(info.GetStartPosition().GetTimestamp(), info.GetSegmentID())
+	}
+	defer func() {
+		for _, info := range req.GetInfos() {
+			sd.deleteBuffer.Unpin(info.GetStartPosition().GetTimestamp(), info.GetSegmentID())
+		}
+	}()
 
 	worker, err := sd.workerManager.GetWorker(ctx, targetNodeID)
 	if err != nil {
@@ -501,9 +511,18 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return err
 	}
 
+	return sd.addDistributionIfVersionOK(req.GetLoadMeta().GetSchemaVersion(), entries...)
+}
+
+func (sd *shardDelegator) addDistributionIfVersionOK(version uint64, entries ...SegmentEntry) error {
+	sd.schemaChangeMutex.Lock()
+	defer sd.schemaChangeMutex.Unlock()
+	if version < sd.schemaVersion {
+		return merr.WrapErrServiceInternal("schema version changed")
+	}
+
 	// alter distribution
 	sd.distribution.AddDistributions(entries...)
-
 	return nil
 }
 
@@ -544,11 +563,24 @@ func (sd *shardDelegator) LoadL0(ctx context.Context, infos []*querypb.SegmentLo
 func (sd *shardDelegator) rangeHitL0Deletions(partitionID int64, candidate pkoracle.Candidate, fn func(pk storage.PrimaryKey, ts uint64) error) error {
 	level0Segments := sd.deleteBuffer.ListL0()
 
+	if len(level0Segments) == 0 {
+		return nil
+	}
+
+	log := sd.getLogger(context.Background())
+	start := time.Now()
+	totalL0Rows := 0
+	totalBfHitRows := int64(0)
+	processedL0Count := 0
+
 	for _, segment := range level0Segments {
 		segment := segment.(*segments.L0Segment)
 		if segment.Partition() == partitionID || segment.Partition() == common.AllPartitionsID {
 			segmentPks, segmentTss := segment.DeleteRecords()
+			totalL0Rows += len(segmentPks)
+			processedL0Count++
 			batchSize := paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt()
+
 			for idx := 0; idx < len(segmentPks); idx += batchSize {
 				endIdx := idx + batchSize
 				if endIdx > len(segmentPks) {
@@ -559,6 +591,7 @@ func (sd *shardDelegator) rangeHitL0Deletions(partitionID int64, candidate pkora
 				hits := candidate.BatchPkExist(lc)
 				for i, hit := range hits {
 					if hit {
+						totalBfHitRows += 1
 						if err := fn(segmentPks[idx+i], segmentTss[idx+i]); err != nil {
 							return err
 						}
@@ -567,6 +600,16 @@ func (sd *shardDelegator) rangeHitL0Deletions(partitionID int64, candidate pkora
 			}
 		}
 	}
+
+	log.Info("forward delete from L0 segments to worker",
+		zap.Int64("targetSegmentID", candidate.ID()),
+		zap.String("channel", sd.vchannelName),
+		zap.Int("l0SegmentCount", processedL0Count),
+		zap.Int("totalDeleteRowsInL0", totalL0Rows),
+		zap.Int64("totalBfHitRows", totalBfHitRows),
+		zap.Int64("totalCost", time.Since(start).Milliseconds()),
+	)
+
 	return nil
 }
 
@@ -658,6 +701,8 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		// list buffered delete
 		deleteRecords := sd.deleteBuffer.ListAfter(info.GetStartPosition().GetTimestamp())
 		tsHitDeleteRows := int64(0)
+		bfHitDeleteRows := int64(0)
+		start := time.Now()
 		for _, entry := range deleteRecords {
 			for _, record := range entry.Data {
 				tsHitDeleteRows += int64(len(record.DeleteData.Pks))
@@ -676,6 +721,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 					hits := candidate.BatchPkExist(lc)
 					for i, hit := range hits {
 						if hit {
+							bfHitDeleteRows += 1
 							err := bufferedForwarder.Buffer(pks[idx+i], record.DeleteData.Tss[idx+i])
 							if err != nil {
 								return err
@@ -685,6 +731,14 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 				}
 			}
 		}
+		log.Info("forward delete to worker...",
+			zap.String("channel", info.InsertChannel),
+			zap.Int64("segmentID", info.GetSegmentID()),
+			zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
+			zap.Int64("tsHitDeleteRowNum", tsHitDeleteRows),
+			zap.Int64("bfHitDeleteRowNum", bfHitDeleteRows),
+			zap.Int64("bfCost", time.Since(start).Milliseconds()),
+		)
 		err := bufferedForwarder.Flush()
 		if err != nil {
 			return err
@@ -712,141 +766,6 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	log.Info("load delete done")
 
 	return nil
-}
-
-func (sd *shardDelegator) createStreamFromMsgStream(ctx context.Context, position *msgpb.MsgPosition) (ch <-chan *msgstream.MsgPack, closer func(), err error) {
-	stream, err := sd.factory.NewTtMsgStream(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer stream.Close()
-	vchannelName := position.ChannelName
-	pChannelName := funcutil.ToPhysicalChannel(vchannelName)
-	position.ChannelName = pChannelName
-
-	ts, _ := tsoutil.ParseTS(position.Timestamp)
-
-	// Random the subname in case we trying to load same delta at the same time
-	subName := fmt.Sprintf("querynode-delta-loader-%d-%d-%d", paramtable.GetNodeID(), sd.collectionID, rand.Int())
-	log.Info("from dml check point load delete", zap.Any("position", position), zap.String("vChannel", vchannelName), zap.String("subName", subName), zap.Time("positionTs", ts))
-	err = stream.AsConsumer(context.TODO(), []string{pChannelName}, subName, mqcommon.SubscriptionPositionUnknown)
-	if err != nil {
-		return nil, stream.Close, err
-	}
-
-	err = stream.Seek(context.TODO(), []*msgpb.MsgPosition{position}, false)
-	if err != nil {
-		return nil, stream.Close, err
-	}
-
-	dispatcher := msgstream.NewSimpleMsgDispatcher(stream, func(pm msgstream.ConsumeMsg) bool {
-		if pm.GetType() != commonpb.MsgType_Delete || pm.GetVChannel() != vchannelName {
-			return false
-		}
-		return true
-	})
-
-	return dispatcher.Chan(), dispatcher.Close, nil
-}
-
-func (sd *shardDelegator) createDeleteStreamFromStreamingService(ctx context.Context, position *msgpb.MsgPosition) (ch <-chan *msgstream.MsgPack, closer func(), err error) {
-	handler := adaptor.NewMsgPackAdaptorHandler()
-	s := streaming.WAL().Read(ctx, streaming.ReadOption{
-		VChannel: position.GetChannelName(),
-		DeliverPolicy: options.DeliverPolicyStartFrom(
-			adaptor.MustGetMessageIDFromMQWrapperIDBytes(streaming.WAL().WALName(), position.GetMsgID()),
-		),
-		DeliverFilters: []options.DeliverFilter{
-			// only deliver message which timestamp >= position.Timestamp
-			options.DeliverFilterTimeTickGTE(position.GetTimestamp()),
-			// only delete message
-			options.DeliverFilterMessageType(message.MessageTypeDelete),
-		},
-		MessageHandler: handler,
-	})
-	return handler.Chan(), s.Close, nil
-}
-
-func (sd *shardDelegator) readDeleteFromMsgstream(ctx context.Context, position *msgpb.MsgPosition, safeTs uint64, candidate *pkoracle.BloomFilterSet) (*storage.DeleteData, error) {
-	log := sd.getLogger(ctx).With(
-		zap.String("channel", position.ChannelName),
-		zap.Int64("segmentID", candidate.ID()),
-	)
-	pChannelName := funcutil.ToPhysicalChannel(position.ChannelName)
-
-	var ch <-chan *msgstream.MsgPack
-	var closer func()
-	var err error
-	if streamingutil.IsStreamingServiceEnabled() {
-		ch, closer, err = sd.createDeleteStreamFromStreamingService(ctx, position)
-	} else {
-		ch, closer, err = sd.createStreamFromMsgStream(ctx, position)
-	}
-	if closer != nil {
-		defer closer()
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	start := time.Now()
-	result := &storage.DeleteData{}
-	hasMore := true
-	for hasMore {
-		select {
-		case <-ctx.Done():
-			log.Debug("read delta msg from seek position done", zap.Error(ctx.Err()))
-			return nil, ctx.Err()
-		case msgPack, ok := <-ch:
-			if !ok {
-				err = fmt.Errorf("stream channel closed, pChannelName=%v, msgID=%v", pChannelName, position.GetMsgID())
-				log.Warn("fail to read delta msg",
-					zap.String("pChannelName", pChannelName),
-					zap.Binary("msgID", position.GetMsgID()),
-					zap.Error(err),
-				)
-				return nil, err
-			}
-
-			if msgPack == nil {
-				continue
-			}
-
-			for _, tsMsg := range msgPack.Msgs {
-				if tsMsg.Type() == commonpb.MsgType_Delete {
-					dmsg := tsMsg.(*msgstream.DeleteMsg)
-					if dmsg.CollectionID != sd.collectionID || (dmsg.GetPartitionID() != common.AllPartitionsID && dmsg.GetPartitionID() != candidate.Partition()) {
-						continue
-					}
-
-					pks := storage.ParseIDs2PrimaryKeys(dmsg.GetPrimaryKeys())
-					batchSize := paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt()
-					for idx := 0; idx < len(pks); idx += batchSize {
-						endIdx := idx + batchSize
-						if endIdx > len(pks) {
-							endIdx = len(pks)
-						}
-
-						lc := storage.NewBatchLocationsCache(pks[idx:endIdx])
-						hits := candidate.BatchPkExist(lc)
-						for i, hit := range hits {
-							if hit {
-								result.Pks = append(result.Pks, pks[idx+i])
-								result.Tss = append(result.Tss, dmsg.Timestamps[idx+i])
-							}
-						}
-					}
-				}
-			}
-
-			// reach safe ts
-			if safeTs <= msgPack.EndPositions[0].GetTimestamp() {
-				hasMore = false
-			}
-		}
-	}
-	log.Info("successfully read delete from stream ", zap.Duration("time spent", time.Since(start)))
-	return result, nil
 }
 
 // ReleaseSegments releases segments local or remotely depending on the target node.
@@ -951,66 +870,45 @@ func (sd *shardDelegator) ReleaseSegments(ctx context.Context, req *querypb.Rele
 	return nil
 }
 
-func (sd *shardDelegator) SyncTargetVersion(
-	newVersion int64,
-	partitions []int64,
-	growingInTarget []int64,
-	sealedInTarget []int64,
-	droppedInTarget []int64,
-	checkpoint *msgpb.MsgPosition,
-	deleteSeekPos *msgpb.MsgPosition,
-) {
-	growings := sd.segmentManager.GetBy(
-		segments.WithType(segments.SegmentTypeGrowing),
-		segments.WithChannel(sd.vchannelName),
-	)
-
-	sealedSet := typeutil.NewUniqueSet(sealedInTarget...)
-	growingSet := typeutil.NewUniqueSet(growingInTarget...)
-	droppedSet := typeutil.NewUniqueSet(droppedInTarget...)
-	redundantGrowing := typeutil.NewUniqueSet()
-	for _, s := range growings {
-		if growingSet.Contain(s.ID()) {
-			continue
+func (sd *shardDelegator) SyncTargetVersion(action *querypb.SyncAction, partitions []int64) {
+	sd.distribution.SyncTargetVersion(action, partitions)
+	// clean delete buffer after distribution becomes serviceable
+	if sd.distribution.queryView.Serviceable() {
+		checkpoint := action.GetCheckpoint()
+		deleteSeekPos := action.GetDeleteCP()
+		if deleteSeekPos == nil {
+			// for compatible with 2.4, we use checkpoint as deleteCP when deleteCP is nil
+			deleteSeekPos = checkpoint
+			log.Info("use checkpoint as deleteCP",
+				zap.String("channelName", sd.vchannelName),
+				zap.Time("deleteSeekPos", tsoutil.PhysicalTime(action.GetCheckpoint().GetTimestamp())))
 		}
 
-		// sealed segment already exists, make growing segment redundant
-		if sealedSet.Contain(s.ID()) {
-			redundantGrowing.Insert(s.ID())
+		start := time.Now()
+		sizeBeforeClean, _ := sd.deleteBuffer.Size()
+		l0NumBeforeClean := len(sd.deleteBuffer.ListL0())
+		sd.deleteBuffer.UnRegister(deleteSeekPos.GetTimestamp())
+		sizeAfterClean, _ := sd.deleteBuffer.Size()
+		l0NumAfterClean := len(sd.deleteBuffer.ListL0())
+
+		if sizeAfterClean < sizeBeforeClean || l0NumAfterClean < l0NumBeforeClean {
+			log.Info("clean delete buffer",
+				zap.String("channel", sd.vchannelName),
+				zap.Time("deleteSeekPos", tsoutil.PhysicalTime(deleteSeekPos.GetTimestamp())),
+				zap.Time("channelCP", tsoutil.PhysicalTime(checkpoint.GetTimestamp())),
+				zap.Int64("sizeBeforeClean", sizeBeforeClean),
+				zap.Int64("sizeAfterClean", sizeAfterClean),
+				zap.Int("l0NumBeforeClean", l0NumBeforeClean),
+				zap.Int("l0NumAfterClean", l0NumAfterClean),
+				zap.Duration("cost", time.Since(start)),
+			)
 		}
-
-		// sealed segment already dropped, make growing segment redundant
-		if droppedSet.Contain(s.ID()) {
-			redundantGrowing.Insert(s.ID())
-		}
+		sd.RefreshLevel0DeletionStats()
 	}
-	redundantGrowingIDs := redundantGrowing.Collect()
-	if len(redundantGrowing) > 0 {
-		log.Warn("found redundant growing segments",
-			zap.Int64s("growingSegments", redundantGrowingIDs))
-	}
-	sd.distribution.SyncTargetVersion(newVersion, partitions, growingInTarget, sealedInTarget, redundantGrowingIDs)
-	start := time.Now()
-	sizeBeforeClean, _ := sd.deleteBuffer.Size()
-	sd.deleteBuffer.UnRegister(deleteSeekPos.GetTimestamp())
-	sizeAfterClean, _ := sd.deleteBuffer.Size()
-
-	if sizeAfterClean < sizeBeforeClean {
-		log.Info("clean delete buffer",
-			zap.String("channel", sd.vchannelName),
-			zap.Time("deleteSeekPos", tsoutil.PhysicalTime(deleteSeekPos.GetTimestamp())),
-			zap.Time("channelCP", tsoutil.PhysicalTime(checkpoint.GetTimestamp())),
-			zap.Int64("sizeBeforeClean", sizeBeforeClean),
-			zap.Int64("sizeAfterClean", sizeAfterClean),
-			zap.Duration("cost", time.Since(start)),
-		)
-	}
-
-	sd.RefreshLevel0DeletionStats()
 }
 
-func (sd *shardDelegator) GetTargetVersion() int64 {
-	return sd.distribution.getTargetVersion()
+func (sd *shardDelegator) GetChannelQueryView() *channelQueryView {
+	return sd.distribution.GetQueryView()
 }
 
 func (sd *shardDelegator) AddExcludedSegments(excludeInfo map[int64]uint64) {
@@ -1040,26 +938,45 @@ func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, 
 		return 0, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("please provide varchar/text for BM25 Function based search, got %s", holder.Type.String()))
 	}
 
-	str := funcutil.GetVarCharFromPlaceholder(holder)
+	texts := funcutil.GetVarCharFromPlaceholder(holder)
+	datas := []any{texts}
 	functionRunner, ok := sd.functionRunners[req.GetFieldId()]
 	if !ok {
 		return 0, fmt.Errorf("functionRunner not found for field: %d", req.GetFieldId())
 	}
 
+	if len(functionRunner.GetInputFields()) == 2 {
+		analyzerName := "default"
+		if name := req.GetAnalyzerName(); name != "" {
+			// use user provided analyzer name
+			analyzerName = name
+		}
+
+		analyzers := make([]string, len(texts))
+		for i := range texts {
+			analyzers[i] = analyzerName
+		}
+		datas = append(datas, analyzers)
+	}
+
 	// get search text term frequency
-	output, err := functionRunner.BatchRun(str)
+	output, err := functionRunner.BatchRun(datas...)
 	if err != nil {
 		return 0, err
 	}
 
 	tfArray, ok := output[0].(*schemapb.SparseFloatArray)
 	if !ok {
-		return 0, fmt.Errorf("functionRunner return unknown data")
+		return 0, errors.New("functionRunner return unknown data")
 	}
 
 	idfSparseVector, avgdl, err := sd.idfOracle.BuildIDF(req.GetFieldId(), tfArray)
 	if err != nil {
 		return 0, err
+	}
+
+	if avgdl <= 0 {
+		return 0, nil
 	}
 
 	for _, idf := range idfSparseVector {

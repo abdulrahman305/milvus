@@ -25,7 +25,6 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -55,7 +54,7 @@ var (
 // ErrLoadWithDefaultRG           = errors.New("load operation can't use default resource group and other resource group together")
 )
 
-func (s *Server) ShowCollections(ctx context.Context, req *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
+func (s *Server) ShowLoadCollections(ctx context.Context, req *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
 	log.Ctx(ctx).Debug("show collections request received", zap.Int64s("collections", req.GetCollectionIDs()))
 	if err := merr.CheckHealthy(s.State()); err != nil {
 		msg := "failed to show collections"
@@ -128,7 +127,7 @@ func (s *Server) ShowCollections(ctx context.Context, req *querypb.ShowCollectio
 	return resp, nil
 }
 
-func (s *Server) ShowPartitions(ctx context.Context, req *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
+func (s *Server) ShowLoadPartitions(ctx context.Context, req *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", req.GetCollectionID()),
 	)
@@ -224,6 +223,8 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 		return merr.Status(err), nil
 	}
 
+	// if user specified the replica number in load request, load config changes won't be apply to the collection automatically
+	userSpecifiedReplicaMode := req.GetReplicaNumber() > 0
 	// to be compatible with old sdk, which set replica=1 if replica is not specified
 	// so only both replica and resource groups didn't set in request, it will turn to use the configured load info
 	if req.GetReplicaNumber() <= 0 && len(req.GetResourceGroups()) == 0 {
@@ -277,6 +278,7 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 				s.targetMgr,
 				s.targetObserver,
 				s.collectionObserver,
+				userSpecifiedReplicaMode,
 			)
 		}
 	}
@@ -291,6 +293,7 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 			s.targetObserver,
 			s.collectionObserver,
 			s.nodeMgr,
+			userSpecifiedReplicaMode,
 		)
 	}
 
@@ -377,6 +380,9 @@ func (s *Server) LoadPartitions(ctx context.Context, req *querypb.LoadPartitions
 		return merr.Status(err), nil
 	}
 
+	// if user specified the replica number in load request, load config changes won't be apply to the collection automatically
+	userSpecifiedReplicaMode := req.GetReplicaNumber() > 0
+
 	// to be compatible with old sdk, which set replica=1 if replica is not specified
 	// so only both replica and resource groups didn't set in request, it will turn to use the configured load info
 	if req.GetReplicaNumber() <= 0 && len(req.GetResourceGroups()) == 0 {
@@ -406,6 +412,7 @@ func (s *Server) LoadPartitions(ctx context.Context, req *querypb.LoadPartitions
 		s.targetObserver,
 		s.collectionObserver,
 		s.nodeMgr,
+		userSpecifiedReplicaMode,
 	)
 	s.jobScheduler.Add(loadJob)
 	err := loadJob.Wait()
@@ -537,7 +544,7 @@ func (s *Server) GetPartitionStates(ctx context.Context, req *querypb.GetPartiti
 	}, nil
 }
 
-func (s *Server) GetSegmentInfo(ctx context.Context, req *querypb.GetSegmentInfoRequest) (*querypb.GetSegmentInfoResponse, error) {
+func (s *Server) GetLoadSegmentInfo(ctx context.Context, req *querypb.GetSegmentInfoRequest) (*querypb.GetSegmentInfoResponse, error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", req.GetCollectionID()),
 	)
@@ -902,7 +909,7 @@ func (s *Server) GetShardLeaders(ctx context.Context, req *querypb.GetShardLeade
 		}, nil
 	}
 
-	leaders, err := utils.GetShardLeaders(ctx, s.meta, s.targetMgr, s.dist, s.nodeMgr, req.GetCollectionID())
+	leaders, err := utils.GetShardLeaders(ctx, s.meta, s.targetMgr, s.dist, s.nodeMgr, req.GetCollectionID(), req.GetWithUnserviceableShards())
 	return &querypb.GetShardLeadersResponse{
 		Status: merr.Status(err),
 		Shards: leaders,
@@ -1178,8 +1185,21 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 		return merr.Status(errors.Wrap(err, msg)), nil
 	}
 
-	jobs := make([]job.Job, 0, len(req.GetCollectionIDs()))
-	for _, collectionID := range req.GetCollectionIDs() {
+	err := s.updateLoadConfig(ctx, req.GetCollectionIDs(), req.GetReplicaNumber(), req.GetResourceGroups())
+	if err != nil {
+		msg := "failed to update load config"
+		log.Warn(msg, zap.Error(err))
+		return merr.Status(errors.Wrap(err, msg)), nil
+	}
+
+	log.Info("update load config request finished")
+
+	return merr.Success(), nil
+}
+
+func (s *Server) updateLoadConfig(ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string) error {
+	jobs := make([]job.Job, 0, len(collectionIDs))
+	for _, collectionID := range collectionIDs {
 		collection := s.meta.GetCollection(ctx, collectionID)
 		if collection == nil {
 			err := merr.WrapErrCollectionNotLoaded(collectionID)
@@ -1188,13 +1208,16 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 		}
 
 		collectionUsedRG := s.meta.ReplicaManager.GetResourceGroupByCollection(ctx, collection.GetCollectionID()).Collect()
-		left, right := lo.Difference(collectionUsedRG, req.GetResourceGroups())
+		left, right := lo.Difference(collectionUsedRG, newRGs)
 		rgChanged := len(left) > 0 || len(right) > 0
-		replicaChanged := collection.GetReplicaNumber() != req.GetReplicaNumber()
+		replicaChanged := collection.GetReplicaNumber() != newReplicaNum
 
-		subReq := proto.Clone(req).(*querypb.UpdateLoadConfigRequest)
-		subReq.CollectionIDs = []int64{collectionID}
-		if len(req.ResourceGroups) == 0 {
+		subReq := &querypb.UpdateLoadConfigRequest{
+			CollectionIDs:  []int64{collectionID},
+			ReplicaNumber:  newReplicaNum,
+			ResourceGroups: newRGs,
+		}
+		if len(subReq.GetResourceGroups()) == 0 {
 			subReq.ResourceGroups = collectionUsedRG
 			rgChanged = false
 		}
@@ -1216,6 +1239,7 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 			s.targetMgr,
 			s.targetObserver,
 			s.collectionObserver,
+			false,
 		)
 
 		jobs = append(jobs, updateJob)
@@ -1230,12 +1254,37 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 		}
 	}
 
-	if err != nil {
-		msg := "failed to update load config"
-		log.Warn(msg, zap.Error(err))
-		return merr.Status(errors.Wrap(err, msg)), nil
-	}
-	log.Info("update load config request finished")
+	return err
+}
 
-	return merr.Success(), nil
+func (s *Server) ListLoadedSegments(ctx context.Context, req *querypb.ListLoadedSegmentsRequest) (*querypb.ListLoadedSegmentsResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ListLoadedSegmentsResponse{
+			Status: merr.Status(errors.Wrap(err, "failed to list loaded segments")),
+		}, nil
+	}
+	segmentIDs := typeutil.NewUniqueSet()
+
+	collections := s.meta.GetAllCollections(ctx)
+	for _, collection := range collections {
+		segments := s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.CurrentTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+		segments = s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.NextTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+	}
+
+	segments := s.dist.SegmentDistManager.GetByFilter()
+	for _, segment := range segments {
+		segmentIDs.Insert(segment.ID)
+	}
+
+	resp := &querypb.ListLoadedSegmentsResponse{
+		Status:     merr.Success(),
+		SegmentIDs: segmentIDs.Collect(),
+	}
+	return resp, nil
 }

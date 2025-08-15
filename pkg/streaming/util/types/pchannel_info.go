@@ -57,6 +57,25 @@ func NewProtoFromPChannelInfo(pchannel PChannelInfo) *streamingpb.PChannelInfo {
 	}
 }
 
+// ChannelID is the unique identifier of a pchannel.
+type ChannelID struct {
+	Name string
+	// TODO: add replica id in future.
+}
+
+func (id ChannelID) IsZero() bool {
+	return id.Name == ""
+}
+
+func (id ChannelID) String() string {
+	return id.Name
+}
+
+// LT is used to make a ChannelID sortable.
+func (id1 ChannelID) LT(id2 ChannelID) bool {
+	return id1.Name < id2.Name
+}
+
 // PChannelInfo is the struct for pchannel info.
 type PChannelInfo struct {
 	Name       string     // name of pchannel.
@@ -66,11 +85,20 @@ type PChannelInfo struct {
 	// and it will fence the old rw wal impls or wait the old rw wal impls close.
 }
 
-func (c *PChannelInfo) String() string {
+func (c PChannelInfo) ChannelID() ChannelID {
+	return ChannelID{Name: c.Name}
+}
+
+func (c PChannelInfo) String() string {
 	return fmt.Sprintf("%s:%s@%d", c.Name, c.AccessMode, c.Term)
 }
 
+// PChannelInfoAssigned is a pair that represent a channel assignment of channel
 type PChannelInfoAssigned struct {
 	Channel PChannelInfo
 	Node    StreamingNodeInfo
+}
+
+func (c PChannelInfoAssigned) String() string {
+	return fmt.Sprintf("%s>%s", c.Channel, c.Node)
 }

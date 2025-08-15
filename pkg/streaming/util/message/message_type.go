@@ -25,6 +25,7 @@ const (
 	MessageTypeCommitTxn        MessageType = MessageType(messagespb.MessageType_CommitTxn)
 	MessageTypeRollbackTxn      MessageType = MessageType(messagespb.MessageType_RollbackTxn)
 	MessageTypeImport           MessageType = MessageType(messagespb.MessageType_Import)
+	MessageTypeSchemaChange     MessageType = MessageType(messagespb.MessageType_SchemaChange)
 )
 
 var messageTypeName = map[MessageType]string{
@@ -44,6 +45,7 @@ var messageTypeName = map[MessageType]string{
 	MessageTypeCommitTxn:        "COMMIT_TXN",
 	MessageTypeRollbackTxn:      "ROLLBACK_TXN",
 	MessageTypeImport:           "IMPORT",
+	MessageTypeSchemaChange:     "SCHEMA_CHANGE",
 }
 
 // String implements fmt.Stringer interface.
@@ -60,6 +62,20 @@ func (t MessageType) marshal() string {
 func (t MessageType) Valid() bool {
 	_, ok := messageTypeName[t]
 	return t != MessageTypeUnknown && ok
+}
+
+// IsExclusiveRequired checks if the MessageType is exclusive append required.
+// An exclusive required message type is that the message's timetick should keep same order with message id.
+// And when the message is appending, other messages with the same vchannel cannot append concurrently.
+func (t MessageType) IsExclusiveRequired() bool {
+	_, ok := exclusiveRequiredMessageType[t]
+	return ok
+}
+
+// CanEnableCipher checks if the MessageType can enable cipher.
+func (t MessageType) CanEnableCipher() bool {
+	_, ok := cipherMessageType[t]
+	return ok
 }
 
 // IsSysmtem checks if the MessageType is a system type.

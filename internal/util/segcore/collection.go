@@ -16,13 +16,15 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // CreateCCollectionRequest is a request to create a CCollection.
 type CreateCCollectionRequest struct {
-	CollectionID int64
-	Schema       *schemapb.CollectionSchema
-	IndexMeta    *segcorepb.CollectionIndexMeta
+	CollectionID  int64
+	Schema        *schemapb.CollectionSchema
+	IndexMeta     *segcorepb.CollectionIndexMeta
+	LoadFieldList []int64
 }
 
 // CreateCCollection creates a CCollection from a CreateCCollectionRequest.
@@ -45,6 +47,14 @@ func CreateCCollection(req *CreateCCollectionRequest) (*CCollection, error) {
 	}
 	if indexMetaBlob != nil {
 		status = C.SetIndexMeta(ptr, unsafe.Pointer(&indexMetaBlob[0]), (C.int64_t)(len(indexMetaBlob)))
+		if err := ConsumeCStatusIntoError(&status); err != nil {
+			C.DeleteCollection(ptr)
+			return nil, err
+		}
+	}
+	if req.LoadFieldList != nil {
+		status = C.UpdateLoadFields(ptr, (*C.int64_t)(unsafe.Pointer(&req.LoadFieldList[0])),
+			C.int64_t(len(req.LoadFieldList)))
 		if err := ConsumeCStatusIntoError(&status); err != nil {
 			C.DeleteCollection(ptr)
 			return nil, err
@@ -83,6 +93,20 @@ func (c *CCollection) Schema() *schemapb.CollectionSchema {
 
 func (c *CCollection) IndexMeta() *segcorepb.CollectionIndexMeta {
 	return c.indexMeta
+}
+
+func (c *CCollection) UpdateSchema(sch *schemapb.CollectionSchema, version uint64) error {
+	if sch == nil {
+		return merr.WrapErrServiceInternal("update collection schema with nil")
+	}
+
+	schemaBlob, err := proto.Marshal(sch)
+	if err != nil {
+		return err
+	}
+
+	status := C.UpdateSchema(c.ptr, unsafe.Pointer(&schemaBlob[0]), (C.int64_t)(len(schemaBlob)), (C.uint64_t)(version))
+	return ConsumeCStatusIntoError(&status)
 }
 
 // Release releases the underlying collection

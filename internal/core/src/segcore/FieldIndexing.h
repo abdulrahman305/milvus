@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <map>
 #include <memory>
@@ -20,15 +21,17 @@
 #include <index/Index.h>
 #include <index/ScalarIndex.h>
 
-#include "AckResponder.h"
 #include "InsertRecord.h"
+#include "cachinglayer/CacheSlot.h"
 #include "common/FieldMeta.h"
 #include "common/Schema.h"
 #include "common/IndexMeta.h"
 #include "IndexConfigGenerator.h"
+#include "common/Types.h"
 #include "knowhere/config.h"
 #include "log/Log.h"
 #include "segcore/SegcoreConfig.h"
+#include "segcore/InsertRecord.h"
 #include "index/VectorIndex.h"
 
 namespace milvus::segcore {
@@ -39,18 +42,17 @@ class FieldIndexing {
  public:
     explicit FieldIndexing(const FieldMeta& field_meta,
                            const SegcoreConfig& segcore_config)
-        : field_meta_(field_meta), segcore_config_(segcore_config) {
+        : data_type_(field_meta.get_data_type()),
+          dim_(IsVectorDataType(field_meta.get_data_type()) &&
+                       !IsSparseFloatVectorDataType(field_meta.get_data_type())
+                   ? field_meta.get_dim()
+                   : 1),
+          segcore_config_(segcore_config) {
     }
     FieldIndexing(const FieldIndexing&) = delete;
     FieldIndexing&
     operator=(const FieldIndexing&) = delete;
     virtual ~FieldIndexing() = default;
-
-    // Do this in parallel
-    virtual void
-    BuildIndexRange(int64_t ack_beg,
-                    int64_t ack_end,
-                    const VectorBase* vec_base) = 0;
 
     virtual void
     AppendSegmentIndexDense(int64_t reserved_offset,
@@ -83,9 +85,14 @@ class FieldIndexing {
         return true;
     }
 
-    const FieldMeta&
-    get_field_meta() {
-        return field_meta_;
+    DataType
+    get_data_type() const {
+        return data_type_;
+    }
+
+    int64_t
+    get_dim() const {
+        return dim_;
     }
 
     int64_t
@@ -93,15 +100,16 @@ class FieldIndexing {
         return segcore_config_.get_chunk_rows();
     }
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const = 0;
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     get_segment_indexing() const = 0;
 
  protected:
     // additional info
-    const FieldMeta& field_meta_;
+    const DataType data_type_;
+    const int64_t dim_;
     const SegcoreConfig& segcore_config_;
 };
 
@@ -111,16 +119,11 @@ class ScalarFieldIndexing : public FieldIndexing {
     using FieldIndexing::FieldIndexing;
 
     void
-    BuildIndexRange(int64_t ack_beg,
-                    int64_t ack_end,
-                    const VectorBase* vec_base) override;
-
-    void
     AppendSegmentIndexDense(int64_t reserved_offset,
                             int64_t size,
                             const VectorBase* vec_base,
                             const void* data_source) override {
-        PanicInfo(Unsupported,
+        ThrowInfo(Unsupported,
                   "scalar index doesn't support append vector segment index");
     }
 
@@ -130,7 +133,7 @@ class ScalarFieldIndexing : public FieldIndexing {
                              int64_t new_data_dim,
                              const VectorBase* vec_base,
                              const void* data_source) override {
-        PanicInfo(Unsupported,
+        ThrowInfo(Unsupported,
                   "scalar index doesn't support append vector segment index");
     }
 
@@ -139,7 +142,7 @@ class ScalarFieldIndexing : public FieldIndexing {
                      int64_t count,
                      int64_t element_size,
                      void* output) override {
-        PanicInfo(Unsupported,
+        ThrowInfo(Unsupported,
                   "scalar index don't support get data from index");
     }
 
@@ -154,13 +157,13 @@ class ScalarFieldIndexing : public FieldIndexing {
     }
 
     // concurrent
-    index::ScalarIndex<T>*
+    PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const override {
-        Assert(!field_meta_.is_vector());
+        Assert(!IsVectorDataType(data_type_));
         return data_.at(chunk_id).get();
     }
 
-    index::IndexBase*
+    PinWrapper<index::IndexBase*>
     get_segment_indexing() const override {
         return nullptr;
     }
@@ -176,12 +179,8 @@ class VectorFieldIndexing : public FieldIndexing {
     explicit VectorFieldIndexing(const FieldMeta& field_meta,
                                  const FieldIndexMeta& field_index_meta,
                                  int64_t segment_max_row_count,
-                                 const SegcoreConfig& segcore_config);
-
-    void
-    BuildIndexRange(int64_t ack_beg,
-                    int64_t ack_end,
-                    const VectorBase* vec_base) override;
+                                 const SegcoreConfig& segcore_config,
+                                 const VectorBase* field_raw_data);
 
     void
     AppendSegmentIndexDense(int64_t reserved_offset,
@@ -211,14 +210,15 @@ class VectorFieldIndexing : public FieldIndexing {
     }
 
     // concurrent
-    index::IndexBase*
+    PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const override {
-        Assert(field_meta_.is_vector());
-        return data_.at(chunk_id).get();
+        Assert(IsVectorDataType(data_type_));
+        return PinWrapper<index::IndexBase*>(data_.at(chunk_id).get());
     }
-    index::IndexBase*
+
+    PinWrapper<index::IndexBase*>
     get_segment_indexing() const override {
-        return index_.get();
+        return PinWrapper<index::IndexBase*>(index_.get());
     }
 
     bool
@@ -228,14 +228,14 @@ class VectorFieldIndexing : public FieldIndexing {
     has_raw_data() const override;
 
     knowhere::Json
-    get_build_params() const;
+    get_build_params(DataType data_type) const;
 
     SearchInfo
     get_search_params(const SearchInfo& searchInfo) const;
 
  private:
     void
-    recreate_index();
+    recreate_index(DataType data_type, const VectorBase* field_raw_data);
     // current number of rows in index.
     std::atomic<idx_t> index_cur_ = 0;
     // whether the growing index has been built.
@@ -252,21 +252,23 @@ std::unique_ptr<FieldIndexing>
 CreateIndex(const FieldMeta& field_meta,
             const FieldIndexMeta& field_index_meta,
             int64_t segment_max_row_count,
-            const SegcoreConfig& segcore_config);
+            const SegcoreConfig& segcore_config,
+            const VectorBase* field_raw_data = nullptr);
 
 class IndexingRecord {
  public:
     explicit IndexingRecord(const Schema& schema,
                             const IndexMetaPtr& indexMetaPtr,
-                            const SegcoreConfig& segcore_config)
+                            const SegcoreConfig& segcore_config,
+                            const InsertRecord<false>* insert_record)
         : schema_(schema),
           index_meta_(indexMetaPtr),
           segcore_config_(segcore_config) {
-        Initialize();
+        Initialize(insert_record);
     }
 
     void
-    Initialize() {
+    Initialize(const InsertRecord<false>* insert_record) {
         int offset_id = 0;
         auto enable_growing_mmap = storage::MmapManager::GetInstance()
                                        .GetMmapConfig()
@@ -292,12 +294,15 @@ class IndexingRecord {
                         index_meta_->GetFieldIndexMeta(field_id);
                     //Disable growing index for flat
                     if (!vec_field_meta.IsFlatIndex()) {
+                        auto field_raw_data =
+                            insert_record->get_data_base(field_id);
                         field_indexings_.try_emplace(
                             field_id,
                             CreateIndex(field_meta,
                                         vec_field_meta,
                                         index_meta_->GetIndexMaxRowCount(),
-                                        segcore_config_));
+                                        segcore_config_,
+                                        field_raw_data));
                     }
                 }
             }
@@ -306,18 +311,17 @@ class IndexingRecord {
     }
 
     // concurrent, reentrant
-    template <bool is_sealed>
     void
     AppendingIndex(int64_t reserved_offset,
                    int64_t size,
                    FieldId fieldId,
                    const DataArray* stream_data,
-                   const InsertRecord<is_sealed>& record) {
+                   const InsertRecord<false>& record) {
         if (!is_in(fieldId)) {
             return;
         }
         auto& indexing = field_indexings_.at(fieldId);
-        auto type = indexing->get_field_meta().get_data_type();
+        auto type = indexing->get_data_type();
         auto field_raw_data = record.get_data_base(fieldId);
         if (type == DataType::VECTOR_FLOAT &&
             reserved_offset + size >= indexing->get_build_threshold()) {
@@ -326,6 +330,20 @@ class IndexingRecord {
                 size,
                 field_raw_data,
                 stream_data->vectors().float_vector().data().data());
+        } else if (type == DataType::VECTOR_FLOAT16 &&
+                   reserved_offset + size >= indexing->get_build_threshold()) {
+            indexing->AppendSegmentIndexDense(
+                reserved_offset,
+                size,
+                field_raw_data,
+                stream_data->vectors().float16_vector().data());
+        } else if (type == DataType::VECTOR_BFLOAT16 &&
+                   reserved_offset + size >= indexing->get_build_threshold()) {
+            indexing->AppendSegmentIndexDense(
+                reserved_offset,
+                size,
+                field_raw_data,
+                stream_data->vectors().bfloat16_vector().data());
         } else if (type == DataType::VECTOR_SPARSE_FLOAT) {
             auto data = SparseBytesToRows(
                 stream_data->vectors().sparse_float_vector().contents());
@@ -339,21 +357,22 @@ class IndexingRecord {
     }
 
     // concurrent, reentrant
-    template <bool is_sealed>
     void
     AppendingIndex(int64_t reserved_offset,
                    int64_t size,
                    FieldId fieldId,
                    const FieldDataPtr data,
-                   const InsertRecord<is_sealed>& record) {
+                   const InsertRecord<false>& record) {
         if (!is_in(fieldId)) {
             return;
         }
         auto& indexing = field_indexings_.at(fieldId);
-        auto type = indexing->get_field_meta().get_data_type();
+        auto type = indexing->get_data_type();
         const void* p = data->Data();
 
-        if (type == DataType::VECTOR_FLOAT &&
+        if ((type == DataType::VECTOR_FLOAT ||
+             type == DataType::VECTOR_FLOAT16 ||
+             type == DataType::VECTOR_BFLOAT16) &&
             reserved_offset + size >= indexing->get_build_threshold()) {
             auto vec_base = record.get_data_base(fieldId);
             indexing->AppendSegmentIndexDense(
@@ -382,10 +401,11 @@ class IndexingRecord {
                      void* output_raw) const {
         if (is_in(fieldId)) {
             auto& indexing = field_indexings_.at(fieldId);
-            if (indexing->get_field_meta().get_data_type() ==
-                    DataType::VECTOR_FLOAT ||
-                indexing->get_field_meta().get_data_type() ==
-                    DataType::VECTOR_SPARSE_FLOAT) {
+            auto data_type = indexing->get_data_type();
+            if (data_type == DataType::VECTOR_FLOAT ||
+                data_type == DataType::VECTOR_FLOAT16 ||
+                data_type == DataType::VECTOR_BFLOAT16 ||
+                data_type == DataType::VECTOR_SPARSE_FLOAT) {
                 indexing->GetDataFromIndex(
                     seg_offsets, count, element_size, output_raw);
             }
@@ -408,7 +428,8 @@ class IndexingRecord {
             const FieldIndexing& indexing = get_field_indexing(fieldId);
             return indexing.has_raw_data();
         }
-        return true;
+        // if this field id not in IndexingRecord or not build index, we should find raw data in InsertRecord instead of IndexingRecord.
+        return false;
     }
 
     // concurrent

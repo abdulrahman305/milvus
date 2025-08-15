@@ -15,13 +15,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-type deleteTaskByStreamingService struct {
-	*deleteTask
-}
-
 // Execute is a function to delete task by streaming service
 // we only overwrite the Execute function
-func (dt *deleteTaskByStreamingService) Execute(ctx context.Context) (err error) {
+func (dt *deleteTask) Execute(ctx context.Context) (err error) {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Delete-Execute")
 	defer sp.End()
 
@@ -49,6 +45,7 @@ func (dt *deleteTaskByStreamingService) Execute(ctx context.Context) (err error)
 			msg, err := message.NewDeleteMessageBuilderV1().
 				WithHeader(&message.DeleteMessageHeader{
 					CollectionId: dt.collectionID,
+					Rows:         uint64(deleteMsg.NumRows),
 				}).
 				WithBody(deleteMsg.DeleteRequest).
 				WithVChannel(vchannel).
@@ -68,7 +65,7 @@ func (dt *deleteTaskByStreamingService) Execute(ctx context.Context) (err error)
 		zap.Duration("prepare duration", dt.tr.RecordSpan()))
 
 	resp := streaming.WAL().AppendMessages(ctx, msgs...)
-	if resp.UnwrapFirstError(); err != nil {
+	if err := resp.UnwrapFirstError(); err != nil {
 		log.Ctx(ctx).Warn("append messages to wal failed", zap.Error(err))
 		return err
 	}

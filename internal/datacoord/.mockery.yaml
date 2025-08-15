@@ -8,9 +8,12 @@ dir: "{{.InterfaceDir}}"
 packages:
   github.com/milvus-io/milvus/internal/datacoord:
     interfaces:
-      compactionPlanContext:
+      trigger:
         config:
-          mockname: MockCompactionPlanContext
+          mockname: MockTrigger
+      CompactionInspector:
+        config:
+          mockname: MockCompactionInspector
       Handler:
         config:
           mockname: NMockHandler
@@ -29,6 +32,7 @@ packages:
       ChannelManager:
       SubCluster:
       StatsJobManager:
+      ImportMeta:
   github.com/milvus-io/milvus/internal/datacoord/allocator:
     interfaces:
       Allocator:
@@ -39,4 +43,9 @@ packages:
     interfaces:
       DataNodeManager:
       WorkerManager:
-      
+      Cluster:
+      NodeManager:
+  github.com/milvus-io/milvus/internal/datacoord/task:
+    interfaces:
+      GlobalScheduler:
+      Task:

@@ -31,6 +31,18 @@ func (m *messageImpl) Version() Version {
 
 // Payload returns payload of current message.
 func (m *messageImpl) Payload() []byte {
+	if ch := m.cipherHeader(); ch != nil {
+		cipher := mustGetCipher()
+		decryptor, err := cipher.GetDecryptor(ch.EzId, ch.CollectionId, ch.SafeKey)
+		if err != nil {
+			panic(fmt.Sprintf("can not get decryptor for message: %s", err))
+		}
+		payload, err := decryptor.Decrypt(m.payload)
+		if err != nil {
+			panic(fmt.Sprintf("can not decrypt message: %s", err))
+		}
+		return payload
+	}
 	return m.payload
 }
 
@@ -39,8 +51,25 @@ func (m *messageImpl) Properties() RProperties {
 	return m.properties
 }
 
+// IsPersisted returns true if the message is persisted.
+func (m *messageImpl) IsPersisted() bool {
+	return !m.properties.Exist(messageNotPersisteted)
+}
+
+// IntoMessageProto converts the message to a protobuf message.
+func (m *messageImpl) IntoMessageProto() *messagespb.Message {
+	return &messagespb.Message{
+		Payload:    m.payload,
+		Properties: m.properties.ToRawMap(),
+	}
+}
+
 // EstimateSize returns the estimated size of current message.
 func (m *messageImpl) EstimateSize() int {
+	if ch := m.cipherHeader(); ch != nil {
+		// if it's a cipher message, we need to estimate the size of payload before encryption.
+		return int(ch.PayloadBytes) + m.properties.EstimateSize()
+	}
 	// TODO: more accurate size estimation.
 	return len(m.payload) + m.properties.EstimateSize()
 }
@@ -73,6 +102,12 @@ func (m *messageImpl) WithTimeTick(tt uint64) MutableMessage {
 func (m *messageImpl) WithLastConfirmed(id MessageID) MutableMessage {
 	m.properties.Delete(messageLastConfirmedIDSameWithMessageID)
 	m.properties.Set(messageLastConfirmed, id.Marshal())
+	return m
+}
+
+// WithOldVersion sets the version of current message to be old version.
+func (m *messageImpl) WithOldVersion() MutableMessage {
+	m.properties.Set(messageVersion, VersionOld.String())
 	return m
 }
 
@@ -181,6 +216,9 @@ func (m *messageImpl) VChannel() string {
 // BroadcastHeader returns the broadcast header of current message.
 func (m *messageImpl) BroadcastHeader() *BroadcastHeader {
 	header := m.broadcastHeader()
+	if header == nil {
+		return nil
+	}
 	return newBroadcastHeaderFromProto(header)
 }
 
@@ -193,6 +231,19 @@ func (m *messageImpl) broadcastHeader() *messagespb.BroadcastHeader {
 	header := &messagespb.BroadcastHeader{}
 	if err := DecodeProto(value, header); err != nil {
 		panic("can not decode broadcast header")
+	}
+	return header
+}
+
+// cipherHeader returns the cipher header of current message.
+func (m *messageImpl) cipherHeader() *messagespb.CipherHeader {
+	value, ok := m.properties.Get(messageCipherHeader)
+	if !ok {
+		return nil
+	}
+	header := &messagespb.CipherHeader{}
+	if err := DecodeProto(value, header); err != nil {
+		panic("can not decode cipher header")
 	}
 	return header
 }

@@ -18,10 +18,10 @@ package index
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
@@ -32,6 +32,8 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks/flushcommon/mock_util"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -145,7 +147,7 @@ func (s *TaskStatsSuite) TestSortSegmentWithBM25() {
 			}
 			return result, nil
 		})
-		s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(fmt.Errorf("mock error")).Once()
+		s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(errors.New("mock error")).Once()
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -172,6 +174,27 @@ func (s *TaskStatsSuite) TestSortSegmentWithBM25() {
 		s.Require().NoError(err)
 		_, err = task.sort(ctx)
 		s.Error(err)
+	})
+}
+
+func (s *TaskStatsSuite) TestBuildIndexParams() {
+	s.Run("test storage v2 index params", func() {
+		req := &workerpb.CreateStatsRequest{
+			TaskID:                    1,
+			CollectionID:              2,
+			PartitionID:               3,
+			TargetSegmentID:           4,
+			TaskVersion:               5,
+			CurrentScalarIndexVersion: int32(1),
+			StorageVersion:            storage.StorageV2,
+			InsertLogs:                []*datapb.FieldBinlog{},
+			StorageConfig:             &indexpb.StorageConfig{RootPath: "/test/path"},
+		}
+
+		params := buildIndexParams(req, []string{"file1", "file2"}, nil, &indexcgopb.StorageConfig{}, 0)
+
+		s.Equal(storage.StorageV2, params.StorageVersion)
+		s.NotNil(params.SegmentInsertFiles)
 	})
 }
 

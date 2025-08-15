@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -91,10 +92,11 @@ func (s *StorageV1SerializerSuite) SetupSuite() {
 }
 
 func (s *StorageV1SerializerSuite) SetupTest() {
-	s.mockCache.EXPECT().Schema().Return(s.schema)
+	s.mockCache.EXPECT().GetSchema(mock.Anything).Return(s.schema).Maybe()
+	s.mockCache.EXPECT().Collection().Return(s.collectionID).Once()
 
 	var err error
-	s.serializer, err = NewStorageSerializer(s.mockCache)
+	s.serializer, err = NewStorageSerializer(s.mockCache, s.schema)
 	s.Require().NoError(err)
 }
 
@@ -253,8 +255,7 @@ func (s *StorageV1SerializerSuite) TestSerializeDelete() {
 
 func (s *StorageV1SerializerSuite) TestBadSchema() {
 	mockCache := metacache.NewMockMetaCache(s.T())
-	mockCache.EXPECT().Schema().Return(&schemapb.CollectionSchema{}).Once()
-	_, err := NewStorageSerializer(mockCache)
+	_, err := NewStorageSerializer(mockCache, &schemapb.CollectionSchema{})
 	s.Error(err)
 }
 

@@ -23,22 +23,34 @@
 #include "storage/azure-blob-storage/AzureBlobChunkManager.h"
 #include "storage/ChunkManager.h"
 #include "storage/Types.h"
+#include "log/Log.h"
 
 namespace milvus {
 namespace storage {
 
 template <typename... Args>
+static std::string
+AzureErrorMessage(const std::string& func,
+                  const std::exception& err,
+                  const std::string& fmt_string,
+                  Args&&... args) {
+    std::ostringstream oss;
+    const auto& message = fmt::format(fmt_string, std::forward<Args>(args)...);
+    oss << "Error in " << func << "[exception:" << err.what()
+        << ", params:" << message << "]";
+    return oss.str();
+}
 
+template <typename... Args>
 static SegcoreError
 ThrowAzureError(const std::string& func,
                 const std::exception& err,
-                const std::string& fmtString,
+                const std::string& fmt_string,
                 Args&&... args) {
-    std::ostringstream oss;
-    const auto& message = fmt::format(fmtString, std::forward<Args>(args)...);
-    oss << "Error in " << func << "[exception:" << err.what()
-        << ", params:" << message << "]";
-    throw SegcoreError(S3Error, oss.str());
+    std::string error_message =
+        AzureErrorMessage(func, err, fmt_string, args...);
+    LOG_WARN(error_message);
+    throw SegcoreError(S3Error, error_message);
 }
 
 void
@@ -70,7 +82,7 @@ class AzureChunkManager : public ChunkManager {
          uint64_t offset,
          void* buf,
          uint64_t len) {
-        PanicInfo(NotImplemented, GetName() + "Read with offset not implement");
+        ThrowInfo(NotImplemented, GetName() + "Read with offset not implement");
     }
 
     virtual void
@@ -78,7 +90,7 @@ class AzureChunkManager : public ChunkManager {
           uint64_t offset,
           void* buf,
           uint64_t len) {
-        PanicInfo(NotImplemented,
+        ThrowInfo(NotImplemented,
                   GetName() + "Write with offset not implement");
     }
 

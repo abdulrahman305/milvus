@@ -26,7 +26,8 @@ type RootCoordCatalog interface {
 	ListCollections(ctx context.Context, dbID int64, ts typeutil.Timestamp) ([]*model.Collection, error)
 	CollectionExists(ctx context.Context, dbID int64, collectionID typeutil.UniqueID, ts typeutil.Timestamp) bool
 	DropCollection(ctx context.Context, collectionInfo *model.Collection, ts typeutil.Timestamp) error
-	AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, alterType AlterType, ts typeutil.Timestamp) error
+	AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, alterType AlterType, ts typeutil.Timestamp, fieldModify bool) error
+	AlterCollectionDB(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts typeutil.Timestamp) error
 
 	CreatePartition(ctx context.Context, dbID int64, partition *model.Partition, ts typeutil.Timestamp) error
 	DropPartition(ctx context.Context, dbID int64, collectionID typeutil.UniqueID, partitionID typeutil.UniqueID, ts typeutil.Timestamp) error
@@ -179,6 +180,11 @@ type DataCoordCatalog interface {
 	ListStatsTasks(ctx context.Context) ([]*indexpb.StatsTask, error)
 	SaveStatsTask(ctx context.Context, task *indexpb.StatsTask) error
 	DropStatsTask(ctx context.Context, taskID typeutil.UniqueID) error
+
+	// Analyzer Resource
+	SaveFileResource(ctx context.Context, resource *model.FileResource) error
+	RemoveFileResource(ctx context.Context, resourceID int64) error
+	ListFileResource(ctx context.Context) ([]*model.FileResource, error)
 }
 
 type QueryCoordCatalog interface {
@@ -203,6 +209,12 @@ type QueryCoordCatalog interface {
 
 // StreamingCoordCataLog is the interface for streamingcoord catalog
 type StreamingCoordCataLog interface {
+	// GetVersion get the streaming version from metastore.
+	GetVersion(ctx context.Context) (*streamingpb.StreamingVersion, error)
+
+	// SaveVersion save the streaming version to metastore.
+	SaveVersion(ctx context.Context, version *streamingpb.StreamingVersion) error
+
 	// physical channel watch related
 
 	// ListPChannel list all pchannels on milvus.
@@ -226,11 +238,17 @@ type StreamingNodeCataLog interface {
 	// WAL select the wal related recovery infos.
 	// Which must give the pchannel name.
 
+	// ListVChannel list all vchannels on current pchannel.
+	ListVChannel(ctx context.Context, pchannelName string) ([]*streamingpb.VChannelMeta, error)
+
+	// SaveVChannels save vchannel on current pchannel.
+	SaveVChannels(ctx context.Context, pchannelName string, vchannels map[string]*streamingpb.VChannelMeta) error
+
 	// ListSegmentAssignment list all segment assignments for the wal.
 	ListSegmentAssignment(ctx context.Context, pChannelName string) ([]*streamingpb.SegmentAssignmentMeta, error)
 
 	// SaveSegmentAssignments save the segment assignments for the wal.
-	SaveSegmentAssignments(ctx context.Context, pChannelName string, infos []*streamingpb.SegmentAssignmentMeta) error
+	SaveSegmentAssignments(ctx context.Context, pChannelName string, infos map[int64]*streamingpb.SegmentAssignmentMeta) error
 
 	// GetConsumeCheckpoint gets the consuming checkpoint of the wal.
 	// Return nil, nil if the checkpoint is not exist.

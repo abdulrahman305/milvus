@@ -49,7 +49,7 @@ func TestNextID(t *testing.T) {
 		i++
 		return rt, nil
 	}
-	bw := NewBulkPackWriter(nil, nil, al)
+	bw := NewBulkPackWriter(nil, nil, nil, al)
 	bw.prefetchIDs(new(SyncPack).WithFlush())
 
 	t.Run("normal_next", func(t *testing.T) {
@@ -96,7 +96,7 @@ func TestBulkPackWriter_Write(t *testing.T) {
 
 	mc := metacache.NewMockMetaCache(t)
 	mc.EXPECT().Collection().Return(collectionID).Maybe()
-	mc.EXPECT().Schema().Return(schema).Maybe()
+	mc.EXPECT().GetSchema(mock.Anything).Return(schema).Maybe()
 	mc.EXPECT().GetSegmentByID(segmentID).Return(seg, true).Maybe()
 	mc.EXPECT().GetSegmentsBy(mock.Anything, mock.Anything).Return([]*metacache.SegmentInfo{seg}).Maybe()
 	mc.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Run(func(action metacache.SegmentAction, filters ...metacache.SegmentFilter) {
@@ -116,6 +116,7 @@ func TestBulkPackWriter_Write(t *testing.T) {
 
 	bw := &BulkPackWriter{
 		metaCache:    mc,
+		schema:       schema,
 		chunkManager: cm,
 		allocator:    allocator.NewLocalAllocator(10000, 100000),
 	}
@@ -151,7 +152,7 @@ func TestBulkPackWriter_Write(t *testing.T) {
 						EntriesNum: 10,
 						LogPath:    "files/delta_log/123/456/789/10000",
 						LogSize:    592,
-						MemorySize: 283,
+						MemorySize: 327,
 					},
 				},
 			},

@@ -20,16 +20,17 @@ package function
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/credentials"
 )
 
 func TestTEITextEmbeddingProvider(t *testing.T) {
@@ -68,17 +69,17 @@ func createTEIProvider(url string, schema *schemapb.FieldSchema, providerName st
 		InputFieldIds:    []int64{101},
 		OutputFieldIds:   []int64{102},
 		Params: []*commonpb.KeyValuePair{
-			{Key: apiKeyParamKey, Value: "mock"},
-			{Key: endpointParamKey, Value: url},
+			{Key: credentialParamKey, Value: "mock"},
+			{Key: EndpointParamKey, Value: url},
 			{Key: ingestionPromptParamKey, Value: "doc:"},
 			{Key: searchPromptParamKey, Value: "query:"},
 		},
 	}
 	switch providerName {
 	case teiProvider:
-		return NewTEIEmbeddingProvider(schema, functionSchema)
+		return NewTEIEmbeddingProvider(schema, functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	default:
-		return nil, fmt.Errorf("Unknow provider")
+		return nil, errors.New("Unknow provider")
 	}
 }
 
@@ -153,8 +154,8 @@ func (s *TEITextEmbeddingProviderSuite) TestCreateTEIEmbeddingClient() {
 	_, err = createTEIEmbeddingClient("", "http://mymock.com")
 	s.NoError(err)
 
-	os.Setenv(enableTeiEnvStr, "false")
-	defer os.Unsetenv(enableTeiEnvStr)
+	os.Setenv(EnableTeiEnvStr, "false")
+	defer os.Unsetenv(EnableTeiEnvStr)
 	_, err = createTEIEmbeddingClient("", "http://mymock.com")
 	s.Error(err)
 }
@@ -168,11 +169,11 @@ func (s *TEITextEmbeddingProviderSuite) TestNewTEIEmbeddingProvider() {
 		InputFieldIds:    []int64{101},
 		OutputFieldIds:   []int64{102},
 		Params: []*commonpb.KeyValuePair{
-			{Key: apiKeyParamKey, Value: "mock"},
-			{Key: endpointParamKey, Value: "http://mymock.com"},
+			{Key: credentialParamKey, Value: "mock"},
+			{Key: EndpointParamKey, Value: "http://mymock.com"},
 		},
 	}
-	provider, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+	provider, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 	s.NoError(err)
 	s.Equal(provider.FieldDim(), int64(4))
 	s.True(provider.MaxBatch() == 32*5)
@@ -180,35 +181,35 @@ func (s *TEITextEmbeddingProviderSuite) TestNewTEIEmbeddingProvider() {
 	// Invalid truncate
 	{
 		functionSchema.Params = append(functionSchema.Params, &commonpb.KeyValuePair{Key: truncateParamKey, Value: "Invalid"})
-		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 		s.Error(err)
 	}
 	// Invalid truncationDirection
 	{
 		functionSchema.Params[2] = &commonpb.KeyValuePair{Key: truncateParamKey, Value: "true"}
 		functionSchema.Params = append(functionSchema.Params, &commonpb.KeyValuePair{Key: truncationDirectionParamKey, Value: "Invalid"})
-		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 		s.Error(err)
 	}
 
 	// truncationDirection
 	{
 		functionSchema.Params[3] = &commonpb.KeyValuePair{Key: truncationDirectionParamKey, Value: "Left"}
-		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 		s.NoError(err)
 	}
 
 	// Invalid max batch
 	{
 		functionSchema.Params = append(functionSchema.Params, &commonpb.KeyValuePair{Key: maxClientBatchSizeParamKey, Value: "Invalid"})
-		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+		_, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 		s.Error(err)
 	}
 
 	// Valid max batch
 	{
 		functionSchema.Params[4] = &commonpb.KeyValuePair{Key: maxClientBatchSizeParamKey, Value: "128"}
-		pv, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema)
+		pv, err := NewTEIEmbeddingProvider(s.schema.Fields[2], functionSchema, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
 		s.NoError(err)
 		s.True(pv.MaxBatch() == 128*5)
 	}

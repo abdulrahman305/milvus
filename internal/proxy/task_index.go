@@ -32,7 +32,6 @@ import (
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
@@ -59,13 +58,10 @@ const (
 type createIndexTask struct {
 	baseTask
 	Condition
-	req       *milvuspb.CreateIndexRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	datacoord types.DataCoordClient
-	result    *commonpb.Status
-
-	replicateMsgStream msgstream.MsgStream
+	req      *milvuspb.CreateIndexRequest
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
 	isAutoIndex    bool
 	newIndexParams []*commonpb.KeyValuePair
@@ -139,7 +135,7 @@ func (cit *createIndexTask) parseFunctionParamsToIndex(indexParamsMap map[string
 
 	switch cit.functionSchema.GetType() {
 	case schemapb.FunctionType_Unknown:
-		return fmt.Errorf("unknown function type encountered")
+		return errors.New("unknown function type encountered")
 
 	case schemapb.FunctionType_BM25:
 		// set default BM25 params if not provided in index params
@@ -180,7 +176,7 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 			return merr.WrapErrParameterInvalidMsg("duplicated index param (key=%s) (value=%s) found", kv.GetKey(), kv.GetValue())
 		}
 		keys.Insert(kv.GetKey())
-		if kv.Key == common.IndexParamsKey {
+		if kv.Key == common.ParamsKey {
 			params, err := funcutil.JSONToMap(kv.Value)
 			if err != nil {
 				return err
@@ -191,6 +187,13 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 		} else {
 			indexParamsMap[kv.Key] = kv.Value
 		}
+	}
+
+	if jsonCastType, exist := indexParamsMap[common.JSONCastTypeKey]; exist {
+		indexParamsMap[common.JSONCastTypeKey] = strings.ToUpper(strings.TrimSpace(jsonCastType))
+	}
+	if jsonCastFunction, exist := indexParamsMap[common.JSONCastFunctionKey]; exist {
+		indexParamsMap[common.JSONCastFunctionKey] = strings.ToUpper(strings.TrimSpace(jsonCastFunction))
 	}
 
 	if err := ValidateAutoIndexMmapConfig(isVecIndex, indexParamsMap); err != nil {
@@ -233,6 +236,8 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 					return getPrimitiveIndexType(dataType), nil
 				} else if typeutil.IsArrayType(dataType) {
 					return getPrimitiveIndexType(cit.fieldSchema.ElementType), nil
+				} else if typeutil.IsJSONType(dataType) {
+					return Params.AutoIndexConfig.ScalarJSONIndexType.GetValue(), nil
 				}
 				return "", fmt.Errorf("create auto index on type:%s is not supported", dataType.String())
 			}()
@@ -302,12 +307,12 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 				metricType, metricTypeExist := indexParamsMap[common.MetricTypeKey]
 
 				if len(indexParamsMap) > numberParams+1 {
-					return fmt.Errorf("only metric type can be passed when use AutoIndex")
+					return errors.New("only metric type can be passed when use AutoIndex")
 				}
 
 				if len(indexParamsMap) == numberParams+1 {
 					if !metricTypeExist {
-						return fmt.Errorf("only metric type can be passed when use AutoIndex")
+						return errors.New("only metric type can be passed when use AutoIndex")
 					}
 
 					// only metric type is passed.
@@ -353,7 +358,7 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 
 		indexType, exist := indexParamsMap[common.IndexTypeKey]
 		if !exist {
-			return fmt.Errorf("IndexType not specified")
+			return errors.New("IndexType not specified")
 		}
 		//  index parameters defined in the YAML file are merged with the user-provided parameters during create stage
 		if Params.KnowhereConfig.Enable.GetAsBool() {
@@ -392,6 +397,13 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 			if !funcutil.SliceContain(indexparamcheck.IntVectorMetrics, metricType) {
 				return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "int vector index does not support metric type: "+metricType)
 			}
+		}
+	}
+
+	// auto fill json path with field name if not specified for json index
+	if typeutil.IsJSONType(cit.fieldSchema.DataType) {
+		if _, exist := indexParamsMap[common.JSONPathKey]; !exist {
+			indexParamsMap[common.JSONPathKey] = cit.req.FieldName
 		}
 	}
 
@@ -459,7 +471,7 @@ func fillDimension(field *schemapb.FieldSchema, indexParams map[string]string) e
 	params = append(params, field.GetIndexParams()...)
 	dimensionInSchema, err := funcutil.GetAttrByKeyFromRepeatedKV(DimKey, params)
 	if err != nil {
-		return fmt.Errorf("dimension not found in schema")
+		return errors.New("dimension not found in schema")
 	}
 	dimension, exist := indexParams[DimKey]
 	if exist {
@@ -561,11 +573,10 @@ func (cit *createIndexTask) Execute(ctx context.Context) error {
 		Timestamp:                        cit.BeginTs(),
 		UserAutoindexMetricTypeSpecified: cit.userAutoIndexMetricTypeSpecified,
 	}
-	cit.result, err = cit.datacoord.CreateIndex(ctx, req)
+	cit.result, err = cit.mixCoord.CreateIndex(ctx, req)
 	if err = merr.CheckRPCCall(cit.result, err); err != nil {
 		return err
 	}
-	SendReplicateMessagePack(ctx, cit.replicateMsgStream, cit.req)
 	return nil
 }
 
@@ -576,13 +587,10 @@ func (cit *createIndexTask) PostExecute(ctx context.Context) error {
 type alterIndexTask struct {
 	baseTask
 	Condition
-	req        *milvuspb.AlterIndexRequest
-	ctx        context.Context
-	datacoord  types.DataCoordClient
-	querycoord types.QueryCoordClient
-	result     *commonpb.Status
-
-	replicateMsgStream msgstream.MsgStream
+	req      *milvuspb.AlterIndexRequest
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
 	collectionID UniqueID
 }
@@ -659,17 +667,13 @@ func (t *alterIndexTask) PreExecute(ctx context.Context) error {
 		return merr.WrapErrParameterInvalidMsg("index name is empty")
 	}
 
-	if err = validateIndexName(t.req.GetIndexName()); err != nil {
-		return err
-	}
-
 	// TODO fubang should implement it when the alter index is reconstructed
 	// typeParams := funcutil.KeyValuePair2Map(t.req.GetExtraParams())
 	// if err = ValidateAutoIndexMmapConfig(typeParams); err != nil {
 	// 	return err
 	// }
 
-	loaded, err := isCollectionLoaded(ctx, t.querycoord, collection)
+	loaded, err := isCollectionLoaded(ctx, t.mixCoord, collection)
 	if err != nil {
 		return err
 	}
@@ -697,11 +701,10 @@ func (t *alterIndexTask) Execute(ctx context.Context) error {
 		Params:       t.req.GetExtraParams(),
 		DeleteKeys:   t.req.GetDeleteKeys(),
 	}
-	t.result, err = t.datacoord.AlterIndex(ctx, req)
+	t.result, err = t.mixCoord.AlterIndex(ctx, req)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
 	}
-	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.req)
 	return nil
 }
 
@@ -713,9 +716,9 @@ type describeIndexTask struct {
 	baseTask
 	Condition
 	*milvuspb.DescribeIndexRequest
-	ctx       context.Context
-	datacoord types.DataCoordClient
-	result    *milvuspb.DescribeIndexResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.DescribeIndexResponse
 
 	collectionID UniqueID
 }
@@ -779,7 +782,7 @@ func (dit *describeIndexTask) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to get collection schema: %s", err)
 	}
 
-	resp, err := dit.datacoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{CollectionID: dit.collectionID, IndexName: dit.IndexName, Timestamp: dit.Timestamp})
+	resp, err := dit.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{CollectionID: dit.collectionID, IndexName: dit.IndexName, Timestamp: dit.Timestamp})
 	if err != nil {
 		return err
 	}
@@ -836,6 +839,8 @@ func (dit *describeIndexTask) Execute(ctx context.Context) error {
 			PendingIndexRows:     indexInfo.GetPendingIndexRows(),
 			State:                indexInfo.GetState(),
 			IndexStateFailReason: indexInfo.GetIndexStateFailReason(),
+			MinIndexVersion:      indexInfo.GetMinIndexVersion(),
+			MaxIndexVersion:      indexInfo.GetMaxIndexVersion(),
 		}
 		dit.result.IndexDescriptions = append(dit.result.IndexDescriptions, desc)
 	}
@@ -850,9 +855,9 @@ type getIndexStatisticsTask struct {
 	baseTask
 	Condition
 	*milvuspb.GetIndexStatisticsRequest
-	ctx       context.Context
-	datacoord types.DataCoordClient
-	result    *milvuspb.GetIndexStatisticsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.GetIndexStatisticsResponse
 
 	nodeID       int64
 	collectionID UniqueID
@@ -918,7 +923,7 @@ func (dit *getIndexStatisticsTask) Execute(ctx context.Context) error {
 	}
 	schemaHelper := schema.schemaHelper
 
-	resp, err := dit.datacoord.GetIndexStatistics(ctx, &indexpb.GetIndexStatisticsRequest{
+	resp, err := dit.mixCoord.GetIndexStatistics(ctx, &indexpb.GetIndexStatisticsRequest{
 		CollectionID: dit.collectionID, IndexName: dit.IndexName,
 	})
 	if err := merr.CheckRPCCall(resp, err); err != nil {
@@ -945,6 +950,8 @@ func (dit *getIndexStatisticsTask) Execute(ctx context.Context) error {
 			TotalRows:            indexInfo.GetTotalRows(),
 			State:                indexInfo.GetState(),
 			IndexStateFailReason: indexInfo.GetIndexStateFailReason(),
+			MinIndexVersion:      indexInfo.GetMinIndexVersion(),
+			MaxIndexVersion:      indexInfo.GetMaxIndexVersion(),
 		}
 		dit.result.IndexDescriptions = append(dit.result.IndexDescriptions, desc)
 	}
@@ -960,13 +967,10 @@ type dropIndexTask struct {
 	Condition
 	ctx context.Context
 	*milvuspb.DropIndexRequest
-	dataCoord  types.DataCoordClient
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
 	collectionID UniqueID
-
-	replicateMsgStream msgstream.MsgStream
 }
 
 func (dit *dropIndexTask) TraceCtx() context.Context {
@@ -1029,7 +1033,7 @@ func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
 	}
 	dit.collectionID = collID
 
-	loaded, err := isCollectionLoaded(ctx, dit.queryCoord, collID)
+	loaded, err := isCollectionLoaded(ctx, dit.mixCoord, collID)
 	if err != nil {
 		return err
 	}
@@ -1050,7 +1054,7 @@ func (dit *dropIndexTask) Execute(ctx context.Context) error {
 	)
 
 	var err error
-	dit.result, err = dit.dataCoord.DropIndex(ctx, &indexpb.DropIndexRequest{
+	dit.result, err = dit.mixCoord.DropIndex(ctx, &indexpb.DropIndexRequest{
 		CollectionID: dit.collectionID,
 		PartitionIDs: nil,
 		IndexName:    dit.IndexName,
@@ -1060,7 +1064,6 @@ func (dit *dropIndexTask) Execute(ctx context.Context) error {
 		ctxLog.Warn("drop index failed", zap.Error(err))
 		return err
 	}
-	SendReplicateMessagePack(ctx, dit.replicateMsgStream, dit.DropIndexRequest)
 	return nil
 }
 
@@ -1073,10 +1076,9 @@ type getIndexBuildProgressTask struct {
 	baseTask
 	Condition
 	*milvuspb.GetIndexBuildProgressRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	dataCoord types.DataCoordClient
-	result    *milvuspb.GetIndexBuildProgressResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.GetIndexBuildProgressResponse
 
 	collectionID UniqueID
 }
@@ -1136,7 +1138,7 @@ func (gibpt *getIndexBuildProgressTask) Execute(ctx context.Context) error {
 	}
 	gibpt.collectionID = collectionID
 
-	resp, err := gibpt.dataCoord.GetIndexBuildProgress(ctx, &indexpb.GetIndexBuildProgressRequest{
+	resp, err := gibpt.mixCoord.GetIndexBuildProgress(ctx, &indexpb.GetIndexBuildProgressRequest{
 		CollectionID: collectionID,
 		IndexName:    gibpt.IndexName,
 	})
@@ -1162,10 +1164,9 @@ type getIndexStateTask struct {
 	baseTask
 	Condition
 	*milvuspb.GetIndexStateRequest
-	ctx       context.Context
-	dataCoord types.DataCoordClient
-	rootCoord types.RootCoordClient
-	result    *milvuspb.GetIndexStateResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.GetIndexStateResponse
 
 	collectionID UniqueID
 }
@@ -1223,7 +1224,7 @@ func (gist *getIndexStateTask) Execute(ctx context.Context) error {
 		return err
 	}
 
-	state, err := gist.dataCoord.GetIndexState(ctx, &indexpb.GetIndexStateRequest{
+	state, err := gist.mixCoord.GetIndexState(ctx, &indexpb.GetIndexStateRequest{
 		CollectionID: collectionID,
 		IndexName:    gist.IndexName,
 	})

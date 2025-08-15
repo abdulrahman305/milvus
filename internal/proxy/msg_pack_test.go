@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -29,9 +28,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
@@ -47,25 +44,19 @@ func TestRepackInsertData(t *testing.T) {
 
 	ctx := context.Background()
 
-	rc := NewRootCoordMock()
-	defer rc.Close()
+	mix := NewMixCoordMock()
+	defer mix.Close()
 
 	cache := NewMockCache(t)
-	cache.On("GetPartitionID",
-		mock.Anything, // context.Context
-		mock.AnythingOfType("string"),
-		mock.AnythingOfType("string"),
-		mock.AnythingOfType("string"),
-	).Return(int64(1), nil)
 	globalMetaCache = cache
 
-	idAllocator, err := allocator.NewIDAllocator(ctx, rc, paramtable.GetNodeID())
+	idAllocator, err := allocator.NewIDAllocator(ctx, mix, paramtable.GetNodeID())
 	assert.NoError(t, err)
 	_ = idAllocator.Start()
 	defer idAllocator.Close()
 
 	t.Run("create collection", func(t *testing.T) {
-		resp, err := rc.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		resp, err := mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
 			CollectionName: collectionName,
@@ -73,7 +64,7 @@ func TestRepackInsertData(t *testing.T) {
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 		assert.NoError(t, err)
 
-		resp, err = rc.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
+		resp, err = mix.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_CreatePartition,
 				MsgID:     0,
@@ -115,33 +106,6 @@ func TestRepackInsertData(t *testing.T) {
 	for index := range insertMsg.RowIDs {
 		insertMsg.RowIDs[index] = int64(index)
 	}
-
-	ids, err := parsePrimaryFieldData2IDs(fieldData)
-	assert.NoError(t, err)
-	result := &milvuspb.MutationResult{
-		IDs: ids,
-	}
-
-	t.Run("assign segmentID failed", func(t *testing.T) {
-		fakeSegAllocator, err := newSegIDAssigner(ctx, &mockDataCoord2{expireTime: Timestamp(2500)}, getLastTick1)
-		assert.NoError(t, err)
-		_ = fakeSegAllocator.Start()
-		defer fakeSegAllocator.Close()
-
-		_, err = repackInsertData(ctx, []string{"test_dml_channel"}, insertMsg,
-			result, idAllocator, fakeSegAllocator)
-		assert.Error(t, err)
-	})
-
-	segAllocator, err := newSegIDAssigner(ctx, &mockDataCoord{expireTime: Timestamp(2500)}, getLastTick1)
-	assert.NoError(t, err)
-	_ = segAllocator.Start()
-	defer segAllocator.Close()
-
-	t.Run("repack insert data success", func(t *testing.T) {
-		_, err = repackInsertData(ctx, []string{"test_dml_channel"}, insertMsg, result, idAllocator, segAllocator)
-		assert.NoError(t, err)
-	})
 }
 
 func TestRepackInsertDataWithPartitionKey(t *testing.T) {
@@ -153,23 +117,15 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 	ctx := context.Background()
 	dbName := GetCurDBNameFromContextOrDefault(ctx)
 
-	rc := NewRootCoordMock()
-	defer rc.Close()
-	qc := &mocks.MockQueryCoordClient{}
-	qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{}, nil).Maybe()
+	mix := NewMixCoordMock()
 
-	err := InitMetaCache(ctx, rc, qc, nil)
+	err := InitMetaCache(ctx, mix, nil)
 	assert.NoError(t, err)
 
-	idAllocator, err := allocator.NewIDAllocator(ctx, rc, paramtable.GetNodeID())
+	idAllocator, err := allocator.NewIDAllocator(ctx, mix, paramtable.GetNodeID())
 	assert.NoError(t, err)
 	_ = idAllocator.Start()
 	defer idAllocator.Close()
-
-	segAllocator, err := newSegIDAssigner(ctx, &mockDataCoord{expireTime: Timestamp(2500)}, getLastTick1)
-	assert.NoError(t, err)
-	_ = segAllocator.Start()
-	defer segAllocator.Close()
 
 	fieldName2Types := map[string]schemapb.DataType{
 		testInt64Field:    schemapb.DataType_Int64,
@@ -182,7 +138,7 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 		marshaledSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
 
-		resp, err := rc.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		resp, err := mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
 			CollectionName: collectionName,
@@ -226,17 +182,4 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 	for index := range insertMsg.RowIDs {
 		insertMsg.RowIDs[index] = int64(index)
 	}
-
-	ids, err := parsePrimaryFieldData2IDs(fieldNameToDatas[testInt64Field])
-	assert.NoError(t, err)
-	result := &milvuspb.MutationResult{
-		IDs: ids,
-	}
-
-	t.Run("repack insert data success", func(t *testing.T) {
-		partitionKeys := generateFieldData(schemapb.DataType_VarChar, testVarCharField, nb)
-		_, err = repackInsertDataWithPartitionKey(ctx, []string{"test_dml_channel"}, partitionKeys,
-			insertMsg, result, idAllocator, segAllocator)
-		assert.NoError(t, err)
-	})
 }

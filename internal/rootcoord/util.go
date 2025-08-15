@@ -19,6 +19,7 @@ package rootcoord
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
@@ -34,6 +36,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -230,13 +233,13 @@ func getRateLimitConfig(properties map[string]string, configKey string, configVa
 	return configValue
 }
 
-func getQueryCoordMetrics(ctx context.Context, queryCoord types.QueryCoordClient) (*metricsinfo.QueryCoordTopology, error) {
+func getQueryCoordMetrics(ctx context.Context, mixCoord types.MixCoord) (*metricsinfo.QueryCoordTopology, error) {
 	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
 	if err != nil {
 		return nil, err
 	}
 
-	rsp, err := queryCoord.GetMetrics(ctx, req)
+	rsp, err := mixCoord.GetQcMetrics(ctx, req)
 	if err = merr.CheckRPCCall(rsp, err); err != nil {
 		return nil, err
 	}
@@ -248,13 +251,13 @@ func getQueryCoordMetrics(ctx context.Context, queryCoord types.QueryCoordClient
 	return queryCoordTopology, nil
 }
 
-func getDataCoordMetrics(ctx context.Context, dataCoord types.DataCoordClient) (*metricsinfo.DataCoordTopology, error) {
+func getDataCoordMetrics(ctx context.Context, mixCoord types.MixCoord) (*metricsinfo.DataCoordTopology, error) {
 	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
 	if err != nil {
 		return nil, err
 	}
 
-	rsp, err := dataCoord.GetMetrics(ctx, req)
+	rsp, err := mixCoord.GetDcMetrics(ctx, req)
 	if err = merr.CheckRPCCall(rsp, err); err != nil {
 		return nil, err
 	}
@@ -285,7 +288,7 @@ func getProxyMetrics(ctx context.Context, proxies proxyutil.ProxyClientManagerIn
 	return ret, nil
 }
 
-func CheckTimeTickLagExceeded(ctx context.Context, queryCoord types.QueryCoordClient, dataCoord types.DataCoordClient, maxDelay time.Duration) error {
+func CheckTimeTickLagExceeded(ctx context.Context, mixcoord types.MixCoord, maxDelay time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, GetMetricsTimeout)
 	defer cancel()
 
@@ -295,7 +298,7 @@ func CheckTimeTickLagExceeded(ctx context.Context, queryCoord types.QueryCoordCl
 	dataNodeTTDelay := typeutil.NewConcurrentMap[string, time.Duration]()
 
 	group.Go(func() error {
-		queryCoordTopology, err := getQueryCoordMetrics(ctx, queryCoord)
+		queryCoordTopology, err := getQueryCoordMetrics(ctx, mixcoord)
 		if err != nil {
 			return err
 		}
@@ -318,7 +321,7 @@ func CheckTimeTickLagExceeded(ctx context.Context, queryCoord types.QueryCoordCl
 
 	// get Data cluster metrics
 	group.Go(func() error {
-		dataCoordTopology, err := getDataCoordMetrics(ctx, dataCoord)
+		dataCoordTopology, err := getDataCoordMetrics(ctx, mixcoord)
 		if err != nil {
 			return err
 		}
@@ -376,5 +379,169 @@ func CheckTimeTickLagExceeded(ctx context.Context, queryCoord types.QueryCoordCl
 		return fmt.Errorf("max timetick lag execced threhold: %s", errStr)
 	}
 
+	return nil
+}
+
+func checkFieldSchema(fieldSchemas []*schemapb.FieldSchema) error {
+	for _, fieldSchema := range fieldSchemas {
+		if fieldSchema.GetDataType() == schemapb.DataType_ArrayOfStruct {
+			msg := fmt.Sprintf("Invalid field type, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetDataType() == schemapb.DataType_ArrayOfVector {
+			msg := fmt.Sprintf("ArrayOfVector is only supported in struct array field, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetNullable() && typeutil.IsVectorType(fieldSchema.GetDataType()) {
+			msg := fmt.Sprintf("vector type not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetNullable() && fieldSchema.IsPrimaryKey {
+			msg := fmt.Sprintf("primary field not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetDefaultValue() != nil {
+			if fieldSchema.IsPrimaryKey {
+				msg := fmt.Sprintf("primary field not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			dtype := fieldSchema.GetDataType()
+			if dtype == schemapb.DataType_Array || dtype == schemapb.DataType_JSON || typeutil.IsVectorType(dtype) {
+				msg := fmt.Sprintf("type not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			errTypeMismatch := func(fieldName, fieldType, defaultValueType string) error {
+				msg := fmt.Sprintf("type (%s) of field (%s) is not equal to the type(%s) of default_value", fieldType, fieldName, defaultValueType)
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			switch fieldSchema.GetDefaultValue().Data.(type) {
+			case *schemapb.ValueField_BoolData:
+				if dtype != schemapb.DataType_Bool {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Bool")
+				}
+			case *schemapb.ValueField_IntData:
+				if dtype != schemapb.DataType_Int32 && dtype != schemapb.DataType_Int16 && dtype != schemapb.DataType_Int8 {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int")
+				}
+				defaultValue := fieldSchema.GetDefaultValue().GetIntData()
+				if dtype == schemapb.DataType_Int16 {
+					if defaultValue > math.MaxInt16 || defaultValue < math.MinInt16 {
+						return merr.WrapErrParameterInvalidRange(math.MinInt16, math.MaxInt16, defaultValue, "default value out of range")
+					}
+				}
+				if dtype == schemapb.DataType_Int8 {
+					if defaultValue > math.MaxInt8 || defaultValue < math.MinInt8 {
+						return merr.WrapErrParameterInvalidRange(math.MinInt8, math.MaxInt8, defaultValue, "default value out of range")
+					}
+				}
+			case *schemapb.ValueField_LongData:
+				if dtype != schemapb.DataType_Int64 {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int64")
+				}
+			case *schemapb.ValueField_FloatData:
+				if dtype != schemapb.DataType_Float {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Float")
+				}
+			case *schemapb.ValueField_DoubleData:
+				if dtype != schemapb.DataType_Double {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Double")
+				}
+			case *schemapb.ValueField_StringData:
+				if dtype != schemapb.DataType_VarChar {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_VarChar")
+				}
+				maxLength, err := parameterutil.GetMaxLength(fieldSchema)
+				if err != nil {
+					return err
+				}
+				defaultValueLength := len(fieldSchema.GetDefaultValue().GetStringData())
+				if int64(defaultValueLength) > maxLength {
+					msg := fmt.Sprintf("the length (%d) of string exceeds max length (%d)", defaultValueLength, maxLength)
+					return merr.WrapErrParameterInvalid("valid length string", "string length exceeds max length", msg)
+				}
+			default:
+				panic("default value unsupport data type")
+			}
+		}
+		if err := checkDupKvPairs(fieldSchema.GetTypeParams(), "type"); err != nil {
+			return err
+		}
+		if err := checkDupKvPairs(fieldSchema.GetIndexParams(), "index"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func checkStructArrayFieldSchema(schemas []*schemapb.StructArrayFieldSchema) error {
+	for _, schema := range schemas {
+		// todo(SpadeA): check struct array field schema
+
+		for _, field := range schema.GetFields() {
+			if field.IsPartitionKey || field.IsPrimaryKey {
+				msg := fmt.Sprintf("partition key or primary key can not be in struct array field. data type:%s, element type:%s, name:%s",
+					field.DataType.String(), field.ElementType.String(), field.Name)
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			if field.GetNullable() && typeutil.IsVectorType(field.ElementType) {
+				msg := fmt.Sprintf("vector type not support null, data type:%s, element type:%s, name:%s",
+					field.DataType.String(), field.ElementType.String(), field.Name)
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			if field.GetDefaultValue() != nil {
+				msg := fmt.Sprintf("fields in struct array field not support default_value, data type:%s, element type:%s, name:%s",
+					field.DataType.String(), field.ElementType.String(), field.Name)
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			if err := checkDupKvPairs(field.GetTypeParams(), "type"); err != nil {
+				return err
+			}
+			if err := checkDupKvPairs(field.GetIndexParams(), "index"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func checkDupKvPairs(params []*commonpb.KeyValuePair, paramType string) error {
+	set := typeutil.NewSet[string]()
+	for _, kv := range params {
+		if set.Contain(kv.GetKey()) {
+			return merr.WrapErrParameterInvalidMsg("duplicated %s param key \"%s\"", paramType, kv.GetKey())
+		}
+		set.Insert(kv.GetKey())
+	}
+	return nil
+}
+
+func validateFieldDataType(fieldSchemas []*schemapb.FieldSchema) error {
+	for _, field := range fieldSchemas {
+		if _, ok := schemapb.DataType_name[int32(field.GetDataType())]; !ok || field.GetDataType() == schemapb.DataType_None {
+			return merr.WrapErrParameterInvalid("Invalid field", fmt.Sprintf("field data type: %s is not supported", field.GetDataType()))
+		}
+	}
+	return nil
+}
+
+func validateStructArrayFieldDataType(fieldSchemas []*schemapb.StructArrayFieldSchema) error {
+	for _, field := range fieldSchemas {
+		if len(field.Fields) == 0 {
+			return merr.WrapErrParameterInvalid("Invalid field", "empty fields in StructArrayField")
+		}
+		for _, subField := range field.GetFields() {
+			if subField.GetDataType() != schemapb.DataType_Array && subField.GetDataType() != schemapb.DataType_ArrayOfVector {
+				return fmt.Errorf("Fields in StructArrayField can only be array or array of vector, but field %s is %s", subField.Name, subField.DataType.String())
+			}
+			if subField.GetElementType() == schemapb.DataType_ArrayOfStruct || subField.GetElementType() == schemapb.DataType_ArrayOfVector ||
+				subField.GetElementType() == schemapb.DataType_Array {
+				return fmt.Errorf("Nested array is not supported %s", subField.Name)
+			}
+			if _, ok := schemapb.DataType_name[int32(subField.GetElementType())]; !ok || subField.GetElementType() == schemapb.DataType_None {
+				return merr.WrapErrParameterInvalid("Invalid field", fmt.Sprintf("field data type: %s is not supported", subField.GetElementType()))
+			}
+		}
+	}
 	return nil
 }

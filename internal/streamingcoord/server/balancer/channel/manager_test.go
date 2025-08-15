@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -12,15 +13,22 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/resource"
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestChannelManager(t *testing.T) {
+	ResetStaticPChannelStatsManager()
+	RecoverPChannelStatsManager([]string{})
+
 	catalog := mock_metastore.NewMockStreamingCoordCataLog(t)
 	resource.InitForTest(resource.OptStreamingCatalog(catalog))
 
 	ctx := context.Background()
 	// Test recover failure.
+	catalog.EXPECT().GetVersion(mock.Anything).Return(&streamingpb.StreamingVersion{
+		Version: 1,
+	}, nil)
 	catalog.EXPECT().ListPChannel(mock.Anything).Return(nil, errors.New("recover failure"))
 	m, err := RecoverChannelManager(ctx)
 	assert.Nil(t, m)
@@ -44,24 +52,18 @@ func TestChannelManager(t *testing.T) {
 	assert.NotNil(t, m)
 	assert.NoError(t, err)
 
-	// Test save meta failure
-	catalog.EXPECT().SavePChannels(mock.Anything, mock.Anything).Return(errors.New("save meta failure"))
-	modified, err := m.AssignPChannels(ctx, map[string]types.StreamingNodeInfo{"test-channel": {ServerID: 2}})
-	assert.Nil(t, modified)
-	assert.Error(t, err)
-	err = m.AssignPChannelsDone(ctx, []string{"test-channel"})
-	assert.Error(t, err)
-	err = m.MarkAsUnavailable(ctx, []types.PChannelInfo{{
-		Name: "test-channel",
-		Term: 2,
-	}})
-	assert.Error(t, err)
-
 	// Test update non exist pchannel
-	modified, err = m.AssignPChannels(ctx, map[string]types.StreamingNodeInfo{"non-exist-channel": {ServerID: 2}})
+	modified, err := m.AssignPChannels(ctx, map[ChannelID]types.PChannelInfoAssigned{newChannelID("non-exist-channel"): {
+		Channel: types.PChannelInfo{
+			Name:       "non-exist-channel",
+			Term:       1,
+			AccessMode: types.AccessModeRW,
+		},
+		Node: types.StreamingNodeInfo{ServerID: 2},
+	}})
 	assert.Nil(t, modified)
 	assert.ErrorIs(t, err, ErrChannelNotExist)
-	err = m.AssignPChannelsDone(ctx, []string{"non-exist-channel"})
+	err = m.AssignPChannelsDone(ctx, []ChannelID{newChannelID("non-exist-channel")})
 	assert.ErrorIs(t, err, ErrChannelNotExist)
 	err = m.MarkAsUnavailable(ctx, []types.PChannelInfo{{
 		Name: "non-exist-channel",
@@ -71,13 +73,30 @@ func TestChannelManager(t *testing.T) {
 
 	// Test success.
 	catalog.EXPECT().SavePChannels(mock.Anything, mock.Anything).Unset()
-	catalog.EXPECT().SavePChannels(mock.Anything, mock.Anything).Return(nil)
-	modified, err = m.AssignPChannels(ctx, map[string]types.StreamingNodeInfo{"test-channel": {ServerID: 2}})
+	catalog.EXPECT().SavePChannels(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, pm []*streamingpb.PChannelMeta) error {
+		if rand.Int31n(3) == 0 {
+			return errors.New("save meta failure")
+		}
+		return nil
+	})
+	modified, err = m.AssignPChannels(ctx, map[ChannelID]types.PChannelInfoAssigned{newChannelID("test-channel"): {
+		Channel: types.PChannelInfo{
+			Name:       "test-channel",
+			Term:       1,
+			AccessMode: types.AccessModeRW,
+		},
+		Node: types.StreamingNodeInfo{ServerID: 2},
+	}})
 	assert.NotNil(t, modified)
 	assert.NoError(t, err)
 	assert.Len(t, modified, 1)
-	err = m.AssignPChannelsDone(ctx, []string{"test-channel"})
+	err = m.AssignPChannelsDone(ctx, []ChannelID{newChannelID("test-channel")})
 	assert.NoError(t, err)
+
+	nodeID, ok := m.GetLatestWALLocated(ctx, "test-channel")
+	assert.True(t, ok)
+	assert.NotZero(t, nodeID)
+
 	err = m.MarkAsUnavailable(ctx, []types.PChannelInfo{{
 		Name: "test-channel",
 		Term: 2,
@@ -86,14 +105,60 @@ func TestChannelManager(t *testing.T) {
 
 	view := m.CurrentPChannelsView()
 	assert.NotNil(t, view)
-	assert.Len(t, view, 1)
-	assert.NotNil(t, view["test-channel"])
+	assert.Equal(t, len(view.Channels), 1)
+	channel, ok := view.Channels[newChannelID("test-channel")]
+	assert.True(t, ok)
+	assert.NotNil(t, channel)
+
+	nodeID, ok = m.GetLatestWALLocated(ctx, "test-channel")
+	assert.False(t, ok)
+	assert.Zero(t, nodeID)
+}
+
+func TestStreamingEnableChecker(t *testing.T) {
+	ctx := context.Background()
+	ResetStaticPChannelStatsManager()
+	RecoverPChannelStatsManager([]string{})
+
+	catalog := mock_metastore.NewMockStreamingCoordCataLog(t)
+	resource.InitForTest(resource.OptStreamingCatalog(catalog))
+	// Test recover failure.
+	catalog.EXPECT().GetVersion(mock.Anything).Return(nil, nil)
+	catalog.EXPECT().SaveVersion(mock.Anything, mock.Anything).Return(nil)
+	catalog.EXPECT().ListPChannel(mock.Anything).Return(nil, nil)
+
+	m, err := RecoverChannelManager(ctx, "test-channel")
+	assert.NoError(t, err)
+
+	assert.False(t, m.IsStreamingEnabledOnce())
+
+	n := syncutil.NewAsyncTaskNotifier[struct{}]()
+	m.RegisterStreamingEnabledNotifier(n)
+	assert.NoError(t, n.Context().Err())
+
+	go func() {
+		defer n.Finish(struct{}{})
+		<-n.Context().Done()
+	}()
+
+	err = m.MarkStreamingHasEnabled(ctx)
+	assert.NoError(t, err)
+
+	n2 := syncutil.NewAsyncTaskNotifier[struct{}]()
+	m.RegisterStreamingEnabledNotifier(n2)
+	assert.Error(t, n.Context().Err())
+	assert.Error(t, n2.Context().Err())
 }
 
 func TestChannelManagerWatch(t *testing.T) {
+	ResetStaticPChannelStatsManager()
+	RecoverPChannelStatsManager([]string{})
+
 	catalog := mock_metastore.NewMockStreamingCoordCataLog(t)
 	resource.InitForTest(resource.OptStreamingCatalog(catalog))
-
+	catalog.EXPECT().GetVersion(mock.Anything).Return(&streamingpb.StreamingVersion{
+		Version: 1,
+	}, nil)
 	catalog.EXPECT().ListPChannel(mock.Anything).Unset()
 	catalog.EXPECT().ListPChannel(mock.Anything).RunAndReturn(func(ctx context.Context) ([]*streamingpb.PChannelMeta, error) {
 		return []*streamingpb.PChannelMeta{
@@ -129,8 +194,15 @@ func TestChannelManagerWatch(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 	}()
 
-	manager.AssignPChannels(ctx, map[string]types.StreamingNodeInfo{"test-channel": {ServerID: 2}})
-	manager.AssignPChannelsDone(ctx, []string{"test-channel"})
+	manager.AssignPChannels(ctx, map[ChannelID]types.PChannelInfoAssigned{newChannelID("test-channel"): {
+		Channel: types.PChannelInfo{
+			Name:       "test-channel",
+			Term:       1,
+			AccessMode: types.AccessModeRW,
+		},
+		Node: types.StreamingNodeInfo{ServerID: 2},
+	}})
+	manager.AssignPChannelsDone(ctx, []ChannelID{newChannelID("test-channel")})
 
 	<-called
 	manager.MarkAsUnavailable(ctx, []types.PChannelInfo{{
@@ -140,4 +212,10 @@ func TestChannelManagerWatch(t *testing.T) {
 	<-called
 	cancel()
 	<-done
+}
+
+func newChannelID(name string) ChannelID {
+	return ChannelID{
+		Name: name,
+	}
 }

@@ -17,11 +17,15 @@
 package httpserver
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
@@ -163,6 +167,25 @@ func (req *CollectionFieldReqWithParams) GetFieldName() string {
 	return req.FieldName
 }
 
+type CollectionFieldReqWithSchema struct {
+	DbName         string       `json:"dbName"`
+	CollectionName string       `json:"collectionName" binding:"required"`
+	Schema         *FieldSchema `json:"schema" binding:"required"`
+}
+
+func (req *CollectionFieldReqWithSchema) GetDbName() string { return req.DbName }
+
+func (req *CollectionFieldReqWithSchema) GetCollectionName() string {
+	return req.CollectionName
+}
+
+func (req *CollectionFieldReqWithSchema) GetFieldName() string {
+	if req.Schema == nil {
+		return ""
+	}
+	return req.Schema.FieldName
+}
+
 type PartitionReq struct {
 	// CollectionNameReq
 	DbName         string `json:"dbName"`
@@ -209,25 +232,27 @@ type JobIDReq struct {
 func (req *JobIDReq) GetJobID() string { return req.JobID }
 
 type QueryReqV2 struct {
-	DbName         string                 `json:"dbName"`
-	CollectionName string                 `json:"collectionName" binding:"required"`
-	PartitionNames []string               `json:"partitionNames"`
-	OutputFields   []string               `json:"outputFields"`
-	Filter         string                 `json:"filter"`
-	Limit          int32                  `json:"limit"`
-	Offset         int32                  `json:"offset"`
-	ExprParams     map[string]interface{} `json:"exprParams"`
+	DbName           string                 `json:"dbName"`
+	CollectionName   string                 `json:"collectionName" binding:"required"`
+	PartitionNames   []string               `json:"partitionNames"`
+	OutputFields     []string               `json:"outputFields"`
+	Filter           string                 `json:"filter"`
+	Limit            int32                  `json:"limit"`
+	Offset           int32                  `json:"offset"`
+	ExprParams       map[string]interface{} `json:"exprParams"`
+	ConsistencyLevel string                 `json:"consistencyLevel"`
 }
 
 func (req *QueryReqV2) GetDbName() string { return req.DbName }
 
 type CollectionIDReq struct {
-	DbName         string      `json:"dbName"`
-	CollectionName string      `json:"collectionName" binding:"required"`
-	PartitionName  string      `json:"partitionName"`
-	PartitionNames []string    `json:"partitionNames"`
-	OutputFields   []string    `json:"outputFields"`
-	ID             interface{} `json:"id" binding:"required"`
+	DbName           string      `json:"dbName"`
+	CollectionName   string      `json:"collectionName" binding:"required"`
+	PartitionName    string      `json:"partitionName"`
+	PartitionNames   []string    `json:"partitionNames"`
+	OutputFields     []string    `json:"outputFields"`
+	ID               interface{} `json:"id" binding:"required"`
+	ConsistencyLevel string      `json:"consistencyLevel"`
 }
 
 func (req *CollectionIDReq) GetDbName() string { return req.DbName }
@@ -267,6 +292,7 @@ type SearchReqV2 struct {
 	SearchParams     map[string]interface{} `json:"searchParams"`
 	ConsistencyLevel string                 `json:"consistencyLevel"`
 	ExprParams       map[string]interface{} `json:"exprParams"`
+	FunctionScore    FunctionScore          `json:"functionScore"`
 	// not use Params any more, just for compatibility
 	Params map[string]float64 `json:"params"`
 }
@@ -297,11 +323,13 @@ type HybridSearchReq struct {
 	Search           []SubSearchReq `json:"search"`
 	Rerank           Rand           `json:"rerank"`
 	Limit            int32          `json:"limit"`
+	Offset           int32          `json:"offset"`
 	GroupByField     string         `json:"groupingField"`
 	GroupSize        int32          `json:"groupSize"`
 	StrictGroupSize  bool           `json:"strictGroupSize"`
 	OutputFields     []string       `json:"outputFields"`
 	ConsistencyLevel string         `json:"consistencyLevel"`
+	FunctionScore    FunctionScore  `json:"functionScore"`
 }
 
 func (req *HybridSearchReq) GetDbName() string { return req.DbName }
@@ -350,7 +378,9 @@ type OptionsGetter interface {
 type JobIDGetter interface {
 	GetJobID() string
 }
-
+type TimestampGetter interface {
+	GetTimestamp() uint64
+}
 type PasswordReq struct {
 	UserName string `json:"userName" binding:"required"`
 	Password string `json:"password" binding:"required"`
@@ -420,6 +450,7 @@ type IndexReq struct {
 	DbName         string `json:"dbName"`
 	CollectionName string `json:"collectionName" binding:"required"`
 	IndexName      string `json:"indexName" binding:"required"`
+	Timestamp      uint64 `json:"timestamp"`
 }
 
 func (req *IndexReq) GetDbName() string { return req.DbName }
@@ -429,6 +460,10 @@ func (req *IndexReq) GetCollectionName() string {
 
 func (req *IndexReq) GetIndexName() string {
 	return req.IndexName
+}
+
+func (req *IndexReq) GetTimestamp() uint64 {
+	return req.Timestamp
 }
 
 type IndexReqWithProperties struct {
@@ -472,9 +507,54 @@ type FieldSchema struct {
 	IsPrimary         bool                   `json:"isPrimary"`
 	IsPartitionKey    bool                   `json:"isPartitionKey"`
 	IsClusteringKey   bool                   `json:"isClusteringKey"`
-	ElementTypeParams map[string]interface{} `json:"elementTypeParams" binding:"required"`
-	Nullable          bool                   `json:"nullable" binding:"required"`
-	DefaultValue      interface{}            `json:"defaultValue" binding:"required"`
+	ElementTypeParams map[string]interface{} `json:"elementTypeParams"`
+	Nullable          bool                   `json:"nullable"`
+	DefaultValue      interface{}            `json:"defaultValue"`
+}
+
+func (field *FieldSchema) GetProto(ctx context.Context) (*schemapb.FieldSchema, error) {
+	fieldDataType, ok := schemapb.DataType_value[field.DataType]
+	if !ok {
+		log.Ctx(ctx).Warn("field's data type is invalid(case sensitive).", zap.Any("fieldDataType", field.DataType), zap.Any("field", field))
+		return nil, merr.WrapErrParameterInvalidMsg("data type %s is invalid(case sensitive)", field.DataType)
+	}
+	dataType := schemapb.DataType(fieldDataType)
+	fieldSchema := &schemapb.FieldSchema{
+		Name:            field.FieldName,
+		IsPrimaryKey:    field.IsPrimary,
+		IsPartitionKey:  field.IsPartitionKey,
+		IsClusteringKey: field.IsClusteringKey,
+		DataType:        dataType,
+		TypeParams:      []*commonpb.KeyValuePair{},
+		Nullable:        field.Nullable,
+	}
+
+	var err error
+	fieldSchema.DefaultValue, err = convertDefaultValue(field.DefaultValue, dataType)
+	if err != nil {
+		log.Ctx(ctx).Warn("convert defaultValue fail", zap.Any("defaultValue", field.DefaultValue))
+		return nil, merr.WrapErrParameterInvalidMsg("convert defaultValue fail, err: %s", err.Error())
+	}
+	if dataType == schemapb.DataType_Array {
+		if _, ok := schemapb.DataType_value[field.ElementDataType]; !ok {
+			log.Ctx(ctx).Warn("element's data type is invalid(case sensitive).", zap.Any("elementDataType", field.ElementDataType), zap.Any("field", field))
+			return nil, merr.WrapErrParameterInvalidMsg("element data type %s is invalid(case sensitive)", field.ElementDataType)
+		}
+		fieldSchema.ElementType = schemapb.DataType(schemapb.DataType_value[field.ElementDataType])
+	}
+	for key, fieldParam := range field.ElementTypeParams {
+		value, err := getElementTypeParams(fieldParam)
+		if err != nil {
+			return nil, err
+		}
+		fieldSchema.TypeParams = append(fieldSchema.TypeParams, &commonpb.KeyValuePair{Key: key, Value: value})
+	}
+	return fieldSchema, nil
+}
+
+type FunctionScore struct {
+	Functions []FunctionSchema       `json:"functions"`
+	Params    map[string]interface{} `json:"params"`
 }
 
 type FunctionSchema struct {
@@ -683,3 +763,5 @@ func (req *GetSegmentsInfoReq) GetCollectionID() int64 {
 func (req *GetSegmentsInfoReq) GetSegmentIDs() []int64 {
 	return req.SegmentIDs
 }
+
+type GetQuotaMetricsReq struct{}

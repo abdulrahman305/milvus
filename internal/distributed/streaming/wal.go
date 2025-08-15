@@ -11,9 +11,9 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/streaming/internal/producer"
 	"github.com/milvus-io/milvus/internal/streamingcoord/client"
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
@@ -28,12 +28,8 @@ func newWALAccesser(c *clientv3.Client) *walAccesserImpl {
 	// Create a new streaming coord client.
 	streamingCoordClient := client.NewClient(c)
 	// Create a new streamingnode handler client.
-	var handlerClient handler.HandlerClient
-	if streamingutil.IsStreamingServiceEnabled() {
-		// streaming service is enabled, create the handler client for the streaming service.
-		handlerClient = handler.NewHandlerClient(streamingCoordClient.Assignment())
-	}
-	return &walAccesserImpl{
+	handlerClient := handler.NewHandlerClient(streamingCoordClient.Assignment())
+	w := &walAccesserImpl{
 		lifetime:             typeutil.NewLifetime(),
 		streamingCoordClient: streamingCoordClient,
 		handlerClient:        handlerClient,
@@ -41,13 +37,16 @@ func newWALAccesser(c *clientv3.Client) *walAccesserImpl {
 		producers:            make(map[string]*producer.ResumableProducer),
 
 		// TODO: optimize the pool size, use the streaming api but not goroutines.
-		appendExecutionPool:   conc.NewPool[struct{}](10),
-		dispatchExecutionPool: conc.NewPool[struct{}](10),
+		appendExecutionPool:   conc.NewPool[struct{}](0),
+		dispatchExecutionPool: conc.NewPool[struct{}](0),
 	}
+	w.SetLogger(log.With(log.FieldComponent("wal-accesser")))
+	return w
 }
 
 // walAccesserImpl is the implementation of WALAccesser.
 type walAccesserImpl struct {
+	log.Binder
 	lifetime *typeutil.Lifetime
 
 	// All services
@@ -64,13 +63,8 @@ func (w *walAccesserImpl) WALName() string {
 	return util.MustSelectWALName()
 }
 
-func (w *walAccesserImpl) GetLatestMVCCTimestampIfLocal(ctx context.Context, vchannel string) (uint64, error) {
-	if !w.lifetime.Add(typeutil.LifetimeStateWorking) {
-		return 0, ErrWALAccesserClosed
-	}
-	defer w.lifetime.Done()
-
-	return w.handlerClient.GetLatestMVCCTimestampIfLocal(ctx, vchannel)
+func (w *walAccesserImpl) Local() Local {
+	return localServiceImpl{w}
 }
 
 // RawAppend writes a record to the log.
@@ -92,14 +86,20 @@ func (w *walAccesserImpl) Read(_ context.Context, opts ReadOption) Scanner {
 	}
 	defer w.lifetime.Done()
 
-	if opts.VChannel == "" {
-		return newErrScanner(status.NewInvaildArgument("vchannel is required"))
+	if opts.VChannel == "" && opts.PChannel == "" {
+		panic("pchannel is required if vchannel is not set")
 	}
 
+	if opts.VChannel != "" {
+		pchannel := funcutil.ToPhysicalChannel(opts.VChannel)
+		if opts.PChannel != "" && opts.PChannel != pchannel {
+			panic("pchannel is not match with vchannel")
+		}
+		opts.PChannel = pchannel
+	}
 	// TODO: optimize the consumer into pchannel level.
-	pchannel := funcutil.ToPhysicalChannel(opts.VChannel)
 	rc := consumer.NewResumableConsumer(w.handlerClient.CreateConsumer, &consumer.ConsumerOptions{
-		PChannel:       pchannel,
+		PChannel:       opts.PChannel,
 		VChannel:       opts.VChannel,
 		DeliverPolicy:  opts.DeliverPolicy,
 		DeliverFilters: opts.DeliverFilters,
@@ -171,11 +171,18 @@ func (w *walAccesserImpl) Close() {
 		w.handlerClient.Close()
 	}
 	w.streamingCoordClient.Close()
+	if w.appendExecutionPool != nil {
+		w.appendExecutionPool.Release()
+	}
+	if w.dispatchExecutionPool != nil {
+		w.dispatchExecutionPool.Release()
+	}
 }
 
 // newErrScanner creates a scanner that returns an error.
 func newErrScanner(err error) Scanner {
 	ch := make(chan struct{})
+	close(ch)
 	return errScanner{
 		closedCh: ch,
 		err:      err,

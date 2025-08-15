@@ -29,8 +29,12 @@ package initcore
 import "C"
 
 import (
+	"context"
+	"encoding/base64"
 	"fmt"
 	"path"
+	"strconv"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -55,10 +59,12 @@ func InitTraceConfig(params *paramtable.ComponentParam) {
 	otlpMethod := C.CString(params.TraceCfg.OtlpMethod.GetValue())
 	endpoint := C.CString(params.TraceCfg.OtlpEndpoint.GetValue())
 	otlpSecure := params.TraceCfg.OtlpSecure.GetAsBool()
+	otlpHeaders := C.CString(serializeHeaders(params.TraceCfg.OtlpHeaders.GetValue()))
 	defer C.free(unsafe.Pointer(exporter))
 	defer C.free(unsafe.Pointer(jaegerURL))
 	defer C.free(unsafe.Pointer(endpoint))
 	defer C.free(unsafe.Pointer(otlpMethod))
+	defer C.free(unsafe.Pointer(otlpHeaders))
 
 	config := C.CTraceConfig{
 		exporter:       exporter,
@@ -66,6 +72,7 @@ func InitTraceConfig(params *paramtable.ComponentParam) {
 		jaegerURL:      jaegerURL,
 		otlpEndpoint:   endpoint,
 		otlpMethod:     otlpMethod,
+		otlpHeaders:    otlpHeaders,
 		oltpSecure:     (C.bool)(otlpSecure),
 		nodeID:         nodeID,
 	}
@@ -86,10 +93,12 @@ func ResetTraceConfig(params *paramtable.ComponentParam) {
 	endpoint := C.CString(params.TraceCfg.OtlpEndpoint.GetValue())
 	otlpMethod := C.CString(params.TraceCfg.OtlpMethod.GetValue())
 	otlpSecure := params.TraceCfg.OtlpSecure.GetAsBool()
+	otlpHeaders := C.CString(serializeHeaders(params.TraceCfg.OtlpHeaders.GetValue()))
 	defer C.free(unsafe.Pointer(exporter))
 	defer C.free(unsafe.Pointer(jaegerURL))
 	defer C.free(unsafe.Pointer(endpoint))
 	defer C.free(unsafe.Pointer(otlpMethod))
+	defer C.free(unsafe.Pointer(otlpHeaders))
 
 	config := C.CTraceConfig{
 		exporter:       exporter,
@@ -97,6 +106,7 @@ func ResetTraceConfig(params *paramtable.ComponentParam) {
 		jaegerURL:      jaegerURL,
 		otlpEndpoint:   endpoint,
 		otlpMethod:     otlpMethod,
+		otlpHeaders:    otlpHeaders,
 		oltpSecure:     (C.bool)(otlpSecure),
 		nodeID:         nodeID,
 	}
@@ -187,7 +197,7 @@ func InitRemoteArrowFileSystem(params *paramtable.ComponentParam) error {
 	}
 
 	status := C.InitRemoteArrowFileSystemSingleton(storageConfig)
-	return HandleCStatus(&status, "InitRemoteChunkManagerSingleton failed")
+	return HandleCStatus(&status, "InitRemoteArrowFileSystemSingleton failed")
 }
 
 func InitRemoteChunkManager(params *paramtable.ComponentParam) error {
@@ -254,9 +264,148 @@ func InitMmapManager(params *paramtable.ComponentParam) error {
 		fix_file_size:            C.uint64_t(mmapFileSize),
 		growing_enable_mmap:      C.bool(params.QueryNodeCfg.GrowingMmapEnabled.GetAsBool()),
 		scalar_index_enable_mmap: C.bool(params.QueryNodeCfg.MmapScalarIndex.GetAsBool()),
+		scalar_field_enable_mmap: C.bool(params.QueryNodeCfg.MmapScalarField.GetAsBool()),
+		vector_index_enable_mmap: C.bool(params.QueryNodeCfg.MmapVectorIndex.GetAsBool()),
+		vector_field_enable_mmap: C.bool(params.QueryNodeCfg.MmapVectorField.GetAsBool()),
 	}
 	status := C.InitMmapManager(mmapConfig)
 	return HandleCStatus(&status, "InitMmapManager failed")
+}
+
+func InitFileWriterConfig(params *paramtable.ComponentParam) error {
+	mode := params.CommonCfg.DiskWriteMode.GetValue()
+	bufferSize := params.CommonCfg.DiskWriteBufferSizeKb.GetAsUint64()
+	numThreads := params.CommonCfg.DiskWriteNumThreads.GetAsInt()
+	cMode := C.CString(mode)
+	cBufferSize := C.uint64_t(bufferSize)
+	cNumThreads := C.int(numThreads)
+	defer C.free(unsafe.Pointer(cMode))
+	status := C.InitFileWriterConfig(cMode, cBufferSize, cNumThreads)
+	return HandleCStatus(&status, "InitFileWriterConfig failed")
+}
+
+var coreParamCallbackInitOnce sync.Once
+
+func SetupCoreConfigChangelCallback() {
+	coreParamCallbackInitOnce.Do(func() {
+		paramtable.Get().CommonCfg.IndexSliceSize.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			size, err := strconv.Atoi(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateIndexSliceSize(size)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.HighPriorityThreadCoreCoefficient.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			coefficient, err := strconv.ParseFloat(newValue, 64)
+			if err != nil {
+				return err
+			}
+			UpdateHighPriorityThreadCoreCoefficient(coefficient)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.MiddlePriorityThreadCoreCoefficient.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			coefficient, err := strconv.ParseFloat(newValue, 64)
+			if err != nil {
+				return err
+			}
+			UpdateMiddlePriorityThreadCoreCoefficient(coefficient)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.LowPriorityThreadCoreCoefficient.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			coefficient, err := strconv.ParseFloat(newValue, 64)
+			if err != nil {
+				return err
+			}
+			UpdateLowPriorityThreadCoreCoefficient(coefficient)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.EnabledOptimizeExpr.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			enable, err := strconv.ParseBool(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateDefaultOptimizeExprEnable(enable)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.EnabledGrowingSegmentJSONKeyStats.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			enable, err := strconv.ParseBool(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateDefaultGrowingJSONKeyStatsEnable(enable)
+			return nil
+		})
+
+		paramtable.Get().CommonCfg.EnableConfigParamTypeCheck.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			enable, err := strconv.ParseBool(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateDefaultConfigParamTypeCheck(enable)
+			return nil
+		})
+
+		paramtable.Get().LogCfg.Level.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			return UpdateLogLevel(newValue)
+		})
+
+		paramtable.Get().QueryNodeCfg.ExprEvalBatchSize.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			size, err := strconv.Atoi(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateDefaultExprEvalBatchSize(size)
+			return nil
+		})
+
+		paramtable.Get().QueryNodeCfg.JSONKeyStatsCommitInterval.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			interval, err := strconv.Atoi(newValue)
+			if err != nil {
+				return err
+			}
+			UpdateDefaultJSONKeyStatsCommitInterval(interval)
+			return nil
+		})
+	})
+}
+
+func InitInterminIndexConfig(params *paramtable.ComponentParam) error {
+	enableInterminIndex := C.bool(params.QueryNodeCfg.EnableInterminSegmentIndex.GetAsBool())
+	C.SegcoreSetEnableInterminSegmentIndex(enableInterminIndex)
+
+	nlist := C.int64_t(params.QueryNodeCfg.InterimIndexNlist.GetAsInt64())
+	C.SegcoreSetNlist(nlist)
+
+	nprobe := C.int64_t(params.QueryNodeCfg.InterimIndexNProbe.GetAsInt64())
+	C.SegcoreSetNprobe(nprobe)
+
+	subDim := C.int64_t(params.QueryNodeCfg.InterimIndexSubDim.GetAsInt64())
+	C.SegcoreSetSubDim(subDim)
+
+	refineRatio := C.float(params.QueryNodeCfg.InterimIndexRefineRatio.GetAsFloat())
+	C.SegcoreSetRefineRatio(refineRatio)
+
+	denseVecIndexType := C.CString(params.QueryNodeCfg.DenseVectorInterminIndexType.GetValue())
+	defer C.free(unsafe.Pointer(denseVecIndexType))
+	status := C.SegcoreSetDenseVectorInterminIndexType(denseVecIndexType)
+	statErr := HandleCStatus(&status, "InitInterminIndexConfig failed")
+	if statErr != nil {
+		return statErr
+	}
+
+	refineWithQuantFlag := C.bool(params.QueryNodeCfg.InterimIndexRefineWithQuant.GetAsBool())
+	C.SegcoreSetDenseVectorInterminIndexRefineWithQuantFlag(refineWithQuantFlag)
+
+	denseVecIndexRefineQuantType := C.CString(params.QueryNodeCfg.InterimIndexRefineQuantType.GetValue())
+	defer C.free(unsafe.Pointer(denseVecIndexRefineQuantType))
+	status = C.SegcoreSetDenseVectorInterminIndexRefineQuantType(denseVecIndexRefineQuantType)
+	return HandleCStatus(&status, "InitInterminIndexConfig failed")
 }
 
 func CleanRemoteChunkManager() {
@@ -284,4 +433,15 @@ func HandleCStatus(status *C.CStatus, extraInfo string) error {
 	logMsg := fmt.Sprintf("%s, C Runtime Exception: %s\n", extraInfo, finalMsg)
 	log.Warn(logMsg)
 	return errors.New(finalMsg)
+}
+
+func serializeHeaders(headerstr string) string {
+	if len(headerstr) == 0 {
+		return ""
+	}
+	decodeheaders, err := base64.StdEncoding.DecodeString(headerstr)
+	if err != nil {
+		return headerstr
+	}
+	return string(decodeheaders)
 }

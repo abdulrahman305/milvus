@@ -33,10 +33,14 @@ class ExecPlanNodeVisitor : PlanNodeVisitor {
  public:
     ExecPlanNodeVisitor(const segcore::SegmentInterface& segment,
                         Timestamp timestamp,
-                        const PlaceholderGroup& placeholder_group)
+                        const PlaceholderGroup& placeholder_group,
+                        int32_t consystency_level,
+                        Timestamp collection_ttl)
         : segment_(segment),
           timestamp_(timestamp),
-          placeholder_group_(placeholder_group) {
+          placeholder_group_(placeholder_group),
+          consystency_level_(consystency_level),
+          collection_ttl_timestamp_(collection_ttl_timestamp_) {
     }
 
     SearchResult
@@ -57,9 +61,11 @@ class ExecPlanNodeVisitor : PlanNodeVisitor {
  private:
     const segcore::SegmentInterface& segment_;
     Timestamp timestamp_;
+    Timestamp collection_ttl_timestamp_;
     const PlaceholderGroup& placeholder_group_;
 
     SearchResultOpt search_result_opt_;
+    int32_t consystency_level_ = 0;
 };
 }  // namespace impl
 
@@ -80,7 +86,6 @@ ExecPlanNodeVisitor::ExecuteTask(
               plan.plan_node_->ToString(),
               query_context->get_active_count(),
               query_context->get_query_timestamp());
-
     auto task =
         milvus::exec::Task::Create(DEFAULT_TASK_ID, plan, 0, query_context);
     int64_t processed_num = 0;
@@ -100,7 +105,7 @@ ExecPlanNodeVisitor::ExecuteTask(
             BitsetTypeView view(vec->GetRawData(), vec->size());
             bitset_holder.append(view);
         } else {
-            PanicInfo(UnexpectedError, "expr return type not matched");
+            ThrowInfo(UnexpectedError, "expr return type not matched");
         }
     }
     return bitset_holder;
@@ -127,8 +132,13 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
     auto plan = plan::PlanFragment(node.plannodes_);
 
     // Set query context
-    auto query_context = std::make_shared<milvus::exec::QueryContext>(
-        DEAFULT_QUERY_ID, segment, active_count, timestamp_);
+    auto query_context =
+        std::make_shared<milvus::exec::QueryContext>(DEAFULT_QUERY_ID,
+                                                     segment,
+                                                     active_count,
+                                                     timestamp_,
+                                                     collection_ttl_timestamp_,
+                                                     consystency_level_);
     query_context->set_search_info(node.search_info_);
     query_context->set_placeholder_group(placeholder_group_);
 
@@ -178,8 +188,13 @@ ExecPlanNodeVisitor::visit(RetrievePlanNode& node) {
     auto plan = plan::PlanFragment(node.plannodes_);
 
     // Set query context
-    auto query_context = std::make_shared<milvus::exec::QueryContext>(
-        DEAFULT_QUERY_ID, segment, active_count, timestamp_);
+    auto query_context =
+        std::make_shared<milvus::exec::QueryContext>(DEAFULT_QUERY_ID,
+                                                     segment,
+                                                     active_count,
+                                                     timestamp_,
+                                                     collection_ttl_timestamp_,
+                                                     consystency_level_);
 
     // Do task execution
     auto bitset_holder = ExecuteTask(plan, query_context);

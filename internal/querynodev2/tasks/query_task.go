@@ -106,6 +106,8 @@ func (t *QueryTask) Execute() error {
 		t.req.Req.GetSerializedExprPlan(),
 		t.req.Req.GetMvccTimestamp(),
 		t.req.Req.Base.GetMsgID(),
+		t.req.Req.GetConsistencyLevel(),
+		t.req.Req.GetCollectionTtlTimestamps(),
 	)
 	if err != nil {
 		return err

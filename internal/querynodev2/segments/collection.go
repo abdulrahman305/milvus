@@ -33,6 +33,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -47,6 +48,8 @@ type CollectionManager interface {
 	// returns true if the collection ref count goes 0, or the collection not exists,
 	// return false otherwise
 	Unref(collectionID int64, count uint32) bool
+	// UpdateSchema update the underlying collection schema of the provided collection.
+	UpdateSchema(collectionID int64, schema *schemapb.CollectionSchema, version uint64) error
 }
 
 type collectionManager struct {
@@ -89,8 +92,17 @@ func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.Collec
 	defer m.mut.Unlock()
 
 	if collection, ok := m.collections[collectionID]; ok {
-		// the schema may be changed even the collection is loaded
-		collection.schema.Store(schema)
+		if loadMeta.GetSchemaVersion() > collection.schemaVersion {
+			// the schema may be changed even the collection is loaded
+			collection.schema.Store(schema)
+			collection.ccollection.UpdateSchema(schema, loadMeta.GetSchemaVersion())
+			collection.schemaVersion = loadMeta.GetSchemaVersion()
+			log.Info("update collection schema",
+				zap.Int64("collectionID", collectionID),
+				zap.Uint64("schemaVersion", loadMeta.GetSchemaVersion()),
+				zap.Any("schema", schema),
+			)
+		}
 		collection.Ref(1)
 		return nil
 	}
@@ -103,6 +115,22 @@ func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.Collec
 	collection.Ref(1)
 	m.collections[collectionID] = collection
 	m.updateMetric()
+	return nil
+}
+
+func (m *collectionManager) UpdateSchema(collectionID int64, schema *schemapb.CollectionSchema, version uint64) error {
+	m.mut.Lock()
+	defer m.mut.Unlock()
+
+	collection, ok := m.collections[collectionID]
+	if !ok {
+		return merr.WrapErrCollectionNotFound(collectionID, "collection not found in querynode collection manager")
+	}
+
+	if err := collection.ccollection.UpdateSchema(schema, version); err != nil {
+		return err
+	}
+	collection.schema.Store(schema)
 	return nil
 }
 
@@ -158,10 +186,11 @@ type Collection struct {
 	// but Collection in Manager will be released before assign new replica of new resource group on these node.
 	// so we don't need to update resource group in Collection.
 	// if resource group is not updated, the reference count of collection manager works failed.
-	metricType atomic.String // deprecated
-	schema     atomic.Pointer[schemapb.CollectionSchema]
-	isGpuIndex bool
-	loadFields typeutil.Set[int64]
+	metricType    atomic.String // deprecated
+	schema        atomic.Pointer[schemapb.CollectionSchema]
+	isGpuIndex    bool
+	loadFields    typeutil.Set[int64]
+	schemaVersion uint64
 
 	refCount *atomic.Uint32
 }
@@ -230,7 +259,7 @@ func (c *Collection) GetLoadType() querypb.LoadType {
 
 func (c *Collection) Ref(count uint32) uint32 {
 	refCount := c.refCount.Add(count)
-	log.Info("collection ref increment",
+	log.Debug("collection ref increment",
 		zap.Int64("nodeID", paramtable.GetNodeID()),
 		zap.Int64("collectionID", c.ID()),
 		zap.Uint32("refCount", refCount),
@@ -240,7 +269,7 @@ func (c *Collection) Ref(count uint32) uint32 {
 
 func (c *Collection) Unref(count uint32) uint32 {
 	refCount := c.refCount.Sub(count)
-	log.Info("collection ref decrement",
+	log.Debug("collection ref decrement",
 		zap.Int64("nodeID", paramtable.GetNodeID()),
 		zap.Int64("collectionID", c.ID()),
 		zap.Uint32("refCount", refCount),
@@ -257,18 +286,23 @@ func NewCollection(collectionID int64, schema *schemapb.CollectionSchema, indexM
 
 	var loadFieldIDs typeutil.Set[int64]
 	loadSchema := typeutil.Clone(schema)
-
 	// if load fields is specified, do filtering logic
 	// otherwise use all fields for backward compatibility
 	if len(loadMetaInfo.GetLoadFields()) > 0 {
 		loadFieldIDs = typeutil.NewSet(loadMetaInfo.GetLoadFields()...)
 	} else {
 		loadFieldIDs = typeutil.NewSet(lo.Map(loadSchema.GetFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })...)
+		for _, structArrayField := range loadSchema.GetStructArrayFields() {
+			for _, subField := range structArrayField.GetFields() {
+				loadFieldIDs.Insert(subField.GetFieldID())
+			}
+		}
 	}
 
 	isGpuIndex := false
 	req := &segcore.CreateCCollectionRequest{
-		Schema: loadSchema,
+		Schema:        loadSchema,
+		LoadFieldList: loadFieldIDs.Collect(),
 	}
 	if indexMeta != nil && len(indexMeta.GetIndexMetas()) > 0 && indexMeta.GetMaxIndexRowCount() > 0 {
 		req.IndexMeta = indexMeta

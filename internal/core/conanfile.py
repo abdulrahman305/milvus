@@ -13,7 +13,7 @@ class MilvusConan(ConanFile):
         "lz4/1.9.4#c5afb86edd69ac0df30e3a9e192e43db",
         "snappy/1.1.9#0519333fef284acd04806243de7d3070",
         "lzo/2.10#9517fc1bcc4d4cc229a79806003a1baa",
-        "arrow/17.0.0#8cea917a6e06ca17c28411966d6fcdd7",
+        "arrow/17.0.0@milvus/dev",
         "openssl/3.1.2#02594c4c0a6e2b4feb3cd15119993597",
         "aws-sdk-cpp/1.9.234#28d6d2c175975900ce292bafe8022c88",
         "googleapis/cci.20221108#65604e1b3b9a6b363044da625b201a2a",
@@ -44,7 +44,10 @@ class MilvusConan(ConanFile):
         "abseil/20230125.3#dad7cc4c83bbd44c1f1cc9cc4d97ac88",
         "roaring/3.0.0#25a703f80eda0764a31ef939229e202d",
         "grpc/1.50.1@milvus/dev#75103960d1cac300cf425ccfccceac08",
-        "rapidjson/cci.20230929#624c0094d741e6a3749d2e44d834b96c"
+        "rapidjson/cci.20230929#624c0094d741e6a3749d2e44d834b96c",
+        "simde/0.8.2#5e1edfd5cba92f25d79bf6ef4616b972",
+        "xxhash/0.8.3#199e63ab9800302c232d030b27accec0",
+        "unordered_dense/4.4.0#6a855c992618cc4c63019109a2e47298",
     )
     generators = ("cmake", "cmake_find_package")
     default_options = {
@@ -70,7 +73,7 @@ class MilvusConan(ConanFile):
         "aws-sdk-cpp:config": True,
         "aws-sdk-cpp:text-to-speech": False,
         "aws-sdk-cpp:transfer": False,
-        "gtest:build_gmock": False,
+        "gtest:build_gmock": True,
         "boost:without_locale": False,
         "boost:without_test": True,
         "glog:with_gflags": True,

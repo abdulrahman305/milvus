@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -34,7 +35,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -47,6 +47,7 @@ type PreImportTask struct {
 	vchannels    []string
 	schema       *schemapb.CollectionSchema
 	options      []*commonpb.KeyValuePair
+	req          *datapb.PreImportRequest
 
 	manager TaskManager
 	cm      storage.ChunkManager
@@ -81,6 +82,7 @@ func NewPreImportTask(req *datapb.PreImportRequest,
 		vchannels:    req.GetVchannels(),
 		schema:       req.GetSchema(),
 		options:      req.GetOptions(),
+		req:          req,
 		manager:      manager,
 		cm:           cm,
 	}
@@ -103,7 +105,12 @@ func (t *PreImportTask) GetSchema() *schemapb.CollectionSchema {
 }
 
 func (t *PreImportTask) GetSlots() int64 {
-	return int64(funcutil.Min(len(t.GetFileStats()), paramtable.Get().DataNodeCfg.MaxTaskSlotNum.GetAsInt()))
+	return t.req.GetTaskSlot()
+}
+
+// PreImportTask buffer size is fixed
+func (t *PreImportTask) GetBufferSize() int64 {
+	return paramtable.Get().DataNodeCfg.ImportBaseBufferSize.GetAsInt64()
 }
 
 func (t *PreImportTask) Cancel() {
@@ -120,14 +127,20 @@ func (t *PreImportTask) Clone() Task {
 		vchannels:     t.GetVchannels(),
 		schema:        t.GetSchema(),
 		options:       t.options,
+		req:           t.req,
+		manager:       t.manager,
+		cm:            t.cm,
 	}
 }
 
 func (t *PreImportTask) Execute() []*conc.Future[any] {
-	bufferSize := paramtable.Get().DataNodeCfg.ReadBufferSizeInMB.GetAsInt() * 1024 * 1024
+	bufferSize := int(t.GetBufferSize())
 	log.Info("start to preimport", WrapLogFields(t,
 		zap.Int("bufferSize", bufferSize),
-		zap.Any("schema", t.GetSchema()))...)
+		zap.Int64("taskSlot", t.GetSlots()),
+		zap.Any("files", t.req.GetImportFiles()),
+		zap.Any("schema", t.GetSchema()),
+	)...)
 	t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
 	files := lo.Map(t.GetFileStats(),
 		func(fileStat *datapb.ImportFileStats, _ int) *internalpb.ImportFile {
@@ -135,10 +148,11 @@ func (t *PreImportTask) Execute() []*conc.Future[any] {
 		})
 
 	fn := func(i int, file *internalpb.ImportFile) error {
-		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, t.options, bufferSize)
+		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, t.options, bufferSize, t.req.GetStorageConfig())
 		if err != nil {
 			log.Warn("new reader failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		defer reader.Close()
@@ -146,7 +160,8 @@ func (t *PreImportTask) Execute() []*conc.Future[any] {
 		err = t.readFileStat(reader, i)
 		if err != nil {
 			log.Warn("preimport failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		log.Info("read file stat done", WrapLogFields(t, zap.Strings("files", file.GetPaths()),
@@ -159,6 +174,9 @@ func (t *PreImportTask) Execute() []*conc.Future[any] {
 		i := i
 		file := file
 		f := GetExecPool().Submit(func() (any, error) {
+			defer func() {
+				debug.FreeOSMemory()
+			}()
 			err := fn(i, file)
 			return err, err
 		})

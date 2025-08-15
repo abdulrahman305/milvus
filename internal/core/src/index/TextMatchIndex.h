@@ -27,16 +27,18 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
                             const char* unique_id,
                             const char* tokenizer_name,
                             const char* analyzer_params);
-    // for sealed segment.
+    // for sealed segment to create index from raw data during loading.
     explicit TextMatchIndex(const std::string& path,
                             const char* unique_id,
+                            uint32_t tantivy_index_version,
                             const char* tokenizer_name,
                             const char* analyzer_params);
     // for building index.
     explicit TextMatchIndex(const storage::FileManagerContext& ctx,
+                            uint32_t tantivy_index_version,
                             const char* tokenizer_name,
                             const char* analyzer_params);
-    // for loading index
+    // for loading built index
     explicit TextMatchIndex(const storage::FileManagerContext& ctx);
 
  public:
@@ -48,16 +50,16 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
 
  public:
     void
-    AddText(const std::string& text, const bool valid, int64_t offset);
+    AddTextSealed(const std::string& text, const bool valid, int64_t offset);
 
     void
-    AddNull(int64_t offset);
+    AddNullSealed(int64_t offset);
 
     void
-    AddTexts(size_t n,
-             const std::string* texts,
-             const bool* valids,
-             int64_t offset_begin);
+    AddTextsGrowing(size_t n,
+                    const std::string* texts,
+                    const bool* valids,
+                    int64_t offset_begin);
 
     void
     BuildIndexFromFieldData(const std::vector<FieldDataPtr>& field_datas,
@@ -74,7 +76,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
 
  public:
     void
-    CreateReader();
+    CreateReader(SetBitsetFn set_bitset);
 
     void
     RegisterTokenizer(const char* tokenizer_name, const char* analyzer_params);

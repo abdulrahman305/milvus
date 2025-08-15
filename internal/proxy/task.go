@@ -31,7 +31,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/ctokenizer"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
@@ -64,7 +63,7 @@ const (
 	TopKKey              = "topk"
 	NQKey                = "nq"
 	MetricTypeKey        = common.MetricTypeKey
-	SearchParamsKey      = "params"
+	ParamsKey            = common.ParamsKey
 	ExprParamsKey        = "expr_params"
 	RoundDecimalKey      = "round_decimal"
 	OffsetKey            = "offset"
@@ -86,6 +85,7 @@ const (
 	HasPartitionTaskName          = "HasPartitionTask"
 	ShowPartitionTaskName         = "ShowPartitionTask"
 	FlushTaskName                 = "FlushTask"
+	FlushAllTaskName              = "FlushAllTask"
 	LoadCollectionTaskName        = "LoadCollectionTask"
 	ReleaseCollectionTaskName     = "ReleaseCollectionTask"
 	LoadPartitionTaskName         = "LoadPartitionsTask"
@@ -106,6 +106,7 @@ const (
 	TransferReplicaTaskName       = "TransferReplicaTask"
 	ListResourceGroupsTaskName    = "ListResourceGroupsTask"
 	DescribeResourceGroupTaskName = "DescribeResourceGroupTask"
+	RunAnalyzerTaskName           = "RunAnalyzer"
 
 	CreateDatabaseTaskName   = "CreateCollectionTask"
 	DropDatabaseTaskName     = "DropDatabaseTaskName"
@@ -113,13 +114,15 @@ const (
 	AlterDatabaseTaskName    = "AlterDatabaseTaskName"
 	DescribeDatabaseTaskName = "DescribeDatabaseTaskName"
 
+	AddFieldTaskName = "AddFieldTaskName"
+
 	// minFloat32 minimum float.
 	minFloat32 = -1 * float32(math.MaxFloat32)
 
 	RankTypeKey      = "strategy"
-	RankParamsKey    = "params"
 	RRFParamsKey     = "k"
 	WeightsParamsKey = "weights"
+	NormScoreKey     = "norm_score"
 )
 
 type task interface {
@@ -141,10 +144,13 @@ type task interface {
 	SetOnEnqueueTime()
 	GetDurationInQueue() time.Duration
 	IsSubTask() bool
+	SetExecutingTime()
+	GetDurationInExecuting() time.Duration
 }
 
 type baseTask struct {
 	onEnqueueTime time.Time
+	executingTime time.Time
 }
 
 func (bt *baseTask) CanSkipAllocTimestamp() bool {
@@ -163,6 +169,14 @@ func (bt *baseTask) IsSubTask() bool {
 	return false
 }
 
+func (bt *baseTask) SetExecutingTime() {
+	bt.executingTime = time.Now()
+}
+
+func (bt *baseTask) GetDurationInExecuting() time.Duration {
+	return time.Since(bt.executingTime)
+}
+
 type dmlTask interface {
 	task
 	setChannels() error
@@ -175,10 +189,10 @@ type createCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.CreateCollectionRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
-	schema    *schemapb.CollectionSchema
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
+	schema   *schemapb.CollectionSchema
 }
 
 func (t *createCollectionTask) TraceCtx() context.Context {
@@ -266,6 +280,16 @@ func (t *createCollectionTask) validatePartitionKey(ctx context.Context) error {
 		}
 	}
 
+	// Fields in StructArrayFields should not be partition key
+	for _, field := range t.schema.StructArrayFields {
+		for _, subField := range field.Fields {
+			if subField.GetIsPartitionKey() {
+				return merr.WrapErrCollectionIllegalSchema(t.CollectionName,
+					fmt.Sprintf("partition key is not supported for struct field, field name = %s", subField.Name))
+			}
+		}
+	}
+
 	mustPartitionKey := Params.ProxyCfg.MustUsePartitionKey.GetAsBool()
 	if mustPartitionKey && idx == -1 {
 		return merr.WrapErrParameterInvalidMsg("partition key must be set when creating the collection" +
@@ -274,7 +298,7 @@ func (t *createCollectionTask) validatePartitionKey(ctx context.Context) error {
 
 	if idx == -1 {
 		if t.GetNumPartitions() != 0 {
-			return fmt.Errorf("num_partitions should only be specified with partition key field enabled")
+			return errors.New("num_partitions should only be specified with partition key field enabled")
 		}
 	} else {
 		log.Ctx(ctx).Info("create collection with partition key mode",
@@ -301,6 +325,15 @@ func (t *createCollectionTask) validateClusteringKey(ctx context.Context) error 
 		}
 	}
 
+	// Fields in StructArrayFields should not be clustering key
+	for _, field := range t.schema.StructArrayFields {
+		for _, subField := range field.Fields {
+			if subField.GetIsClusteringKey() {
+				return merr.WrapErrCollectionIllegalSchema(t.CollectionName,
+					fmt.Sprintf("clustering key is not supported for struct field, field name = %s", subField.Name))
+			}
+		}
+	}
 	if idx != -1 {
 		log.Ctx(ctx).Info("create collection with clustering key",
 			zap.String("collectionName", t.CollectionName),
@@ -328,7 +361,8 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		return fmt.Errorf("maximum shards's number should be limited to %d", Params.ProxyCfg.MaxShardNum.GetAsInt())
 	}
 
-	if len(t.schema.Fields) > Params.ProxyCfg.MaxFieldNum.GetAsInt() {
+	totalFieldsNum := typeutil.GetTotalFieldsNum(t.schema)
+	if totalFieldsNum > Params.ProxyCfg.MaxFieldNum.GetAsInt() {
 		return fmt.Errorf("maximum field's number should be limited to %d", Params.ProxyCfg.MaxFieldNum.GetAsInt())
 	}
 
@@ -347,7 +381,7 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	}
 
 	// validate whether field names duplicates
-	if err := validateDuplicatedFieldName(t.schema.Fields); err != nil {
+	if err := validateDuplicatedFieldName(t.schema); err != nil {
 		return err
 	}
 
@@ -387,42 +421,13 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	}
 
 	for _, field := range t.schema.Fields {
-		// validate field name
-		if err := validateFieldName(field.Name); err != nil {
+		if err := ValidateField(field, t.schema); err != nil {
 			return err
 		}
-		// validate dense vector field type parameters
-		isVectorType := typeutil.IsVectorType(field.DataType)
-		if isVectorType {
-			err = validateDimension(field)
-			if err != nil {
-				return err
-			}
-		}
-		// valid max length per row parameters
-		// if max_length not specified, return error
-		if field.DataType == schemapb.DataType_VarChar ||
-			field.DataType == schemapb.DataType_Text ||
-			(field.GetDataType() == schemapb.DataType_Array && field.GetElementType() == schemapb.DataType_VarChar) {
-			err = validateMaxLengthPerRow(t.schema.Name, field)
-			if err != nil {
-				return err
-			}
-		}
-		// valid max capacity for array per row parameters
-		// if max_capacity not specified, return error
-		if field.DataType == schemapb.DataType_Array {
-			if err = validateMaxCapacityPerRow(t.schema.Name, field); err != nil {
-				return err
-			}
-		}
-		// TODO should remove the index params in the field schema
-		indexParams := funcutil.KeyValuePair2Map(field.GetIndexParams())
-		if err = ValidateAutoIndexMmapConfig(isVectorType, indexParams); err != nil {
-			return err
-		}
+	}
 
-		if err := ctokenizer.ValidateTextSchema(field, wasBm25FunctionInputField(t.schema, field)); err != nil {
+	for _, structArrayField := range t.schema.StructArrayFields {
+		if err := ValidateStructArrayField(structArrayField, t.schema); err != nil {
 			return err
 		}
 	}
@@ -445,7 +450,7 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 
 func (t *createCollectionTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.CreateCollection(ctx, t.CreateCollectionRequest)
+	t.result, err = t.mixCoord.CreateCollection(ctx, t.CreateCollectionRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -453,15 +458,135 @@ func (t *createCollectionTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
+type addCollectionFieldTask struct {
+	baseTask
+	Condition
+	*milvuspb.AddCollectionFieldRequest
+	ctx         context.Context
+	mixCoord    types.MixCoordClient
+	result      *commonpb.Status
+	fieldSchema *schemapb.FieldSchema
+	oldSchema   *schemapb.CollectionSchema
+}
+
+func (t *addCollectionFieldTask) TraceCtx() context.Context {
+	return t.ctx
+}
+
+func (t *addCollectionFieldTask) ID() UniqueID {
+	return t.Base.MsgID
+}
+
+func (t *addCollectionFieldTask) SetID(uid UniqueID) {
+	t.Base.MsgID = uid
+}
+
+func (t *addCollectionFieldTask) Name() string {
+	return AddFieldTaskName
+}
+
+func (t *addCollectionFieldTask) Type() commonpb.MsgType {
+	return t.Base.MsgType
+}
+
+func (t *addCollectionFieldTask) BeginTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *addCollectionFieldTask) EndTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *addCollectionFieldTask) SetTs(ts Timestamp) {
+	t.Base.Timestamp = ts
+}
+
+func (t *addCollectionFieldTask) OnEnqueue() error {
+	if t.Base == nil {
+		t.Base = commonpbutil.NewMsgBase()
+	}
+	t.Base.MsgType = commonpb.MsgType_AddCollectionField
+	t.Base.SourceID = paramtable.GetNodeID()
+	return nil
+}
+
+func (t *addCollectionFieldTask) PreExecute(ctx context.Context) error {
+	if t.oldSchema == nil {
+		return merr.WrapErrParameterInvalidMsg("empty old schema in add field task")
+	}
+	t.fieldSchema = &schemapb.FieldSchema{}
+	err := proto.Unmarshal(t.GetSchema(), t.fieldSchema)
+	if err != nil {
+		return err
+	}
+	fieldList := typeutil.NewSet[string]()
+	for _, schema := range t.oldSchema.Fields {
+		fieldList.Insert(schema.Name)
+	}
+
+	if len(fieldList) >= Params.ProxyCfg.MaxFieldNum.GetAsInt() {
+		msg := fmt.Sprintf("The number of fields has reached the maximum value %d", Params.ProxyCfg.MaxFieldNum.GetAsInt())
+		return merr.WrapErrParameterInvalidMsg(msg)
+	}
+
+	if _, ok := schemapb.DataType_name[int32(t.fieldSchema.DataType)]; !ok || t.fieldSchema.GetDataType() == schemapb.DataType_None {
+		return merr.WrapErrParameterInvalid("valid field", fmt.Sprintf("field data type: %s is not supported", t.fieldSchema.GetDataType()))
+	}
+
+	if typeutil.IsVectorType(t.fieldSchema.DataType) {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support to add vector field, field name = %s", t.fieldSchema.Name))
+	}
+	if funcutil.SliceContain([]string{common.RowIDFieldName, common.TimeStampFieldName, common.MetaFieldName}, t.fieldSchema.GetName()) {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support to add system field, field name = %s", t.fieldSchema.Name))
+	}
+	if t.fieldSchema.IsPrimaryKey {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support to add pk field, field name = %s", t.fieldSchema.Name))
+	}
+	if !t.fieldSchema.Nullable {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("added field must be nullable, please check it, field name = %s", t.fieldSchema.Name))
+	}
+	if t.fieldSchema.AutoID {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("only primary field can speficy AutoID with true, field name = %s", t.fieldSchema.Name))
+	}
+	if t.fieldSchema.IsPartitionKey {
+		return merr.WrapErrParameterInvalidMsg("not support to add partition key field, field name  = %s", t.fieldSchema.Name)
+	}
+	if t.fieldSchema.GetIsClusteringKey() {
+		for _, f := range t.oldSchema.Fields {
+			if f.GetIsClusteringKey() {
+				return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("already has another clutering key field, field name: %s", t.fieldSchema.GetName()))
+			}
+		}
+	}
+	if err := ValidateField(t.fieldSchema, t.oldSchema); err != nil {
+		return err
+	}
+	if fieldList.Contain(t.fieldSchema.Name) {
+		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("duplicate field name: %s", t.fieldSchema.GetName()))
+	}
+
+	log.Info("PreExecute addField task done", zap.Any("field schema", t.fieldSchema))
+	return nil
+}
+
+func (t *addCollectionFieldTask) Execute(ctx context.Context) error {
+	var err error
+	t.result, err = t.mixCoord.AddCollectionField(ctx, t.AddCollectionFieldRequest)
+	return merr.CheckRPCCall(t.result, err)
+}
+
+func (t *addCollectionFieldTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
 type dropCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.DropCollectionRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
-	chMgr     channelsMgr
-	chTicker  channelsTimeTicker
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
+	chMgr    channelsMgr
 }
 
 func (t *dropCollectionTask) TraceCtx() context.Context {
@@ -506,15 +631,15 @@ func (t *dropCollectionTask) OnEnqueue() error {
 }
 
 func (t *dropCollectionTask) PreExecute(ctx context.Context) error {
-	if err := validateCollectionName(t.CollectionName); err != nil {
-		return err
-	}
+	// No need to check collection name
+	// Validation shall be preformed in `CreateCollection`
+	// also permit drop collection one with bad collection name
 	return nil
 }
 
 func (t *dropCollectionTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.DropCollection(ctx, t.DropCollectionRequest)
+	t.result, err = t.mixCoord.DropCollection(ctx, t.DropCollectionRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -526,9 +651,9 @@ type hasCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.HasCollectionRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.BoolResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.BoolResponse
 }
 
 func (t *hasCollectionTask) TraceCtx() context.Context {
@@ -603,9 +728,9 @@ type describeCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.DescribeCollectionRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.DescribeCollectionResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.DescribeCollectionResponse
 }
 
 func (t *describeCollectionTask) TraceCtx() context.Context {
@@ -662,11 +787,12 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 	t.result = &milvuspb.DescribeCollectionResponse{
 		Status: merr.Success(),
 		Schema: &schemapb.CollectionSchema{
-			Name:        "",
-			Description: "",
-			AutoID:      false,
-			Fields:      make([]*schemapb.FieldSchema, 0),
-			Functions:   make([]*schemapb.FunctionSchema, 0),
+			Name:              "",
+			Description:       "",
+			AutoID:            false,
+			Fields:            make([]*schemapb.FieldSchema, 0),
+			Functions:         make([]*schemapb.FunctionSchema, 0),
+			StructArrayFields: make([]*schemapb.StructArrayFieldSchema, 0),
 		},
 		CollectionID:         0,
 		VirtualChannelNames:  nil,
@@ -675,7 +801,8 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 		DbName:               t.GetDbName(),
 	}
 
-	result, err := t.rootCoord.DescribeCollection(ctx, t.DescribeCollectionRequest)
+	ctx = AppendUserInfoForRPC(ctx)
+	result, err := t.mixCoord.DescribeCollection(ctx, t.DescribeCollectionRequest)
 	if err != nil {
 		return err
 	}
@@ -711,28 +838,45 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 	t.result.DbName = result.GetDbName()
 	t.result.NumPartitions = result.NumPartitions
 	t.result.UpdateTimestamp = result.UpdateTimestamp
+	t.result.UpdateTimestampStr = result.UpdateTimestampStr
+	copyFieldSchema := func(field *schemapb.FieldSchema) *schemapb.FieldSchema {
+		return &schemapb.FieldSchema{
+			FieldID:          field.FieldID,
+			Name:             field.Name,
+			IsPrimaryKey:     field.IsPrimaryKey,
+			AutoID:           field.AutoID,
+			Description:      field.Description,
+			DataType:         field.DataType,
+			TypeParams:       field.TypeParams,
+			IndexParams:      field.IndexParams,
+			IsDynamic:        field.IsDynamic,
+			IsPartitionKey:   field.IsPartitionKey,
+			IsClusteringKey:  field.IsClusteringKey,
+			DefaultValue:     field.DefaultValue,
+			ElementType:      field.ElementType,
+			Nullable:         field.Nullable,
+			IsFunctionOutput: field.IsFunctionOutput,
+		}
+	}
+
 	for _, field := range result.Schema.Fields {
 		if field.IsDynamic {
 			continue
 		}
 		if field.FieldID >= common.StartOfUserFieldID {
-			t.result.Schema.Fields = append(t.result.Schema.Fields, &schemapb.FieldSchema{
-				FieldID:          field.FieldID,
-				Name:             field.Name,
-				IsPrimaryKey:     field.IsPrimaryKey,
-				AutoID:           field.AutoID,
-				Description:      field.Description,
-				DataType:         field.DataType,
-				TypeParams:       field.TypeParams,
-				IndexParams:      field.IndexParams,
-				IsDynamic:        field.IsDynamic,
-				IsPartitionKey:   field.IsPartitionKey,
-				IsClusteringKey:  field.IsClusteringKey,
-				DefaultValue:     field.DefaultValue,
-				ElementType:      field.ElementType,
-				Nullable:         field.Nullable,
-				IsFunctionOutput: field.IsFunctionOutput,
-			})
+			t.result.Schema.Fields = append(t.result.Schema.Fields, copyFieldSchema(field))
+		}
+	}
+
+	for i, structArrayField := range result.Schema.StructArrayFields {
+		t.result.Schema.StructArrayFields = append(t.result.Schema.StructArrayFields, &schemapb.StructArrayFieldSchema{
+			FieldID:     structArrayField.FieldID,
+			Name:        structArrayField.Name,
+			Description: structArrayField.Description,
+			Fields:      make([]*schemapb.FieldSchema, 0, len(structArrayField.Fields)),
+		})
+		for _, field := range structArrayField.Fields {
+			t.result.Schema.StructArrayFields[i].Fields = append(t.result.Schema.StructArrayFields[i].Fields, copyFieldSchema(field))
 		}
 	}
 
@@ -750,10 +894,9 @@ type showCollectionsTask struct {
 	baseTask
 	Condition
 	*milvuspb.ShowCollectionsRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	queryCoord types.QueryCoordClient
-	result     *milvuspb.ShowCollectionsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.ShowCollectionsResponse
 }
 
 func (t *showCollectionsTask) TraceCtx() context.Context {
@@ -809,7 +952,7 @@ func (t *showCollectionsTask) PreExecute(ctx context.Context) error {
 
 func (t *showCollectionsTask) Execute(ctx context.Context) error {
 	ctx = AppendUserInfoForRPC(ctx)
-	respFromRootCoord, err := t.rootCoord.ShowCollections(ctx, t.ShowCollectionsRequest)
+	respFromRootCoord, err := t.mixCoord.ShowCollections(ctx, t.ShowCollectionsRequest)
 	if err = merr.CheckRPCCall(respFromRootCoord, err); err != nil {
 		return err
 	}
@@ -832,7 +975,7 @@ func (t *showCollectionsTask) Execute(ctx context.Context) error {
 			IDs2Names[collectionID] = collectionName
 		}
 
-		resp, err := t.queryCoord.ShowCollections(ctx, &querypb.ShowCollectionsRequest{
+		resp, err := t.mixCoord.ShowLoadCollections(ctx, &querypb.ShowCollectionsRequest{
 			Base: commonpbutil.UpdateMsgBase(
 				t.Base,
 				commonpbutil.WithMsgType(commonpb.MsgType_ShowCollections),
@@ -903,11 +1046,9 @@ type alterCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.AlterCollectionRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	result     *commonpb.Status
-	queryCoord types.QueryCoordClient
-	dataCoord  types.DataCoordClient
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *alterCollectionTask) TraceCtx() context.Context {
@@ -1018,7 +1159,7 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 
 	if len(t.GetProperties()) > 0 {
 		if hasMmapProp(t.Properties...) || hasLazyLoadProp(t.Properties...) {
-			loaded, err := isCollectionLoaded(ctx, t.queryCoord, t.CollectionID)
+			loaded, err := isCollectionLoaded(ctx, t.mixCoord, t.CollectionID)
 			if err != nil {
 				return err
 			}
@@ -1029,7 +1170,7 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 	} else if len(t.GetDeleteKeys()) > 0 {
 		key := hasPropInDeletekeys(t.DeleteKeys)
 		if key != "" {
-			loaded, err := isCollectionLoaded(ctx, t.queryCoord, t.CollectionID)
+			loaded, err := isCollectionLoaded(ctx, t.mixCoord, t.CollectionID)
 			if err != nil {
 				return err
 			}
@@ -1074,7 +1215,7 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 
 		hasVecIndex := false
 		indexName := ""
-		indexResponse, err := t.dataCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+		indexResponse, err := t.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
 			CollectionID: t.CollectionID,
 			IndexName:    "",
 		})
@@ -1101,7 +1242,7 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 	}
 	endTS, ok := common.GetReplicateEndTS(t.Properties)
 	if ok && collBasicInfo.replicateID != "" {
-		allocResp, err := t.rootCoord.AllocTimestamp(ctx, &rootcoordpb.AllocTimestampRequest{
+		allocResp, err := t.mixCoord.AllocTimestamp(ctx, &rootcoordpb.AllocTimestampRequest{
 			Count:          1,
 			BlockTimestamp: endTS,
 		})
@@ -1119,8 +1260,11 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 
 func (t *alterCollectionTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.AlterCollection(ctx, t.AlterCollectionRequest)
-	return merr.CheckRPCCall(t.result, err)
+	t.result, err = t.mixCoord.AlterCollection(ctx, t.AlterCollectionRequest)
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *alterCollectionTask) PostExecute(ctx context.Context) error {
@@ -1131,11 +1275,9 @@ type alterCollectionFieldTask struct {
 	baseTask
 	Condition
 	*milvuspb.AlterCollectionFieldRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	result     *commonpb.Status
-	queryCoord types.QueryCoordClient
-	dataCoord  types.DataCoordClient
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *alterCollectionFieldTask) TraceCtx() context.Context {
@@ -1183,13 +1325,18 @@ const (
 	MmapEnabledKey = "mmap_enabled"
 )
 
-var allowedProps = []string{
+var allowedAlterProps = []string{
 	common.MaxLengthKey,
+	common.MmapEnabledKey,
+	common.MaxCapacityKey,
+}
+
+var allowedDropProps = []string{
 	common.MmapEnabledKey,
 }
 
-func IsKeyAllowed(key string) bool {
-	for _, allowedKey := range allowedProps {
+func IsKeyAllowAlter(key string) bool {
+	for _, allowedKey := range allowedAlterProps {
 		if key == allowedKey {
 			return true
 		}
@@ -1197,15 +1344,29 @@ func IsKeyAllowed(key string) bool {
 	return false
 }
 
+func IsKeyAllowDrop(key string) bool {
+	for _, allowedKey := range allowedDropProps {
+		if key == allowedKey {
+			return true
+		}
+	}
+	return false
+}
+
+func updateKey(key string) string {
+	var updatedKey string
+	if key == MmapEnabledKey {
+		updatedKey = common.MmapEnabledKey
+	} else {
+		updatedKey = key
+	}
+	return updatedKey
+}
+
 func updatePropertiesKeys(oldProps []*commonpb.KeyValuePair) []*commonpb.KeyValuePair {
 	props := make(map[string]string)
 	for _, prop := range oldProps {
-		var updatedKey string
-		if prop.Key == MmapEnabledKey {
-			updatedKey = common.MmapEnabledKey
-		} else {
-			updatedKey = prop.Key
-		}
+		updatedKey := updateKey(prop.Key)
 		props[updatedKey] = prop.Value
 	}
 
@@ -1225,21 +1386,30 @@ func (t *alterCollectionFieldTask) PreExecute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	isCollectionLoadedFn := func() (bool, error) {
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, t.GetDbName(), t.CollectionName)
+		if err != nil {
+			return false, err
+		}
+		loaded, err1 := isCollectionLoaded(ctx, t.mixCoord, collectionID)
+		if err1 != nil {
+			return false, err1
+		}
+		return loaded, nil
+	}
+
 	t.Properties = updatePropertiesKeys(t.Properties)
 	for _, prop := range t.Properties {
-		if !IsKeyAllowed(prop.Key) {
+		if !IsKeyAllowAlter(prop.Key) {
 			return merr.WrapErrParameterInvalidMsg("%s does not allow update in collection field param", prop.Key)
 		}
 		// Check the value type based on the key
 		switch prop.Key {
 		case common.MmapEnabledKey:
-			collectionID, err := globalMetaCache.GetCollectionID(ctx, t.GetDbName(), t.CollectionName)
+			loaded, err := isCollectionLoadedFn()
 			if err != nil {
 				return err
-			}
-			loaded, err1 := isCollectionLoaded(ctx, t.queryCoord, collectionID)
-			if err1 != nil {
-				return err1
 			}
 			if loaded {
 				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter collection field properties if collection loaded")
@@ -1248,36 +1418,80 @@ func (t *alterCollectionFieldTask) PreExecute(ctx context.Context) error {
 		case common.MaxLengthKey:
 			IsStringType := false
 			fieldName := ""
-			var dataType int32
 			for _, field := range collSchema.Fields {
 				if field.GetName() == t.FieldName && (typeutil.IsStringType(field.DataType) || typeutil.IsArrayContainStringElementType(field.DataType, field.ElementType)) {
 					IsStringType = true
 					fieldName = field.GetName()
-					dataType = int32(field.DataType)
+					break
 				}
 			}
 			if !IsStringType {
-				return merr.WrapErrParameterInvalid(fieldName, "%s can not modify the maxlength for non-string types", schemapb.DataType_name[dataType])
+				return merr.WrapErrParameterInvalidMsg("%s can not modify the maxlength for non-string types", fieldName)
 			}
 			value, err := strconv.Atoi(prop.Value)
 			if err != nil {
-				return merr.WrapErrParameterInvalid("%s should be an integer, but got %T", prop.Key, prop.Value)
+				return merr.WrapErrParameterInvalidMsg("%s should be an integer, but got %T", prop.Key, prop.Value)
 			}
 
 			defaultMaxVarCharLength := Params.ProxyCfg.MaxVarCharLength.GetAsInt64()
 			if int64(value) > defaultMaxVarCharLength {
 				return merr.WrapErrParameterInvalidMsg("%s exceeds the maximum allowed value %s", prop.Value, strconv.FormatInt(defaultMaxVarCharLength, 10))
 			}
+		case common.MaxCapacityKey:
+			IsArrayType := false
+			fieldName := ""
+			for _, field := range collSchema.Fields {
+				if field.GetName() == t.FieldName && typeutil.IsArrayType(field.DataType) {
+					IsArrayType = true
+					fieldName = field.GetName()
+					break
+				}
+			}
+			if !IsArrayType {
+				return merr.WrapErrParameterInvalidMsg("%s can not modify the maxcapacity for non-array types", fieldName)
+			}
+
+			maxCapacityPerRow, err := strconv.ParseInt(prop.Value, 10, 64)
+			if err != nil {
+				return merr.WrapErrParameterInvalidMsg("the value for %s of field %s must be an integer", common.MaxCapacityKey, fieldName)
+			}
+			if maxCapacityPerRow > defaultMaxArrayCapacity || maxCapacityPerRow <= 0 {
+				return merr.WrapErrParameterInvalidMsg("the maximum capacity specified for a Array should be in (0, %d]", defaultMaxArrayCapacity)
+			}
 		}
 	}
+
+	deleteKeys := make([]string, 0)
+	for _, key := range t.DeleteKeys {
+		updatedKey := updateKey(key)
+		if !IsKeyAllowDrop(updatedKey) {
+			return merr.WrapErrParameterInvalidMsg("%s is not allowed to drop in collection field param", key)
+		}
+
+		if updatedKey == common.MmapEnabledKey {
+			loaded, err := isCollectionLoadedFn()
+			if err != nil {
+				return err
+			}
+			if loaded {
+				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not drop collection field properties if collection loaded")
+			}
+		}
+
+		deleteKeys = append(deleteKeys, updatedKey)
+	}
+	t.DeleteKeys = deleteKeys
 
 	return nil
 }
 
 func (t *alterCollectionFieldTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.rootCoord.AlterCollectionField(ctx, t.AlterCollectionFieldRequest)
-	return merr.CheckRPCCall(t.result, err)
+	t.result, err = t.mixCoord.AlterCollectionField(ctx, t.AlterCollectionFieldRequest)
+	if err = merr.CheckRPCCall(t.result, err); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *alterCollectionFieldTask) PostExecute(ctx context.Context) error {
@@ -1288,10 +1502,9 @@ type createPartitionTask struct {
 	baseTask
 	Condition
 	*milvuspb.CreatePartitionRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *createPartitionTask) TraceCtx() context.Context {
@@ -1358,7 +1571,7 @@ func (t *createPartitionTask) PreExecute(ctx context.Context) error {
 }
 
 func (t *createPartitionTask) Execute(ctx context.Context) (err error) {
-	t.result, err = t.rootCoord.CreatePartition(ctx, t.CreatePartitionRequest)
+	t.result, err = t.mixCoord.CreatePartition(ctx, t.CreatePartitionRequest)
 	if err := merr.CheckRPCCall(t.result, err); err != nil {
 		return err
 	}
@@ -1372,7 +1585,7 @@ func (t *createPartitionTask) Execute(ctx context.Context) (err error) {
 		t.result = merr.Status(err)
 		return err
 	}
-	t.result, err = t.queryCoord.SyncNewCreatedPartition(ctx, &querypb.SyncNewCreatedPartitionRequest{
+	t.result, err = t.mixCoord.SyncNewCreatedPartition(ctx, &querypb.SyncNewCreatedPartitionRequest{
 		Base:         commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_ReleasePartitions)),
 		CollectionID: collectionID,
 		PartitionID:  partitionID,
@@ -1388,10 +1601,9 @@ type dropPartitionTask struct {
 	baseTask
 	Condition
 	*milvuspb.DropPartitionRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *dropPartitionTask) TraceCtx() context.Context {
@@ -1466,12 +1678,12 @@ func (t *dropPartitionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	collLoaded, err := isCollectionLoaded(ctx, t.queryCoord, collID)
+	collLoaded, err := isCollectionLoaded(ctx, t.mixCoord, collID)
 	if err != nil {
 		return err
 	}
 	if collLoaded {
-		loaded, err := isPartitionLoaded(ctx, t.queryCoord, collID, partID)
+		loaded, err := isPartitionLoaded(ctx, t.mixCoord, collID, partID)
 		if err != nil {
 			return err
 		}
@@ -1484,7 +1696,7 @@ func (t *dropPartitionTask) PreExecute(ctx context.Context) error {
 }
 
 func (t *dropPartitionTask) Execute(ctx context.Context) (err error) {
-	t.result, err = t.rootCoord.DropPartition(ctx, t.DropPartitionRequest)
+	t.result, err = t.mixCoord.DropPartition(ctx, t.DropPartitionRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -1496,9 +1708,9 @@ type hasPartitionTask struct {
 	baseTask
 	Condition
 	*milvuspb.HasPartitionRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.BoolResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.BoolResponse
 }
 
 func (t *hasPartitionTask) TraceCtx() context.Context {
@@ -1556,7 +1768,7 @@ func (t *hasPartitionTask) PreExecute(ctx context.Context) error {
 }
 
 func (t *hasPartitionTask) Execute(ctx context.Context) (err error) {
-	t.result, err = t.rootCoord.HasPartition(ctx, t.HasPartitionRequest)
+	t.result, err = t.mixCoord.HasPartition(ctx, t.HasPartitionRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -1568,10 +1780,9 @@ type showPartitionsTask struct {
 	baseTask
 	Condition
 	*milvuspb.ShowPartitionsRequest
-	ctx        context.Context
-	rootCoord  types.RootCoordClient
-	queryCoord types.QueryCoordClient
-	result     *milvuspb.ShowPartitionsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.ShowPartitionsResponse
 }
 
 func (t *showPartitionsTask) TraceCtx() context.Context {
@@ -1632,7 +1843,7 @@ func (t *showPartitionsTask) PreExecute(ctx context.Context) error {
 }
 
 func (t *showPartitionsTask) Execute(ctx context.Context) error {
-	respFromRootCoord, err := t.rootCoord.ShowPartitions(ctx, t.ShowPartitionsRequest)
+	respFromRootCoord, err := t.mixCoord.ShowPartitions(ctx, t.ShowPartitionsRequest)
 	if err = merr.CheckRPCCall(respFromRootCoord, err); err != nil {
 		return err
 	}
@@ -1661,7 +1872,7 @@ func (t *showPartitionsTask) Execute(ctx context.Context) error {
 			partitionIDs = append(partitionIDs, partitionID)
 			IDs2Names[partitionID] = partitionName
 		}
-		resp, err := t.queryCoord.ShowPartitions(ctx, &querypb.ShowPartitionsRequest{
+		resp, err := t.mixCoord.ShowLoadPartitions(ctx, &querypb.ShowPartitionsRequest{
 			Base: commonpbutil.UpdateMsgBase(
 				t.Base,
 				commonpbutil.WithMsgType(commonpb.MsgType_ShowCollections),
@@ -1712,17 +1923,17 @@ func (t *showPartitionsTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
+const LoadPriorityName = "load_priority"
+
 type loadCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.LoadCollectionRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	datacoord  types.DataCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
-	collectionID       UniqueID
-	replicateMsgStream msgstream.MsgStream
+	collectionID UniqueID
 }
 
 func (t *loadCollectionTask) TraceCtx() context.Context {
@@ -1779,6 +1990,15 @@ func (t *loadCollectionTask) PreExecute(ctx context.Context) error {
 	return nil
 }
 
+func (t *loadCollectionTask) GetLoadPriority() commonpb.LoadPriority {
+	loadPriority := commonpb.LoadPriority_HIGH
+	loadPriorityStr, ok := t.LoadCollectionRequest.LoadParams[LoadPriorityName]
+	if ok && loadPriorityStr == "low" {
+		loadPriority = commonpb.LoadPriority_LOW
+	}
+	return loadPriority
+}
+
 func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
 	collID, err := globalMetaCache.GetCollectionID(ctx, t.GetDbName(), t.CollectionName)
 
@@ -1803,7 +2023,7 @@ func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
 	}
 
 	// check index
-	indexResponse, err := t.datacoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+	indexResponse, err := t.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
 		CollectionID: collID,
 		IndexName:    "",
 	})
@@ -1833,6 +2053,8 @@ func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
 		}
 	}
 
+	// todo(SpadeA): check vector field in StructArrayField when index is implemented
+
 	if len(unindexedVecFields) != 0 {
 		errMsg := fmt.Sprintf("there is no vector index on field: %v, please create index firstly", unindexedVecFields)
 		log.Debug(errMsg)
@@ -1851,14 +2073,15 @@ func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
 		Refresh:        t.Refresh,
 		ResourceGroups: t.ResourceGroups,
 		LoadFields:     loadFields,
+		Priority:       t.GetLoadPriority(),
 	}
-	log.Debug("send LoadCollectionRequest to query coordinator",
-		zap.Any("schema", request.Schema))
-	t.result, err = t.queryCoord.LoadCollection(ctx, request)
+	log.Info("send LoadCollectionRequest to query coordinator",
+		zap.Any("schema", request.Schema),
+		zap.Int32("priority", int32(request.GetPriority())))
+	t.result, err = t.mixCoord.LoadCollection(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return fmt.Errorf("call query coordinator LoadCollection: %s", err)
 	}
-	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.LoadCollectionRequest)
 	return nil
 }
 
@@ -1877,12 +2100,11 @@ type releaseCollectionTask struct {
 	baseTask
 	Condition
 	*milvuspb.ReleaseCollectionRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
-	collectionID       UniqueID
-	replicateMsgStream msgstream.MsgStream
+	collectionID UniqueID
 }
 
 func (t *releaseCollectionTask) TraceCtx() context.Context {
@@ -1951,12 +2173,11 @@ func (t *releaseCollectionTask) Execute(ctx context.Context) (err error) {
 		CollectionID: collID,
 	}
 
-	t.result, err = t.queryCoord.ReleaseCollection(ctx, request)
+	t.result, err = t.mixCoord.ReleaseCollection(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
 	}
 
-	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.ReleaseCollectionRequest)
 	return nil
 }
 
@@ -1968,13 +2189,11 @@ type loadPartitionsTask struct {
 	baseTask
 	Condition
 	*milvuspb.LoadPartitionsRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	datacoord  types.DataCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
-	collectionID       UniqueID
-	replicateMsgStream msgstream.MsgStream
+	collectionID UniqueID
 }
 
 func (t *loadPartitionsTask) TraceCtx() context.Context {
@@ -2036,6 +2255,15 @@ func (t *loadPartitionsTask) PreExecute(ctx context.Context) error {
 	return nil
 }
 
+func (t *loadPartitionsTask) GetLoadPriority() commonpb.LoadPriority {
+	loadPriority := commonpb.LoadPriority_HIGH
+	loadPriorityStr, ok := t.LoadPartitionsRequest.LoadParams[LoadPriorityName]
+	if ok && loadPriorityStr == "low" {
+		loadPriority = commonpb.LoadPriority_LOW
+	}
+	return loadPriority
+}
+
 func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 	var partitionIDs []int64
 	collID, err := globalMetaCache.GetCollectionID(ctx, t.GetDbName(), t.CollectionName)
@@ -2053,7 +2281,7 @@ func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 		return err
 	}
 	// check index
-	indexResponse, err := t.datacoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+	indexResponse, err := t.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
 		CollectionID: collID,
 		IndexName:    "",
 	})
@@ -2082,6 +2310,8 @@ func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 			}
 		}
 	}
+
+	// todo(SpadeA): check vector field in StructArrayField when index is implemented
 
 	if len(unindexedVecFields) != 0 {
 		errMsg := fmt.Sprintf("there is no vector index on field: %v, please create index firstly", unindexedVecFields)
@@ -2113,12 +2343,15 @@ func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 		Refresh:        t.Refresh,
 		ResourceGroups: t.ResourceGroups,
 		LoadFields:     loadFields,
+		Priority:       t.GetLoadPriority(),
 	}
-	t.result, err = t.queryCoord.LoadPartitions(ctx, request)
+	log.Info("send LoadPartitionRequest to query coordinator",
+		zap.Any("schema", request.Schema),
+		zap.Int32("priority", int32(request.GetPriority())))
+	t.result, err = t.mixCoord.LoadPartitions(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
 	}
-	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.LoadPartitionsRequest)
 
 	return nil
 }
@@ -2131,12 +2364,11 @@ type releasePartitionsTask struct {
 	baseTask
 	Condition
 	*milvuspb.ReleasePartitionsRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
-	collectionID       UniqueID
-	replicateMsgStream msgstream.MsgStream
+	collectionID UniqueID
 }
 
 func (t *releasePartitionsTask) TraceCtx() context.Context {
@@ -2221,11 +2453,10 @@ func (t *releasePartitionsTask) Execute(ctx context.Context) (err error) {
 		CollectionID: collID,
 		PartitionIDs: partitionIDs,
 	}
-	t.result, err = t.queryCoord.ReleasePartitions(ctx, request)
+	t.result, err = t.mixCoord.ReleasePartitions(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
 	}
-	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.ReleasePartitionsRequest)
 	return nil
 }
 
@@ -2237,9 +2468,9 @@ type CreateResourceGroupTask struct {
 	baseTask
 	Condition
 	*milvuspb.CreateResourceGroupRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *CreateResourceGroupTask) TraceCtx() context.Context {
@@ -2289,7 +2520,7 @@ func (t *CreateResourceGroupTask) PreExecute(ctx context.Context) error {
 
 func (t *CreateResourceGroupTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.queryCoord.CreateResourceGroup(ctx, t.CreateResourceGroupRequest)
+	t.result, err = t.mixCoord.CreateResourceGroup(ctx, t.CreateResourceGroupRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -2301,9 +2532,9 @@ type UpdateResourceGroupsTask struct {
 	baseTask
 	Condition
 	*milvuspb.UpdateResourceGroupsRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *UpdateResourceGroupsTask) TraceCtx() context.Context {
@@ -2353,7 +2584,7 @@ func (t *UpdateResourceGroupsTask) PreExecute(ctx context.Context) error {
 
 func (t *UpdateResourceGroupsTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.queryCoord.UpdateResourceGroups(ctx, &querypb.UpdateResourceGroupsRequest{
+	t.result, err = t.mixCoord.UpdateResourceGroups(ctx, &querypb.UpdateResourceGroupsRequest{
 		Base:           t.UpdateResourceGroupsRequest.GetBase(),
 		ResourceGroups: t.UpdateResourceGroupsRequest.GetResourceGroups(),
 	})
@@ -2368,9 +2599,9 @@ type DropResourceGroupTask struct {
 	baseTask
 	Condition
 	*milvuspb.DropResourceGroupRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *DropResourceGroupTask) TraceCtx() context.Context {
@@ -2420,7 +2651,7 @@ func (t *DropResourceGroupTask) PreExecute(ctx context.Context) error {
 
 func (t *DropResourceGroupTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.queryCoord.DropResourceGroup(ctx, t.DropResourceGroupRequest)
+	t.result, err = t.mixCoord.DropResourceGroup(ctx, t.DropResourceGroupRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -2432,9 +2663,9 @@ type DescribeResourceGroupTask struct {
 	baseTask
 	Condition
 	*milvuspb.DescribeResourceGroupRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *milvuspb.DescribeResourceGroupResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.DescribeResourceGroupResponse
 }
 
 func (t *DescribeResourceGroupTask) TraceCtx() context.Context {
@@ -2484,7 +2715,7 @@ func (t *DescribeResourceGroupTask) PreExecute(ctx context.Context) error {
 
 func (t *DescribeResourceGroupTask) Execute(ctx context.Context) error {
 	var err error
-	resp, err := t.queryCoord.DescribeResourceGroup(ctx, &querypb.DescribeResourceGroupRequest{
+	resp, err := t.mixCoord.DescribeResourceGroup(ctx, &querypb.DescribeResourceGroupRequest{
 		ResourceGroup: t.ResourceGroup,
 	})
 	if err != nil {
@@ -2557,9 +2788,9 @@ type TransferNodeTask struct {
 	baseTask
 	Condition
 	*milvuspb.TransferNodeRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *TransferNodeTask) TraceCtx() context.Context {
@@ -2609,7 +2840,7 @@ func (t *TransferNodeTask) PreExecute(ctx context.Context) error {
 
 func (t *TransferNodeTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.queryCoord.TransferNode(ctx, t.TransferNodeRequest)
+	t.result, err = t.mixCoord.TransferNode(ctx, t.TransferNodeRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
@@ -2621,9 +2852,9 @@ type TransferReplicaTask struct {
 	baseTask
 	Condition
 	*milvuspb.TransferReplicaRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 }
 
 func (t *TransferReplicaTask) TraceCtx() context.Context {
@@ -2677,7 +2908,7 @@ func (t *TransferReplicaTask) Execute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	t.result, err = t.queryCoord.TransferReplica(ctx, &querypb.TransferReplicaRequest{
+	t.result, err = t.mixCoord.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: t.SourceResourceGroup,
 		TargetResourceGroup: t.TargetResourceGroup,
 		CollectionID:        collID,
@@ -2694,9 +2925,9 @@ type ListResourceGroupsTask struct {
 	baseTask
 	Condition
 	*milvuspb.ListResourceGroupsRequest
-	ctx        context.Context
-	queryCoord types.QueryCoordClient
-	result     *milvuspb.ListResourceGroupsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.ListResourceGroupsResponse
 }
 
 func (t *ListResourceGroupsTask) TraceCtx() context.Context {
@@ -2746,11 +2977,126 @@ func (t *ListResourceGroupsTask) PreExecute(ctx context.Context) error {
 
 func (t *ListResourceGroupsTask) Execute(ctx context.Context) error {
 	var err error
-	t.result, err = t.queryCoord.ListResourceGroups(ctx, t.ListResourceGroupsRequest)
+	t.result, err = t.mixCoord.ListResourceGroups(ctx, t.ListResourceGroupsRequest)
 	return merr.CheckRPCCall(t.result, err)
 }
 
 func (t *ListResourceGroupsTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
+type RunAnalyzerTask struct {
+	baseTask
+	Condition
+	*milvuspb.RunAnalyzerRequest
+	ctx          context.Context
+	collectionID typeutil.UniqueID
+	fieldID      typeutil.UniqueID
+	dbName       string
+	lb           LBPolicy
+
+	result *milvuspb.RunAnalyzerResponse
+}
+
+func (t *RunAnalyzerTask) TraceCtx() context.Context {
+	return t.ctx
+}
+
+func (t *RunAnalyzerTask) ID() UniqueID {
+	return t.Base.MsgID
+}
+
+func (t *RunAnalyzerTask) SetID(uid UniqueID) {
+	t.Base.MsgID = uid
+}
+
+func (t *RunAnalyzerTask) Name() string {
+	return RunAnalyzerTaskName
+}
+
+func (t *RunAnalyzerTask) Type() commonpb.MsgType {
+	return t.Base.MsgType
+}
+
+func (t *RunAnalyzerTask) BeginTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *RunAnalyzerTask) EndTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *RunAnalyzerTask) SetTs(ts Timestamp) {
+	t.Base.Timestamp = ts
+}
+
+func (t *RunAnalyzerTask) OnEnqueue() error {
+	if t.Base == nil {
+		t.Base = commonpbutil.NewMsgBase()
+	}
+	t.Base.MsgType = commonpb.MsgType_RunAnalyzer
+	t.Base.SourceID = paramtable.GetNodeID()
+	return nil
+}
+
+func (t *RunAnalyzerTask) PreExecute(ctx context.Context) error {
+	t.dbName = t.GetDbName()
+
+	collID, err := globalMetaCache.GetCollectionID(ctx, t.dbName, t.GetCollectionName())
+	if err != nil { // err is not nil if collection not exists
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
+	}
+
+	t.collectionID = collID
+
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, t.dbName, t.GetCollectionName())
+	if err != nil { // err is not nil if collection not exists
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
+	}
+
+	fieldId, ok := schema.MapFieldID(t.GetFieldName())
+	if !ok {
+		return merr.WrapErrAsInputError(merr.WrapErrFieldNotFound(t.GetFieldName()))
+	}
+
+	t.fieldID = fieldId
+	t.result = &milvuspb.RunAnalyzerResponse{}
+	return nil
+}
+
+func (t *RunAnalyzerTask) runAnalyzerOnShardleader(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
+	resp, err := qn.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+		Channel:       channel,
+		FieldId:       t.fieldID,
+		AnalyzerNames: t.GetAnalyzerNames(),
+		Placeholder:   t.GetPlaceholder(),
+		WithDetail:    t.GetWithDetail(),
+		WithHash:      t.GetWithHash(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := merr.Error(resp.GetStatus()); err != nil {
+		return err
+	}
+	t.result = resp
+	return nil
+}
+
+func (t *RunAnalyzerTask) Execute(ctx context.Context) error {
+	err := t.lb.ExecuteOneChannel(ctx, CollectionWorkLoad{
+		db:             t.dbName,
+		collectionName: t.GetCollectionName(),
+		collectionID:   t.collectionID,
+		nq:             int64(len(t.GetPlaceholder())),
+		exec:           t.runAnalyzerOnShardleader,
+	})
+
+	return err
+}
+
+func (t *RunAnalyzerTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 

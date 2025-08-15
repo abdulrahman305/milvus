@@ -29,9 +29,11 @@ namespace index {
 
 template <typename T>
 HybridScalarIndex<T>::HybridScalarIndex(
+    uint32_t tantivy_index_version,
     const storage::FileManagerContext& file_manager_context)
     : ScalarIndex<T>(HYBRID_INDEX_TYPE),
       is_built_(false),
+      tantivy_index_version_(tantivy_index_version),
       bitmap_index_cardinality_limit_(
           DEFAULT_HYBRID_INDEX_BITMAP_CARDINALITY_LIMIT),
       file_manager_context_(file_manager_context) {
@@ -54,7 +56,11 @@ HybridScalarIndex<T>::SelectIndexBuildType(size_t n, const T* values) {
 
     // Decide whether to select bitmap index or inverted sort
     if (distinct_vals.size() >= bitmap_index_cardinality_limit_) {
-        internal_index_type_ = ScalarIndexType::INVERTED;
+        if constexpr (std::is_integral_v<T>) {
+            internal_index_type_ = ScalarIndexType::STLSORT;
+        } else {
+            internal_index_type_ = ScalarIndexType::INVERTED;
+        }
     } else {
         internal_index_type_ = ScalarIndexType::BITMAP;
     }
@@ -100,7 +106,11 @@ HybridScalarIndex<T>::SelectBuildTypeForPrimitiveType(
 
     // Decide whether to select bitmap index or inverted sort
     if (distinct_vals.size() >= bitmap_index_cardinality_limit_) {
-        internal_index_type_ = ScalarIndexType::INVERTED;
+        if constexpr (std::is_integral_v<T>) {
+            internal_index_type_ = ScalarIndexType::STLSORT;
+        } else {
+            internal_index_type_ = ScalarIndexType::INVERTED;
+        }
     } else {
         internal_index_type_ = ScalarIndexType::BITMAP;
     }
@@ -172,7 +182,7 @@ HybridScalarIndex<T>::SelectIndexBuildType(
     } else if (IsArrayType(field_type_)) {
         return SelectBuildTypeForArrayType(field_datas);
     } else {
-        PanicInfo(Unsupported,
+        ThrowInfo(Unsupported,
                   fmt::format("unsupported build index for type {}",
                               DataType_Name(field_type_)));
     }
@@ -191,10 +201,10 @@ HybridScalarIndex<T>::GetInternalIndex() {
         internal_index_ =
             std::make_shared<ScalarIndexSort<T>>(file_manager_context_);
     } else if (internal_index_type_ == ScalarIndexType::INVERTED) {
-        internal_index_ =
-            std::make_shared<InvertedIndexTantivy<T>>(file_manager_context_);
+        internal_index_ = std::make_shared<InvertedIndexTantivy<T>>(
+            tantivy_index_version_, file_manager_context_);
     } else {
-        PanicInfo(UnexpectedError,
+        ThrowInfo(UnexpectedError,
                   "unknown index type when get internal index");
     }
     return internal_index_;
@@ -215,9 +225,9 @@ HybridScalarIndex<std::string>::GetInternalIndex() {
             std::make_shared<StringIndexMarisa>(file_manager_context_);
     } else if (internal_index_type_ == ScalarIndexType::INVERTED) {
         internal_index_ = std::make_shared<InvertedIndexTantivy<std::string>>(
-            file_manager_context_);
+            tantivy_index_version_, file_manager_context_);
     } else {
-        PanicInfo(UnexpectedError,
+        ThrowInfo(UnexpectedError,
                   "unknown index type when get internal index");
     }
     return internal_index_;
@@ -242,14 +252,8 @@ HybridScalarIndex<T>::Build(const Config& config) {
         GetBitmapCardinalityLimitFromConfig(config);
     LOG_INFO("config bitmap cardinality limit to {}",
              bitmap_index_cardinality_limit_);
-
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build index");
-
     auto field_datas =
-        mem_file_manager_->CacheRawDataToMemory(insert_files.value());
+        storage::CacheRawDataAndFillMissing(mem_file_manager_, config);
 
     SelectIndexBuildType(field_datas);
     BuildInternal(field_datas);
@@ -361,17 +365,12 @@ HybridScalarIndex<T>::Load(milvus::tracer::TraceContext ctx,
     auto index_type_file = GetRemoteIndexTypeFile(index_files.value());
 
     auto index_datas = mem_file_manager_->LoadIndexToMemory(
-        std::vector<std::string>{index_type_file});
-    AssembleIndexDatas(index_datas);
+        std::vector<std::string>{index_type_file},
+        config[milvus::LOAD_PRIORITY]);
     BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        auto size = data->DataSize();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        binary_set.Append(key, buf, size);
-    }
-
+    AssembleIndexDatas(index_datas, binary_set);
+    // clear index_datas to free memory early
+    index_datas.clear();
     DeserializeIndexType(binary_set);
 
     auto index = GetInternalIndex();

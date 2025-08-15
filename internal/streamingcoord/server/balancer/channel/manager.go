@@ -10,6 +10,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -18,10 +19,17 @@ var ErrChannelNotExist = errors.New("channel not exist")
 
 // RecoverChannelManager creates a new channel manager.
 func RecoverChannelManager(ctx context.Context, incomingChannel ...string) (*ChannelManager, error) {
-	channels, metrics, err := recoverFromConfigurationAndMeta(ctx, incomingChannel...)
+	// streamingVersion is used to identify current streaming service version.
+	// Used to check if there's some upgrade happens.
+	streamingVersion, err := resource.Resource().StreamingCatalog().GetVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
+	channels, metrics, err := recoverFromConfigurationAndMeta(ctx, streamingVersion, incomingChannel...)
+	if err != nil {
+		return nil, err
+	}
+
 	globalVersion := paramtable.GetNodeID()
 	return &ChannelManager{
 		cond:     syncutil.NewContextCond(&sync.Mutex{}),
@@ -30,12 +38,13 @@ func RecoverChannelManager(ctx context.Context, incomingChannel ...string) (*Cha
 			Global: globalVersion, // global version should be keep increasing globally, it's ok to use node id.
 			Local:  0,
 		},
-		metrics: metrics,
+		metrics:          metrics,
+		streamingVersion: streamingVersion,
 	}, nil
 }
 
 // recoverFromConfigurationAndMeta recovers the channel manager from configuration and meta.
-func recoverFromConfigurationAndMeta(ctx context.Context, incomingChannel ...string) (map[string]*PChannelMeta, *channelMetrics, error) {
+func recoverFromConfigurationAndMeta(ctx context.Context, streamingVersion *streamingpb.StreamingVersion, incomingChannel ...string) (map[ChannelID]*PChannelMeta, *channelMetrics, error) {
 	// Recover metrics.
 	metrics := newPChannelMetrics()
 
@@ -45,16 +54,26 @@ func recoverFromConfigurationAndMeta(ctx context.Context, incomingChannel ...str
 		return nil, metrics, err
 	}
 
-	channels := make(map[string]*PChannelMeta, len(channelMetas))
+	// TODO: only support rw channel here now, add ro channel in future.
+	channels := make(map[ChannelID]*PChannelMeta, len(channelMetas))
 	for _, channel := range channelMetas {
-		metrics.AssignPChannelStatus(channel)
-		channels[channel.GetChannel().GetName()] = newPChannelMetaFromProto(channel)
+		c := newPChannelMetaFromProto(channel)
+		metrics.AssignPChannelStatus(c)
+		channels[c.ChannelID()] = c
 	}
 
 	// Get new incoming meta from configuration.
 	for _, newChannel := range incomingChannel {
-		if _, ok := channels[newChannel]; !ok {
-			channels[newChannel] = newPChannelMeta(newChannel)
+		var c *PChannelMeta
+		if streamingVersion == nil {
+			// if streaming service has never been enabled, we treat all channels as read-only.
+			c = newPChannelMeta(newChannel, types.AccessModeRO)
+		} else {
+			// once the streaming service is enabled, we treat all channels as read-write.
+			c = newPChannelMeta(newChannel, types.AccessModeRW)
+		}
+		if _, ok := channels[c.ChannelID()]; !ok {
+			channels[c.ChannelID()] = c
 		}
 	}
 	return channels, metrics, nil
@@ -64,41 +83,93 @@ func recoverFromConfigurationAndMeta(ctx context.Context, incomingChannel ...str
 // ChannelManager is the `wal` of channel assignment and unassignment.
 // Every operation applied to the streaming node should be recorded in ChannelManager first.
 type ChannelManager struct {
-	cond     *syncutil.ContextCond
-	channels map[string]*PChannelMeta
-	version  typeutil.VersionInt64Pair
-	metrics  *channelMetrics
+	cond             *syncutil.ContextCond
+	channels         map[ChannelID]*PChannelMeta
+	version          typeutil.VersionInt64Pair
+	metrics          *channelMetrics
+	streamingVersion *streamingpb.StreamingVersion // used to identify the current streaming service version.
+	// null if no streaming service has been run.
+	// 1 if streaming service has been run once.
+	streamingEnableNotifiers []*syncutil.AsyncTaskNotifier[struct{}]
 }
 
-// CurrentPChannelsView returns the current view of pchannels.
-func (cm *ChannelManager) CurrentPChannelsView() map[string]*PChannelMeta {
+// RegisterStreamingEnabledNotifier registers a notifier into the balancer.
+func (cm *ChannelManager) RegisterStreamingEnabledNotifier(notifier *syncutil.AsyncTaskNotifier[struct{}]) {
 	cm.cond.L.Lock()
 	defer cm.cond.L.Unlock()
 
-	channels := make(map[string]*PChannelMeta, len(cm.channels))
-	for k, v := range cm.channels {
-		channels[k] = v
+	if cm.streamingVersion != nil {
+		// If the streaming service is already enabled once, notify the notifier and ignore it.
+		notifier.Cancel()
+		return
 	}
-	return channels
+	cm.streamingEnableNotifiers = append(cm.streamingEnableNotifiers, notifier)
+}
+
+// IsStreamingEnabledOnce returns true if streaming is enabled once.
+func (cm *ChannelManager) IsStreamingEnabledOnce() bool {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+
+	return cm.streamingVersion != nil
+}
+
+// MarkStreamingHasEnabled marks the streaming service has been enabled.
+func (cm *ChannelManager) MarkStreamingHasEnabled(ctx context.Context) error {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+
+	cm.streamingVersion = &streamingpb.StreamingVersion{
+		Version: 1,
+	}
+
+	if err := retry.Do(ctx, func() error {
+		return resource.Resource().StreamingCatalog().SaveVersion(ctx, cm.streamingVersion)
+	}, retry.AttemptAlways()); err != nil {
+		return err
+	}
+
+	// notify all notifiers that the streaming service has been enabled.
+	for _, notifier := range cm.streamingEnableNotifiers {
+		notifier.Cancel()
+	}
+	// and block until the listener of notifiers are finished.
+	for _, notifier := range cm.streamingEnableNotifiers {
+		notifier.BlockUntilFinish()
+	}
+	cm.streamingEnableNotifiers = nil
+	return nil
+}
+
+// CurrentPChannelsView returns the current view of pchannels.
+func (cm *ChannelManager) CurrentPChannelsView() *PChannelView {
+	cm.cond.L.Lock()
+	view := newPChannelView(cm.channels)
+	cm.cond.L.Unlock()
+
+	for _, channel := range view.Channels {
+		cm.metrics.UpdateVChannelTotal(channel)
+	}
+	return view
 }
 
 // AssignPChannels update the pchannels to servers and return the modified pchannels.
 // When the balancer want to assign a pchannel into a new server.
 // It should always call this function to update the pchannel assignment first.
 // Otherwise, the pchannel assignment tracing is lost at meta.
-func (cm *ChannelManager) AssignPChannels(ctx context.Context, pChannelToStreamingNode map[string]types.StreamingNodeInfo) (map[string]*PChannelMeta, error) {
+func (cm *ChannelManager) AssignPChannels(ctx context.Context, pChannelToStreamingNode map[ChannelID]types.PChannelInfoAssigned) (map[ChannelID]*PChannelMeta, error) {
 	cm.cond.LockAndBroadcast()
 	defer cm.cond.L.Unlock()
 
 	// modified channels.
 	pChannelMetas := make([]*streamingpb.PChannelMeta, 0, len(pChannelToStreamingNode))
-	for channelName, streamingNode := range pChannelToStreamingNode {
-		pchannel, ok := cm.channels[channelName]
+	for id, assign := range pChannelToStreamingNode {
+		pchannel, ok := cm.channels[id]
 		if !ok {
 			return nil, ErrChannelNotExist
 		}
 		mutablePchannel := pchannel.CopyForWrite()
-		if mutablePchannel.TryAssignToServerID(streamingNode) {
+		if mutablePchannel.TryAssignToServerID(assign.Channel.AccessMode, assign.Node) {
 			pChannelMetas = append(pChannelMetas, mutablePchannel.IntoRawMeta())
 		}
 	}
@@ -107,10 +178,11 @@ func (cm *ChannelManager) AssignPChannels(ctx context.Context, pChannelToStreami
 	if err != nil {
 		return nil, err
 	}
-	updates := make(map[string]*PChannelMeta, len(pChannelMetas))
+	updates := make(map[ChannelID]*PChannelMeta, len(pChannelMetas))
 	for _, pchannel := range pChannelMetas {
-		updates[pchannel.GetChannel().GetName()] = newPChannelMetaFromProto(pchannel)
-		cm.metrics.AssignPChannelStatus(pchannel)
+		meta := newPChannelMetaFromProto(pchannel)
+		updates[meta.ChannelID()] = meta
+		cm.metrics.AssignPChannelStatus(meta)
 	}
 	return updates, nil
 }
@@ -119,14 +191,14 @@ func (cm *ChannelManager) AssignPChannels(ctx context.Context, pChannelToStreami
 // When the balancer want to cleanup the history data of a pchannel.
 // It should always remove the pchannel on the server first.
 // Otherwise, the pchannel assignment tracing is lost at meta.
-func (cm *ChannelManager) AssignPChannelsDone(ctx context.Context, pChannels []string) error {
+func (cm *ChannelManager) AssignPChannelsDone(ctx context.Context, pChannels []ChannelID) error {
 	cm.cond.LockAndBroadcast()
 	defer cm.cond.L.Unlock()
 
 	// modified channels.
 	pChannelMetas := make([]*streamingpb.PChannelMeta, 0, len(pChannels))
-	for _, channelName := range pChannels {
-		pchannel, ok := cm.channels[channelName]
+	for _, channelID := range pChannels {
+		pchannel, ok := cm.channels[channelID]
 		if !ok {
 			return ErrChannelNotExist
 		}
@@ -141,7 +213,7 @@ func (cm *ChannelManager) AssignPChannelsDone(ctx context.Context, pChannels []s
 
 	// Update metrics.
 	for _, pchannel := range pChannelMetas {
-		cm.metrics.AssignPChannelStatus(pchannel)
+		cm.metrics.AssignPChannelStatus(newPChannelMetaFromProto(pchannel))
 	}
 	return nil
 }
@@ -154,7 +226,7 @@ func (cm *ChannelManager) MarkAsUnavailable(ctx context.Context, pChannels []typ
 	// modified channels.
 	pChannelMetas := make([]*streamingpb.PChannelMeta, 0, len(pChannels))
 	for _, channel := range pChannels {
-		pchannel, ok := cm.channels[channel.Name]
+		pchannel, ok := cm.channels[channel.ChannelID()]
 		if !ok {
 			return ErrChannelNotExist
 		}
@@ -167,7 +239,7 @@ func (cm *ChannelManager) MarkAsUnavailable(ctx context.Context, pChannels []typ
 		return err
 	}
 	for _, pchannel := range pChannelMetas {
-		cm.metrics.AssignPChannelStatus(pchannel)
+		cm.metrics.AssignPChannelStatus(newPChannelMetaFromProto(pchannel))
 	}
 	return nil
 }
@@ -177,18 +249,37 @@ func (cm *ChannelManager) updatePChannelMeta(ctx context.Context, pChannelMetas 
 	if len(pChannelMetas) == 0 {
 		return nil
 	}
-	if err := resource.Resource().StreamingCatalog().SavePChannels(ctx, pChannelMetas); err != nil {
-		return errors.Wrap(err, "update meta at catalog")
+
+	if err := retry.Do(ctx, func() error {
+		return resource.Resource().StreamingCatalog().SavePChannels(ctx, pChannelMetas)
+	}, retry.AttemptAlways()); err != nil {
+		return err
 	}
 
 	// update in-memory copy and increase the version.
 	for _, pchannel := range pChannelMetas {
-		cm.channels[pchannel.GetChannel().GetName()] = newPChannelMetaFromProto(pchannel)
+		c := newPChannelMetaFromProto(pchannel)
+		cm.channels[c.ChannelID()] = c
 	}
 	cm.version.Local++
 	// update metrics.
 	cm.metrics.UpdateAssignmentVersion(cm.version.Local)
 	return nil
+}
+
+// GetLatestWALLocated returns the server id of the node that the wal of the vChannel is located.
+func (cm *ChannelManager) GetLatestWALLocated(ctx context.Context, pchannel string) (int64, bool) {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+
+	pChannelMeta, ok := cm.channels[types.ChannelID{Name: pchannel}]
+	if !ok {
+		return 0, false
+	}
+	if pChannelMeta.IsAssigned() {
+		return pChannelMeta.CurrentServerID(), true
+	}
+	return 0, false
 }
 
 func (cm *ChannelManager) WatchAssignmentResult(ctx context.Context, cb func(version typeutil.VersionInt64Pair, assignments []types.PChannelInfoAssigned) error) error {
@@ -211,20 +302,15 @@ func (cm *ChannelManager) WatchAssignmentResult(ctx context.Context, cb func(ver
 // applyAssignments applies the assignments.
 func (cm *ChannelManager) applyAssignments(cb func(version typeutil.VersionInt64Pair, assignments []types.PChannelInfoAssigned) error) (typeutil.VersionInt64Pair, error) {
 	cm.cond.L.Lock()
-	assignments, version := cm.getAssignments()
-	cm.cond.L.Unlock()
-	return version, cb(version, assignments)
-}
-
-// getAssignments returns the current assignments.
-func (cm *ChannelManager) getAssignments() ([]types.PChannelInfoAssigned, typeutil.VersionInt64Pair) {
 	assignments := make([]types.PChannelInfoAssigned, 0, len(cm.channels))
 	for _, c := range cm.channels {
 		if c.IsAssigned() {
 			assignments = append(assignments, c.CurrentAssignment())
 		}
 	}
-	return assignments, cm.version
+	version := cm.version
+	cm.cond.L.Unlock()
+	return version, cb(version, assignments)
 }
 
 // waitChanges waits for the layout to be updated.

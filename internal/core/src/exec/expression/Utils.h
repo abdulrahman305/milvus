@@ -39,12 +39,12 @@ GetColumnVector(const VectorPtr& result) {
                 convert_vector->child(0))) {
             res = convert_flat_vector;
         } else {
-            PanicInfo(
+            ThrowInfo(
                 UnexpectedError,
                 "RowVector result must have a first ColumnVector children");
         }
     } else {
-        PanicInfo(UnexpectedError,
+        ThrowInfo(UnexpectedError,
                   "expr result must have a ColumnVector or RowVector result");
     }
     return res;
@@ -62,6 +62,16 @@ CompareTwoJsonArray(T arr1, const proto::plan::Array& arr2) {
     if constexpr (std::is_same_v<T,
                                  std::vector<simdjson::simdjson_result<
                                      simdjson::ondemand::value>>>) {
+        json_array_length = arr1.size();
+    }
+
+    if constexpr (std::is_same_v<
+                      T,
+                      simdjson::simdjson_result<simdjson::dom::array>>) {
+        json_array_length = arr1.size();
+    }
+
+    if constexpr (std::is_same_v<T, simdjson::dom::array>) {
         json_array_length = arr1.size();
     }
     if (arr2.array_size() != json_array_length) {
@@ -99,7 +109,7 @@ CompareTwoJsonArray(T arr1, const proto::plan::Array& arr2) {
                 break;
             }
             default:
-                PanicInfo(DataTypeInvalid,
+                ThrowInfo(DataTypeInvalid,
                           "unsupported data type {}",
                           arr2.array(i).val_case());
         }
@@ -142,7 +152,7 @@ GetValueFromProtoInternal(const milvus::proto::plan::GenericValue& value_proto,
     } else if constexpr (std::is_same_v<T, milvus::proto::plan::GenericValue>) {
         return static_cast<T>(value_proto);
     } else {
-        PanicInfo(Unsupported,
+        ThrowInfo(Unsupported,
                   "unsupported generic value {}",
                   value_proto.DebugString());
     }
@@ -160,6 +170,25 @@ T
 GetValueFromProtoWithOverflow(
     const milvus::proto::plan::GenericValue& value_proto, bool& overflowed) {
     return GetValueFromProtoInternal<T>(value_proto, overflowed);
+}
+
+template <typename T>
+T
+GetValueWithCastNumber(const milvus::proto::plan::GenericValue& value_proto) {
+    if constexpr (std::is_same_v<T, double> || std::is_same_v<T, float>) {
+        Assert(value_proto.val_case() ==
+                   milvus::proto::plan::GenericValue::kFloatVal ||
+               value_proto.val_case() ==
+                   milvus::proto::plan::GenericValue::kInt64Val);
+        if (value_proto.val_case() ==
+            milvus::proto::plan::GenericValue::kInt64Val) {
+            return static_cast<T>(value_proto.int64_val());
+        } else {
+            return static_cast<T>(value_proto.float_val());
+        }
+    } else {
+        return GetValueFromProto<T>(value_proto);
+    }
 }
 
 }  // namespace exec

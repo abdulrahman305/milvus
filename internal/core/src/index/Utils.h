@@ -28,12 +28,15 @@
 #include <string>
 #include <boost/algorithm/string.hpp>
 
+#include "common/Common.h"
 #include "common/Types.h"
 #include "common/FieldData.h"
 #include "common/QueryInfo.h"
 #include "common/RangeSearchHelper.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
+#include "storage/DataCodec.h"
+#include "log/Log.h"
 
 namespace milvus::index {
 
@@ -82,23 +85,39 @@ void inline CheckParameter(Config& conf,
 template <typename T>
 inline std::optional<T>
 GetValueFromConfig(const Config& cfg, const std::string& key) {
-    if (cfg.contains(key)) {
-        try {
-            // compatibility for boolean string
-            if constexpr (std::is_same_v<T, bool>) {
-                if (cfg.at(key).is_boolean()) {
-                    return cfg.at(key).get<bool>();
-                }
-                return boost::algorithm::to_lower_copy(
-                           cfg.at(key).get<std::string>()) == "true";
+    if (!cfg.contains(key)) {
+        return std::nullopt;
+    }
+
+    const auto& value = cfg.at(key);
+    if (value.is_null()) {
+        return std::nullopt;
+    }
+
+    try {
+        if constexpr (std::is_same_v<T, bool>) {
+            if (value.is_boolean()) {
+                return value.get<bool>();
             }
-            return cfg.at(key).get<T>();
-        } catch (std::exception& e) {
-            PanicInfo(ErrorCode::UnexpectedError,
-                      "get value from config for key {} failed, error: {}",
-                      key,
-                      e.what());
+            // compatibility for boolean string
+            return boost::algorithm::to_lower_copy(value.get<std::string>()) ==
+                   "true";
         }
+        return value.get<T>();
+    } catch (const nlohmann::json::type_error& e) {
+        if (!CONFIG_PARAM_TYPE_CHECK_ENABLED) {
+            LOG_WARN("config type mismatch for key {}: {}", key, e.what());
+            return std::nullopt;
+        }
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  "config type error for key {}: {}",
+                  key,
+                  e.what());
+    } catch (const std::exception& e) {
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  "Unexpected error for key {}: {}",
+                  key,
+                  e.what());
     }
     return std::nullopt;
 }
@@ -150,8 +169,23 @@ Config
 ParseConfigFromIndexParams(
     const std::map<std::string, std::string>& index_params);
 
+struct IndexDataCodec {
+    std::list<std::unique_ptr<storage::DataCodec>> codecs_{};
+    int64_t size_{0};
+};
+
+std::map<std::string, IndexDataCodec>
+CompactIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas);
+
 void
-AssembleIndexDatas(std::map<std::string, FieldDataPtr>& index_datas);
+AssembleIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas,
+    BinarySet& index_binary_set);
+
+void
+AssembleIndexDatas(std::map<std::string, IndexDataCodec>& index_datas,
+                   BinarySet& index_binary_set);
 
 void
 AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
@@ -166,5 +200,33 @@ CheckAndUpdateKnowhereRangeSearchParam(const SearchInfo& search_info,
                                        const int64_t topk,
                                        const MetricType& metric_type,
                                        knowhere::Json& search_config);
+
+// For sealed segment, the doc_id is guaranteed to be less than bitset size which equals to the doc count of tantivy before querying.
+void inline SetBitsetSealed(void* bitset, const uint32_t* doc_id, uintptr_t n) {
+    TargetBitmap* bitmap = static_cast<TargetBitmap*>(bitset);
+    const auto bitmap_size = bitmap->size();
+
+    for (uintptr_t i = 0; i < n; ++i) {
+        assert(doc_id[i] < bitmap_size);
+        (*bitmap)[doc_id[i]] = true;
+    }
+}
+
+// For growing segment, concurrent insert exists, so the doc_id may exceed bitset size.
+void inline SetBitsetGrowing(void* bitset,
+                             const uint32_t* doc_id,
+                             uintptr_t n) {
+    TargetBitmap* bitmap = static_cast<TargetBitmap*>(bitset);
+    const auto bitmap_size = bitmap->size();
+
+    for (uintptr_t i = 0; i < n; ++i) {
+        const auto id = doc_id[i];
+        if (id >= bitmap_size) {
+            // Ideally, the doc_id is sorted and we can return directly. But I don't want to have this strong guarantee.
+            continue;
+        }
+        (*bitmap)[id] = true;
+    }
+}
 
 }  // namespace milvus::index

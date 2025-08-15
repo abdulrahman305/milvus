@@ -18,7 +18,7 @@ package datacoord
 
 import (
 	"context"
-	"fmt"
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -33,7 +33,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
-	"github.com/milvus-io/milvus/internal/datacoord/session"
 	mockkv "github.com/milvus-io/milvus/internal/kv/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
 	catalogmocks "github.com/milvus-io/milvus/internal/metastore/mocks"
@@ -45,7 +44,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -91,21 +89,21 @@ func TestServer_CreateIndex(t *testing.T) {
 
 	mock0Allocator := newMockAllocator(t)
 
+	collections := typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()
+	collections.Insert(collID, &collectionInfo{
+		ID:             collID,
+		Partitions:     nil,
+		StartPositions: nil,
+		Properties:     nil,
+		CreatedAt:      0,
+	})
+
 	indexMeta := newSegmentIndexMeta(catalog)
 	s := &Server{
 		meta: &meta{
-			catalog: catalog,
-			collections: map[UniqueID]*collectionInfo{
-				collID: {
-					ID: collID,
-
-					Partitions:     nil,
-					StartPositions: nil,
-					Properties:     nil,
-					CreatedAt:      0,
-				},
-			},
-			indexMeta: indexMeta,
+			catalog:     catalog,
+			collections: collections,
+			indexMeta:   indexMeta,
 		},
 		allocator:       mock0Allocator,
 		notifyIndexChan: make(chan UniqueID, 1),
@@ -113,10 +111,10 @@ func TestServer_CreateIndex(t *testing.T) {
 
 	s.stateCode.Store(commonpb.StateCode_Healthy)
 
-	b := mocks.NewMockRootCoordClient(t)
+	b := mocks.NewMixCoord(t)
 
 	t.Run("get field name failed", func(t *testing.T) {
-		b.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Return(nil, fmt.Errorf("mock error"))
+		b.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
 
 		s.broker = broker.NewCoordinatorBroker(b)
 		resp, err := s.CreateIndex(ctx, req)
@@ -212,7 +210,7 @@ func TestServer_CreateIndex(t *testing.T) {
 			},
 			{
 				Key:   common.JSONCastTypeKey,
-				Value: "int64",
+				Value: "double",
 			},
 			{
 				Key:   common.IndexTypeKey,
@@ -260,7 +258,7 @@ func TestServer_CreateIndex(t *testing.T) {
 		assert.Error(t, merr.CheckRPCCall(resp, err))
 	})
 
-	t.Run("not support disk index", func(t *testing.T) {
+	t.Run("disk index", func(t *testing.T) {
 		s.allocator = mock0Allocator
 		s.meta.indexMeta.indexes = map[UniqueID]map[UniqueID]*model.Index{}
 		req.IndexParams = []*commonpb.KeyValuePair{
@@ -269,9 +267,8 @@ func TestServer_CreateIndex(t *testing.T) {
 				Value: "DISKANN",
 			},
 		}
-		s.indexNodeManager = session.NewNodeManager(ctx, defaultDataNodeCreatorFunc)
 		resp, err := s.CreateIndex(ctx, req)
-		assert.Error(t, merr.CheckRPCCall(resp, err))
+		assert.NoError(t, merr.CheckRPCCall(resp, err))
 	})
 
 	t.Run("disk index with mmap", func(t *testing.T) {
@@ -287,14 +284,6 @@ func TestServer_CreateIndex(t *testing.T) {
 				Value: "true",
 			},
 		}
-		nodeManager := session.NewNodeManager(ctx, defaultDataNodeCreatorFunc)
-		s.indexNodeManager = nodeManager
-		mockNode := mocks.NewMockDataNodeClient(t)
-		nodeManager.SetClient(1001, mockNode)
-		mockNode.EXPECT().GetJobStats(mock.Anything, mock.Anything).Return(&workerpb.GetJobStatsResponse{
-			Status:     merr.Success(),
-			EnableDisk: true,
-		}, nil)
 
 		resp, err := s.CreateIndex(ctx, req)
 		assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -770,6 +759,7 @@ func TestServer_GetIndexState(t *testing.T) {
 		fieldID    = UniqueID(10)
 		indexID    = UniqueID(100)
 		segID      = UniqueID(1000)
+		buildID    = UniqueID(10000)
 		indexName  = "default_idx"
 		typeParams = []*commonpb.KeyValuePair{
 			{
@@ -1479,6 +1469,7 @@ func TestServer_DescribeIndex(t *testing.T) {
 		IndexFileKeys:       nil,
 		IndexSerializedSize: 0,
 		WriteHandoff:        false,
+		CurrentIndexVersion: 7,
 	})
 	segIdx1.Insert(indexID+1, &model.SegmentIndex{
 		SegmentID:           segID,
@@ -1496,6 +1487,8 @@ func TestServer_DescribeIndex(t *testing.T) {
 		IndexFileKeys:       nil,
 		IndexSerializedSize: 0,
 		WriteHandoff:        false,
+		// deleted index
+		CurrentIndexVersion: 6,
 	})
 	segIdx1.Insert(indexID+3, &model.SegmentIndex{
 		SegmentID:           segID,
@@ -1552,28 +1545,30 @@ func TestServer_DescribeIndex(t *testing.T) {
 
 	segIdx2 := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
 	segIdx2.Insert(indexID, &model.SegmentIndex{
-		SegmentID:      segID - 1,
-		CollectionID:   collID,
-		PartitionID:    partID,
-		NumRows:        10000,
-		IndexID:        indexID,
-		BuildID:        buildID,
-		NodeID:         0,
-		IndexVersion:   1,
-		IndexState:     commonpb.IndexState_Finished,
-		CreatedUTCTime: createTS,
+		SegmentID:           segID - 1,
+		CollectionID:        collID,
+		PartitionID:         partID,
+		NumRows:             10000,
+		IndexID:             indexID,
+		BuildID:             buildID,
+		NodeID:              0,
+		IndexVersion:        1,
+		IndexState:          commonpb.IndexState_Finished,
+		CreatedUTCTime:      createTS,
+		CurrentIndexVersion: 6,
 	})
 	segIdx2.Insert(indexID+1, &model.SegmentIndex{
-		SegmentID:      segID - 1,
-		CollectionID:   collID,
-		PartitionID:    partID,
-		NumRows:        10000,
-		IndexID:        indexID + 1,
-		BuildID:        buildID + 1,
-		NodeID:         0,
-		IndexVersion:   1,
-		IndexState:     commonpb.IndexState_Finished,
-		CreatedUTCTime: createTS,
+		SegmentID:           segID - 1,
+		CollectionID:        collID,
+		PartitionID:         partID,
+		NumRows:             10000,
+		IndexID:             indexID + 1,
+		BuildID:             buildID + 1,
+		NodeID:              0,
+		IndexVersion:        1,
+		IndexState:          commonpb.IndexState_Finished,
+		CreatedUTCTime:      createTS,
+		CurrentIndexVersion: 6,
 	})
 	segIdx2.Insert(indexID+3, &model.SegmentIndex{
 		SegmentID:      segID - 1,
@@ -1601,16 +1596,17 @@ func TestServer_DescribeIndex(t *testing.T) {
 		CreatedUTCTime: createTS,
 	})
 	segIdx2.Insert(indexID+5, &model.SegmentIndex{
-		SegmentID:      segID - 1,
-		CollectionID:   collID,
-		PartitionID:    partID,
-		NumRows:        10000,
-		IndexID:        indexID + 5,
-		BuildID:        buildID + 5,
-		NodeID:         0,
-		IndexVersion:   1,
-		IndexState:     commonpb.IndexState_Finished,
-		CreatedUTCTime: createTS,
+		SegmentID:           segID - 1,
+		CollectionID:        collID,
+		PartitionID:         partID,
+		NumRows:             10000,
+		IndexID:             indexID + 5,
+		BuildID:             buildID + 5,
+		NodeID:              0,
+		IndexVersion:        1,
+		IndexState:          commonpb.IndexState_Finished,
+		CreatedUTCTime:      createTS,
+		CurrentIndexVersion: 6,
 	})
 	s.meta.indexMeta.segmentIndexes.Insert(segID-1, segIdx2)
 
@@ -1632,6 +1628,18 @@ func TestServer_DescribeIndex(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 5, len(resp.GetIndexInfos()))
+		minIndexVersion := int32(math.MaxInt32)
+		maxIndexVersion := int32(math.MinInt32)
+		for _, indexInfo := range resp.GetIndexInfos() {
+			if indexInfo.GetMinIndexVersion() < minIndexVersion {
+				minIndexVersion = indexInfo.GetMinIndexVersion()
+			}
+			if indexInfo.GetMaxIndexVersion() > maxIndexVersion {
+				maxIndexVersion = indexInfo.GetMaxIndexVersion()
+			}
+		}
+		assert.Equal(t, int32(7), minIndexVersion)
+		assert.Equal(t, int32(7), maxIndexVersion)
 	})
 
 	t.Run("describe after drop index", func(t *testing.T) {
@@ -2408,6 +2416,14 @@ func TestServer_GetIndexInfos(t *testing.T) {
 }
 
 func TestMeta_GetHasUnindexTaskSegments(t *testing.T) {
+	var (
+		collID    = UniqueID(1)
+		partID    = UniqueID(2)
+		segID     = UniqueID(1000)
+		indexID   = UniqueID(100)
+		fieldID   = UniqueID(10)
+		indexName = "default_idx"
+	)
 	segments := map[UniqueID]*SegmentInfo{
 		segID: {
 			SegmentInfo: &datapb.SegmentInfo{
@@ -2480,10 +2496,12 @@ func TestMeta_GetHasUnindexTaskSegments(t *testing.T) {
 	for id, segment := range segments {
 		m.segments.SetSegment(id, segment)
 	}
-	s := &Server{meta: m}
+	indexInspector := &indexInspector{
+		meta: m,
+	}
 
 	t.Run("normal", func(t *testing.T) {
-		segments := s.getUnIndexTaskSegments(context.TODO())
+		segments := indexInspector.getUnIndexTaskSegments(context.TODO())
 		assert.Equal(t, 1, len(segments))
 		assert.Equal(t, segID, segments[0].ID)
 
@@ -2506,7 +2524,7 @@ func TestMeta_GetHasUnindexTaskSegments(t *testing.T) {
 			IndexState:   commonpb.IndexState_Finished,
 		})
 
-		segments := s.getUnIndexTaskSegments(context.TODO())
+		segments := indexInspector.getUnIndexTaskSegments(context.TODO())
 		assert.Equal(t, 1, len(segments))
 		assert.Equal(t, segID, segments[0].ID)
 	})
@@ -2519,7 +2537,7 @@ func TestMeta_GetHasUnindexTaskSegments(t *testing.T) {
 			IndexState:   commonpb.IndexState_Finished,
 		})
 
-		segments := s.getUnIndexTaskSegments(context.TODO())
+		segments := indexInspector.getUnIndexTaskSegments(context.TODO())
 		assert.Equal(t, 0, len(segments))
 	})
 }
@@ -2631,11 +2649,12 @@ func TestValidateIndexParams(t *testing.T) {
 }
 
 func TestJsonIndex(t *testing.T) {
+	collID := UniqueID(1)
 	catalog := catalogmocks.NewDataCoordCatalog(t)
 	catalog.EXPECT().CreateIndex(mock.Anything, mock.Anything).Return(nil).Maybe()
 	mock0Allocator := newMockAllocator(t)
 	indexMeta := newSegmentIndexMeta(catalog)
-	b := mocks.NewMockRootCoordClient(t)
+	b := mocks.NewMixCoord(t)
 	b.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 		Status: &commonpb.Status{
 			ErrorCode: 0,
@@ -2664,15 +2683,16 @@ func TestJsonIndex(t *testing.T) {
 		},
 	}, nil)
 
+	collections := typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()
+	collections.Insert(collID, &collectionInfo{
+		ID: collID,
+	})
+
 	s := &Server{
 		meta: &meta{
-			catalog: catalog,
-			collections: map[UniqueID]*collectionInfo{
-				collID: {
-					ID: collID,
-				},
-			},
-			indexMeta: indexMeta,
+			catalog:     catalog,
+			collections: collections,
+			indexMeta:   indexMeta,
 		},
 		allocator:       mock0Allocator,
 		notifyIndexChan: make(chan UniqueID, 1),
@@ -2683,7 +2703,7 @@ func TestJsonIndex(t *testing.T) {
 	req := &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "a",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_String))}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "varchar"}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
 	}
 	resp, err := s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
@@ -2691,7 +2711,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_String))}, {Key: common.JSONPathKey, Value: "json[\"c\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "varchar"}, {Key: common.JSONPathKey, Value: "json[\"c\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
@@ -2700,7 +2720,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     1,
 		IndexName:   "",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_String))}, {Key: common.JSONPathKey, Value: "json2[\"c\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "varchar"}, {Key: common.JSONPathKey, Value: "json2[\"c\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
@@ -2709,7 +2729,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "a",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_String))}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "varchar"}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
@@ -2718,7 +2738,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "a",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2727,7 +2747,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "b",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2736,7 +2756,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "a",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"b\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"b\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2754,7 +2774,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     1,
 		IndexName:   "c",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "bad_json[\"a\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "bad_json[\"a\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2763,7 +2783,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     2,
 		IndexName:   "",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "dynamic_a_field"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "dynamic_a_field"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
@@ -2772,7 +2792,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "d",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[a][\"b\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[a][\"b\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2781,7 +2801,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "e",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"a\"][\"b"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"a\"][\"b"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2790,7 +2810,7 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "f",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"a\"[\"b]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"a\"[\"b]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.Error(t, merr.CheckRPCCall(resp, err))
@@ -2799,8 +2819,35 @@ func TestJsonIndex(t *testing.T) {
 	req = &indexpb.CreateIndexRequest{
 		FieldID:     0,
 		IndexName:   "g",
-		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_Int16))}, {Key: common.JSONPathKey, Value: "json[\"a\"][0][\"b\"]"}},
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: "double"}, {Key: common.JSONPathKey, Value: "json[\"a\"][0][\"b\"]"}},
 	}
 	resp, err = s.CreateIndex(context.Background(), req)
 	assert.NoError(t, merr.CheckRPCCall(resp, err))
+
+	// test json flat index
+	req = &indexpb.CreateIndexRequest{
+		FieldID:     0,
+		IndexName:   "h",
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_JSON))}, {Key: common.JSONPathKey, Value: "json[\"a\"][\"b\"]"}},
+	}
+	resp, err = s.CreateIndex(context.Background(), req)
+	assert.NoError(t, merr.CheckRPCCall(resp, err))
+
+	// test json flat index with dynamic field
+	req = &indexpb.CreateIndexRequest{
+		FieldID:     2,
+		IndexName:   "i",
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_JSON))}, {Key: common.JSONPathKey, Value: "dynamic"}},
+	}
+	resp, err = s.CreateIndex(context.Background(), req)
+	assert.NoError(t, merr.CheckRPCCall(resp, err))
+
+	// duplicated json flat index
+	req = &indexpb.CreateIndexRequest{
+		FieldID:     0,
+		IndexName:   "a",
+		IndexParams: []*commonpb.KeyValuePair{{Key: common.JSONCastTypeKey, Value: strconv.Itoa(int(schemapb.DataType_JSON))}, {Key: common.JSONPathKey, Value: "json[\"a\"]"}},
+	}
+	resp, err = s.CreateIndex(context.Background(), req)
+	assert.Error(t, merr.CheckRPCCall(resp, err))
 }

@@ -38,7 +38,6 @@ import (
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
@@ -109,7 +108,7 @@ func (s *SyncTaskSuite) SetupTest() {
 	s.broker = broker.NewMockBroker(s.T())
 	s.metacache = metacache.NewMockMetaCache(s.T())
 	s.metacache.EXPECT().Collection().Return(s.collectionID).Maybe()
-	s.metacache.EXPECT().Schema().Return(s.schema).Maybe()
+	s.metacache.EXPECT().GetSchema(mock.Anything).Return(s.schema).Maybe()
 
 	initcore.InitLocalArrowFileSystem("/tmp")
 }
@@ -159,7 +158,8 @@ func (s *SyncTaskSuite) getSuiteSyncTask(pack *SyncPack) *SyncTask {
 			WithChannelName(s.channelName)).
 		WithAllocator(s.allocator).
 		WithChunkManager(s.chunkManager).
-		WithMetaCache(s.metacache)
+		WithMetaCache(s.metacache).
+		WithSchema(s.schema)
 	return task
 }
 
@@ -209,6 +209,12 @@ func (s *SyncTaskSuite) runTestRunNormal(storageVersion int64) {
 		action(seg)
 	}).Return()
 
+	isDataReleased := func(task *SyncTask) bool {
+		return task.pack.insertData == nil &&
+			task.pack.deltaData == nil &&
+			task.pack.bm25Stats == nil
+	}
+
 	s.Run("without_data", func() {
 		task := s.getSuiteSyncTask(new(SyncPack).WithCheckpoint(
 			&msgpb.MsgPosition{
@@ -217,13 +223,9 @@ func (s *SyncTaskSuite) runTestRunNormal(storageVersion int64) {
 				Timestamp:   100,
 			}))
 		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
-		if storageVersion == storage.StorageV2 {
-			task.WithMultiPartUploadSize(0)
-			task.WithSyncBufferSize(packed.DefaultWriteBufferSize)
-		}
-
 		err := task.Run(ctx)
 		s.NoError(err)
+		s.True(isDataReleased(task)) // data should be released after task finished
 	})
 
 	s.Run("with_insert_delete_cp", func() {
@@ -235,14 +237,11 @@ func (s *SyncTaskSuite) runTestRunNormal(storageVersion int64) {
 					MsgID:       []byte{1, 2, 3, 4},
 					Timestamp:   100,
 				}))
-		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
-		if storageVersion == storage.StorageV2 {
-			task.WithMultiPartUploadSize(0)
-			task.WithSyncBufferSize(packed.DefaultWriteBufferSize)
-		}
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1)).WithSchema(s.schema)
 
 		err := task.Run(ctx)
 		s.NoError(err)
+		s.True(isDataReleased(task)) // data should be released after task finished
 	})
 
 	s.Run("with_flush", func() {
@@ -255,13 +254,10 @@ func (s *SyncTaskSuite) runTestRunNormal(storageVersion int64) {
 					MsgID:       []byte{1, 2, 3, 4},
 					Timestamp:   100,
 				}))
-		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
-		if storageVersion == storage.StorageV2 {
-			task.WithMultiPartUploadSize(0)
-			task.WithSyncBufferSize(packed.DefaultWriteBufferSize)
-		}
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1)).WithSchema(s.schema)
 		err := task.Run(ctx)
 		s.NoError(err)
+		s.True(isDataReleased(task)) // data should be released after task finished
 	})
 
 	s.Run("with_drop", func() {
@@ -274,13 +270,10 @@ func (s *SyncTaskSuite) runTestRunNormal(storageVersion int64) {
 				MsgID:       []byte{1, 2, 3, 4},
 				Timestamp:   100,
 			}))
-		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
-		if storageVersion == storage.StorageV2 {
-			task.WithMultiPartUploadSize(0)
-			task.WithSyncBufferSize(packed.DefaultWriteBufferSize)
-		}
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1)).WithSchema(s.schema)
 		err := task.Run(ctx)
 		s.NoError(err)
+		s.True(isDataReleased(task)) // data should be released after task finished
 	})
 }
 
@@ -303,7 +296,7 @@ func (s *SyncTaskSuite) TestRunL0Segment() {
 				MsgID:       []byte{1, 2, 3, 4},
 				Timestamp:   100,
 			}))
-		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1)).WithSchema(s.schema)
 
 		err := task.Run(ctx)
 		s.NoError(err)
@@ -324,7 +317,7 @@ func (s *SyncTaskSuite) TestRunL0Segment() {
 				MsgID:       []byte{1, 2, 3, 4},
 				Timestamp:   100,
 			}))
-		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1)).WithSchema(s.schema)
 
 		err := task.Run(ctx)
 		s.NoError(err)
@@ -338,12 +331,13 @@ func (s *SyncTaskSuite) TestRunError() {
 		s.metacache.EXPECT().GetSegmentByID(s.segmentID).Return(nil, false)
 		flag := false
 		handler := func(_ error) { flag = true }
+		// segment not found should be ignored.
 		task := s.getSuiteSyncTask(new(SyncPack)).WithFailureCallback(handler)
 
 		err := task.Run(ctx)
 
-		s.Error(err)
-		s.True(flag)
+		s.NoError(err)
+		s.False(flag)
 	})
 
 	s.metacache.ExpectedCalls = nil
@@ -352,7 +346,7 @@ func (s *SyncTaskSuite) TestRunError() {
 	s.metacache.EXPECT().GetSegmentByID(s.segmentID).Return(seg, true)
 	s.metacache.EXPECT().GetSegmentsBy(mock.Anything, mock.Anything, mock.Anything).Return([]*metacache.SegmentInfo{seg})
 	s.metacache.EXPECT().Collection().Return(s.collectionID).Maybe()
-	s.metacache.EXPECT().Schema().Return(s.schema).Maybe()
+	s.metacache.EXPECT().GetSchema(mock.Anything).Return(s.schema).Maybe()
 
 	s.Run("allocate_id_fail", func() {
 		mockAllocator := allocator.NewMockAllocator(s.T())

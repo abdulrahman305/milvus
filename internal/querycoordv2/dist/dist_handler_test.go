@@ -18,16 +18,22 @@ package dist
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -49,8 +55,7 @@ type DistHandlerSuite struct {
 	executedFlagChan chan struct{}
 	dist             *meta.DistributionManager
 	target           *meta.MockTargetManager
-
-	handler *distHandler
+	handler          *distHandler
 }
 
 func (suite *DistHandlerSuite) SetupSuite() {
@@ -114,8 +119,7 @@ func (suite *DistHandlerSuite) TestBasic() {
 		LastModifyTs: 1,
 	}, nil)
 
-	syncTargetVersionFn := func(collectionID int64) {}
-	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, syncTargetVersionFn)
+	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, func(collectionID ...int64) {})
 	defer suite.handler.stop()
 
 	time.Sleep(3 * time.Second)
@@ -135,8 +139,7 @@ func (suite *DistHandlerSuite) TestGetDistributionFailed() {
 	}))
 	suite.client.EXPECT().GetDataDistribution(mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("fake error"))
 
-	syncTargetVersionFn := func(collectionID int64) {}
-	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, syncTargetVersionFn)
+	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, func(collectionID ...int64) {})
 	defer suite.handler.stop()
 
 	time.Sleep(3 * time.Second)
@@ -184,11 +187,159 @@ func (suite *DistHandlerSuite) TestForcePullDist() {
 		LastModifyTs: 1,
 	}, nil)
 	suite.executedFlagChan <- struct{}{}
-	syncTargetVersionFn := func(collectionID int64) {}
-	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, syncTargetVersionFn)
+	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, func(collectionID ...int64) {})
 	defer suite.handler.stop()
 
 	time.Sleep(300 * time.Millisecond)
+}
+
+func (suite *DistHandlerSuite) TestHandlerWithSyncDelegatorChanges() {
+	if suite.dispatchMockCall != nil {
+		suite.dispatchMockCall.Unset()
+		suite.dispatchMockCall = nil
+	}
+
+	suite.target.EXPECT().GetSealedSegmentsByChannel(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(map[int64]*datapb.SegmentInfo{}).Maybe()
+	suite.dispatchMockCall = suite.scheduler.EXPECT().Dispatch(mock.Anything).Maybe()
+	suite.nodeManager.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   1,
+		Address:  "localhost",
+		Hostname: "localhost",
+	}))
+
+	// Test scenario: update segments and channels distribution without replicaMgr
+	suite.client.EXPECT().GetDataDistribution(mock.Anything, mock.Anything, mock.Anything).Return(&querypb.GetDataDistributionResponse{
+		Status: merr.Success(),
+		NodeID: 1,
+		Channels: []*querypb.ChannelVersionInfo{
+			{
+				Channel:    "test-channel-1",
+				Collection: 1,
+				Version:    1,
+			},
+		},
+		Segments: []*querypb.SegmentVersionInfo{
+			{
+				ID:         1,
+				Collection: 1,
+				Partition:  1,
+				Channel:    "test-channel-1",
+				Version:    1,
+			},
+		},
+		LeaderViews: []*querypb.LeaderView{
+			{
+				Collection:    1,
+				Channel:       "test-channel-1",
+				TargetVersion: 1011,
+				Status: &querypb.LeaderViewStatus{
+					Serviceable: true,
+				},
+			},
+		},
+		LastModifyTs: 2, // Different from previous test to ensure update happens
+	}, nil)
+
+	notifyCounter := atomic.NewInt32(0)
+	notifyFunc := func(collectionID ...int64) {
+		suite.Require().Equal(1, len(collectionID))
+		suite.Require().Equal(int64(1), collectionID[0])
+		notifyCounter.Inc()
+	}
+
+	suite.handler = newDistHandler(suite.ctx, suite.nodeID, suite.client, suite.nodeManager, suite.scheduler, suite.dist, suite.target, notifyFunc)
+	defer suite.handler.stop()
+
+	// Wait for distribution to be processed
+	time.Sleep(1000 * time.Millisecond)
+
+	// Verify that the distributions were updated correctly
+	segments := suite.dist.SegmentDistManager.GetByFilter(meta.WithNodeID(1))
+	suite.Require().Equal(1, len(segments))
+	suite.Require().Equal(int64(1), segments[0].SegmentInfo.ID)
+
+	channels := suite.dist.ChannelDistManager.GetByFilter(meta.WithNodeID2Channel(1))
+	suite.Require().Equal(1, len(channels))
+	suite.Require().Equal("test-channel-1", channels[0].VchannelInfo.ChannelName)
+
+	// Verify that the notification was called
+	suite.Require().Greater(notifyCounter.Load(), int32(0))
+}
+
+// TestHeartbeatMetricsRecording tests that heartbeat metrics are properly recorded
+func TestHeartbeatMetricsRecording(t *testing.T) {
+	// Arrange: Create test response with a unique nodeID to avoid test interference
+	nodeID := time.Now().UnixNano() % 1000000 // Use timestamp-based unique ID
+	resp := &querypb.GetDataDistributionResponse{
+		Status:       merr.Success(),
+		NodeID:       nodeID,
+		LastModifyTs: 1,
+	}
+
+	// Create mock node
+	nodeManager := session.NewNodeManager()
+	nodeInfo := session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   nodeID,
+		Address:  "localhost:19530",
+		Hostname: "localhost",
+	})
+	nodeManager.Add(nodeInfo)
+
+	// Mock time.Now() to get predictable timestamp
+	expectedTimestamp := time.Unix(1640995200, 0) // 2022-01-01 00:00:00 UTC
+	mockTimeNow := mockey.Mock(time.Now).Return(expectedTimestamp).Build()
+	defer mockTimeNow.UnPatch()
+
+	// Record the initial state of the metric for our specific nodeID
+	initialMetricValue := getMetricValueForNode(fmt.Sprint(nodeID))
+
+	// Create dist handler
+	ctx := context.Background()
+	handler := &distHandler{
+		nodeID:      nodeID,
+		nodeManager: nodeManager,
+		dist:        meta.NewDistributionManager(),
+		target:      meta.NewTargetManager(nil, nil),
+		scheduler:   task.NewScheduler(ctx, nil, nil, nil, nil, nil, nil),
+	}
+
+	// Act: Handle distribution response
+	handler.handleDistResp(ctx, resp, false)
+
+	// Assert: Verify our specific metric was recorded with the expected value
+	finalMetricValue := getMetricValueForNode(fmt.Sprint(nodeID))
+
+	// Check that the metric value changed and matches our expected timestamp
+	assert.NotEqual(t, initialMetricValue, finalMetricValue, "Metric value should have changed")
+	assert.Equal(t, float64(expectedTimestamp.UnixNano()), finalMetricValue, "Metric should record the expected timestamp")
+
+	// Clean up: Remove the test metric to avoid affecting other tests
+	metrics.QueryCoordLastHeartbeatTimeStamp.DeleteLabelValues(fmt.Sprint(nodeID))
+}
+
+// Helper function to get the current metric value for a specific nodeID
+func getMetricValueForNode(nodeID string) float64 {
+	// Create a temporary registry to capture the current state
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(metrics.QueryCoordLastHeartbeatTimeStamp)
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		return -1 // Return -1 if we can't gather metrics
+	}
+
+	for _, mf := range metricFamilies {
+		if mf.GetName() == "milvus_querycoord_last_heartbeat_timestamp" {
+			for _, metric := range mf.GetMetric() {
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == "node_id" && label.GetValue() == nodeID {
+						return metric.GetGauge().GetValue()
+					}
+				}
+			}
+		}
+	}
+	return 0 // Return 0 if metric not found (default value)
 }
 
 func TestDistHandlerSuite(t *testing.T) {

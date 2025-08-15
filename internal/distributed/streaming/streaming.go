@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
@@ -18,8 +17,6 @@ var singleton WALAccesser = nil
 func Init() {
 	c, _ := kvfactory.GetEtcdAndPath()
 	singleton = newWALAccesser(c)
-	// Add the wal accesser to the broadcaster registry for making broadcast operation.
-	registry.Register(registry.AppendOperatorTypeStreaming, singleton)
 }
 
 // Release releases the resources of the wal accesser.
@@ -53,8 +50,13 @@ type TxnOption struct {
 }
 
 type ReadOption struct {
+	// PChannel is the target pchannel to read, if the pchannel is not set.
+	// It will be parsed from setted `VChannel`.
+	PChannel string
+
 	// VChannel is the target vchannel to read.
 	// It must be set to read message from a vchannel.
+	// If VChannel is empty, the PChannel must be set, and all message of pchannel will be read.
 	VChannel string
 
 	// DeliverPolicy is the deliver policy of the consumer.
@@ -84,9 +86,8 @@ type WALAccesser interface {
 	// WALName returns the name of the wal.
 	WALName() string
 
-	// GetLatestMVCCTimestampIfLocal gets the latest mvcc timestamp of the vchannel.
-	// If the wal is located at remote, it will return 0, error.
-	GetLatestMVCCTimestampIfLocal(ctx context.Context, vchannel string) (uint64, error)
+	// Local returns the local services.
+	Local() Local
 
 	// Txn returns a transaction for writing records to one vchannel.
 	// It promises the atomicity written of the messages.
@@ -118,6 +119,16 @@ type WALAccesser interface {
 	AppendMessagesWithOption(ctx context.Context, opts AppendOption, msgs ...message.MutableMessage) AppendResponses
 }
 
+type Local interface {
+	// GetLatestMVCCTimestampIfLocal gets the latest mvcc timestamp of the vchannel.
+	// If the wal is located at remote, it will return 0, error.
+	GetLatestMVCCTimestampIfLocal(ctx context.Context, vchannel string) (uint64, error)
+
+	// GetMetricsIfLocal gets the metrics of the local wal.
+	// It will only return the metrics of the local wal but not the remote wal.
+	GetMetricsIfLocal(ctx context.Context) (*types.StreamingNodeMetrics, error)
+}
+
 // Broadcast is the interface for writing broadcast message into the wal.
 type Broadcast interface {
 	// Append of Broadcast sends a broadcast message to all target vchannels.
@@ -129,6 +140,7 @@ type Broadcast interface {
 
 	// Ack acknowledges a broadcast message at the specified vchannel.
 	// It must be called after the message is comsumed by the unique-consumer.
+	// It will only return error when the ctx is canceled.
 	Ack(ctx context.Context, req types.BroadcastAckRequest) error
 }
 

@@ -39,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -382,6 +383,10 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 		Infos: nil,
 	}
 
+	if len(collSchema.StructArrayFields) > 0 {
+		return nil, errors.New("struct fields are not implemented in row based insert data")
+	}
+
 	for _, field := range collSchema.Fields {
 		if skipFunction && IsBM25FunctionOutputField(field, collSchema) {
 			continue
@@ -441,7 +446,7 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 				Dim:  dim,
 			}
 		case schemapb.DataType_SparseFloatVector:
-			return nil, fmt.Errorf("Sparse Float Vector is not supported in row based data")
+			return nil, errors.New("Sparse Float Vector is not supported in row based data")
 
 		case schemapb.DataType_Int8Vector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -520,6 +525,10 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemapb.CollectionSchema) (idata *InsertData, err error) {
 	srcFields := make(map[FieldID]*schemapb.FieldData)
 	for _, field := range msg.FieldsData {
+		if _, ok := field.Field.(*schemapb.FieldData_StructArrays); ok {
+			// unreachable
+			panic("struct is not flattened")
+		}
 		srcFields[field.FieldId] = field
 	}
 
@@ -527,14 +536,11 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 		Data: make(map[FieldID]FieldData),
 	}
 	length := 0
-	for _, field := range collSchema.Fields {
-		if IsBM25FunctionOutputField(field, collSchema) {
-			continue
-		}
-
+	getFieldData := func(field *schemapb.FieldSchema) (FieldData, error) {
 		srcField, ok := srcFields[field.GetFieldID()]
 		if !ok && field.GetFieldID() >= common.StartOfUserFieldID {
-			return nil, merr.WrapErrFieldNotFound(field.GetFieldID(), fmt.Sprintf("field %s not found when converting insert msg to insert data", field.GetName()))
+			err := fillMissingFields(collSchema, idata)
+			return nil, err
 		}
 		var fieldData FieldData
 		switch field.DataType {
@@ -618,6 +624,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &BoolFieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Int8:
@@ -627,6 +634,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &Int8FieldData{
 				Data:      lo.Map(srcData, func(v int32, _ int) int8 { return int8(v) }),
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Int16:
@@ -636,6 +644,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &Int16FieldData{
 				Data:      lo.Map(srcData, func(v int32, _ int) int16 { return int16(v) }),
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Int32:
@@ -645,6 +654,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &Int32FieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Int64:
@@ -663,6 +673,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 				fieldData = &Int64FieldData{
 					Data:      srcData,
 					ValidData: validData,
+					Nullable:  field.GetNullable(),
 				}
 			}
 
@@ -673,6 +684,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &FloatFieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Double:
@@ -682,6 +694,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &DoubleFieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
@@ -691,6 +704,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &StringFieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
 
 		case schemapb.DataType_Array:
@@ -701,6 +715,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 				ElementType: field.GetElementType(),
 				Data:        srcData,
 				ValidData:   validData,
+				Nullable:    field.GetNullable(),
 			}
 
 		case schemapb.DataType_JSON:
@@ -710,20 +725,66 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			fieldData = &JSONFieldData{
 				Data:      srcData,
 				ValidData: validData,
+				Nullable:  field.GetNullable(),
+			}
+
+		case schemapb.DataType_ArrayOfVector:
+			vectorArray := srcField.GetVectors().GetVectorArray()
+
+			fieldData = &VectorArrayFieldData{
+				ElementType: field.GetElementType(),
+				Data:        vectorArray.GetData(),
+				Dim:         vectorArray.GetDim(),
 			}
 
 		default:
 			return nil, merr.WrapErrServiceInternal("data type not handled", field.GetDataType().String())
 		}
 
+		return fieldData, nil
+	}
+
+	handleFieldData := func(field *schemapb.FieldSchema) (FieldData, error) {
+		if IsBM25FunctionOutputField(field, collSchema) {
+			return nil, nil
+		}
+
+		fieldData, err := getFieldData(field)
+		if err != nil || fieldData == nil {
+			return nil, err
+		}
+
 		if length == 0 {
 			length = fieldData.RowNum()
 		}
+
 		if fieldData.RowNum() != length {
 			return nil, merr.WrapErrServiceInternal("row num not match", fmt.Sprintf("field %s row num not match %d, other column %d", field.GetName(), fieldData.RowNum(), length))
 		}
 
-		idata.Data[field.FieldID] = fieldData
+		return fieldData, nil
+	}
+
+	for _, field := range collSchema.Fields {
+		fieldData, err := handleFieldData(field)
+		if err != nil {
+			return nil, err
+		}
+		if fieldData != nil {
+			idata.Data[field.FieldID] = fieldData
+		}
+	}
+
+	for _, structField := range collSchema.GetStructArrayFields() {
+		for _, field := range structField.GetFields() {
+			fieldData, err := handleFieldData(field)
+			if err != nil {
+				return nil, err
+			}
+			if fieldData != nil {
+				idata.Data[field.FieldID] = fieldData
+			}
+		}
 	}
 
 	idata.Infos = []BlobInfo{
@@ -1325,8 +1386,25 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 					},
 				},
 			}
+		case *VectorArrayFieldData:
+			fieldData = &schemapb.FieldData{
+				Type:    schemapb.DataType_ArrayOfVector,
+				FieldId: fieldID,
+				Field: &schemapb.FieldData_Vectors{
+					Vectors: &schemapb.VectorField{
+						Data: &schemapb.VectorField_VectorArray{
+							VectorArray: &schemapb.VectorArray{
+								Data:        rawData.Data,
+								ElementType: rawData.ElementType,
+								Dim:         rawData.Dim,
+							},
+						},
+						Dim: rawData.Dim,
+					},
+				},
+			}
 		default:
-			return insertRecord, fmt.Errorf("unsupported data type when transter storage.InsertData to internalpb.InsertRecord")
+			return insertRecord, errors.New("unsupported data type when transter storage.InsertData to internalpb.InsertRecord")
 		}
 
 		insertRecord.FieldsData = append(insertRecord.FieldsData, fieldData)
@@ -1426,7 +1504,7 @@ func IsBM25FunctionOutputField(field *schemapb.FieldSchema, collSchema *schemapb
 	return false
 }
 
-func getDefaultValue(fieldSchema *schemapb.FieldSchema) interface{} {
+func GetDefaultValue(fieldSchema *schemapb.FieldSchema) interface{} {
 	switch fieldSchema.DataType {
 	case schemapb.DataType_Bool:
 		return fieldSchema.GetDefaultValue().GetBoolData()
@@ -1448,4 +1526,59 @@ func getDefaultValue(fieldSchema *schemapb.FieldSchema) interface{} {
 		// won't happen
 		panic(fmt.Sprintf("undefined data type:%s", fieldSchema.DataType.String()))
 	}
+}
+
+// fillMissingFields fills default values or null values for missing fields in insertData
+func fillMissingFields(schema *schemapb.CollectionSchema, insertData *InsertData) error {
+	batchRows := int64(insertData.GetRowNum())
+
+	for _, field := range schema.Fields {
+		// Skip function output fields and system fields
+		if field.GetIsFunctionOutput() || field.GetFieldID() < 100 {
+			continue
+		}
+
+		_, exists := insertData.Data[field.GetFieldID()]
+
+		if !exists {
+			// Create default field data if not found
+			fieldData, err := NewFieldData(field.DataType, field, int(batchRows))
+			if err != nil {
+				return merr.WrapErrServiceInternal(fmt.Sprintf("failed to create default field data for field %s: %v", field.Name, err))
+			}
+
+			if field.GetDefaultValue() != nil { // Fill with default value
+				defaultValue := GetDefaultValue(field)
+
+				for j := 0; j < int(batchRows); j++ {
+					if err := fieldData.AppendRow(defaultValue); err != nil {
+						return merr.WrapErrServiceInternal(fmt.Sprintf("failed to append default value for field %s: %v", field.Name, err))
+					}
+				}
+			} else if field.GetNullable() { // Fill with null values
+				for j := 0; j < int(batchRows); j++ {
+					if err := fieldData.AppendRow(nil); err != nil {
+						return merr.WrapErrServiceInternal(fmt.Sprintf("failed to append null value for field %s: %v", field.Name, err))
+					}
+				}
+			} else {
+				return merr.WrapErrServiceInternal(fmt.Sprintf("field %s is not nullable and has no default value", field.Name))
+			}
+			insertData.Data[field.GetFieldID()] = fieldData
+		}
+	}
+	return nil
+}
+
+// sort by field binlogs key
+func SortFieldBinlogs(fieldBinlogs map[int64]*datapb.FieldBinlog) []*datapb.FieldBinlog {
+	fieldIDs := lo.Keys(fieldBinlogs)
+	sort.Slice(fieldIDs, func(i, j int) bool {
+		return fieldIDs[i] < fieldIDs[j]
+	})
+	binlogs := make([]*datapb.FieldBinlog, 0, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		binlogs = append(binlogs, fieldBinlogs[fieldID])
+	}
+	return binlogs
 }

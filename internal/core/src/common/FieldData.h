@@ -24,7 +24,7 @@
 
 #include "common/FieldDataInterface.h"
 #include "common/Channel.h"
-#include "parquet/arrow/reader.h"
+#include "common/ArrowDataWrapper.h"
 
 namespace milvus {
 
@@ -77,6 +77,20 @@ class FieldData<Array> : public FieldDataArrayImpl {
                        bool nullable,
                        int64_t buffered_num_rows = 0)
         : FieldDataArrayImpl(data_type, nullable, buffered_num_rows) {
+    }
+};
+
+template <>
+class FieldData<VectorArray> : public FieldDataVectorArrayImpl {
+ public:
+    explicit FieldData(DataType data_type, int64_t buffered_num_rows = 0)
+        : FieldDataVectorArrayImpl(data_type, buffered_num_rows) {
+    }
+
+    int64_t
+    get_dim() const override {
+        ThrowInfo(Unsupported,
+                  "Call get_dim on FieldData<VectorArray> is not supported");
     }
 };
 
@@ -155,23 +169,6 @@ class FieldData<Int8Vector> : public FieldDataImpl<int8, false> {
 using FieldDataPtr = std::shared_ptr<FieldDataBase>;
 using FieldDataChannel = Channel<FieldDataPtr>;
 using FieldDataChannelPtr = std::shared_ptr<FieldDataChannel>;
-
-struct ArrowDataWrapper {
-    ArrowDataWrapper() = default;
-    ArrowDataWrapper(std::shared_ptr<arrow::RecordBatchReader> reader,
-                     std::shared_ptr<parquet::arrow::FileReader> arrow_reader,
-                     std::shared_ptr<uint8_t[]> file_data)
-        : reader(std::move(reader)),
-          arrow_reader(std::move(arrow_reader)),
-          file_data(std::move(file_data)) {
-    }
-    std::shared_ptr<arrow::RecordBatchReader> reader;
-    // file reader must outlive the record batch reader
-    std::shared_ptr<parquet::arrow::FileReader> arrow_reader;
-    // underlying file data memory, must outlive the arrow reader
-    std::shared_ptr<uint8_t[]> file_data;
-};
-using ArrowReaderChannel = Channel<std::shared_ptr<milvus::ArrowDataWrapper>>;
 
 FieldDataPtr
 InitScalarFieldData(const DataType& type, bool nullable, int64_t cap_rows);

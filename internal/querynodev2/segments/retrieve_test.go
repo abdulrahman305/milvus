@@ -88,6 +88,7 @@ func (suite *RetrieveSuite) SetupTest() {
 
 	suite.sealed, err = NewSegment(ctx,
 		suite.collection,
+		suite.manager.Segment,
 		SegmentTypeSealed,
 		0,
 		&querypb.SegmentLoadInfo{
@@ -98,7 +99,6 @@ func (suite *RetrieveSuite) SetupTest() {
 			InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
 			Level:         datapb.SegmentLevel_Legacy,
 		},
-		nil,
 	)
 	suite.Require().NoError(err)
 
@@ -118,6 +118,7 @@ func (suite *RetrieveSuite) SetupTest() {
 
 	suite.growing, err = NewSegment(ctx,
 		suite.collection,
+		suite.manager.Segment,
 		SegmentTypeGrowing,
 		0,
 		&querypb.SegmentLoadInfo{
@@ -127,7 +128,6 @@ func (suite *RetrieveSuite) SetupTest() {
 			InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
 			Level:         datapb.SegmentLevel_Legacy,
 		},
-		nil,
 	)
 	suite.Require().NoError(err)
 

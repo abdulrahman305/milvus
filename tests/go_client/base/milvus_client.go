@@ -323,6 +323,11 @@ func (mc *MilvusClient) HybridSearch(ctx context.Context, option client.HybridSe
 	return resultSets, err
 }
 
+func (mc *MilvusClient) SearchIterator(ctx context.Context, option client.SearchIteratorOption, callOptions ...grpc.CallOption) (client.SearchIterator, error) {
+	searchIterator, err := mc.mClient.SearchIterator(ctx, option, callOptions...)
+	return searchIterator, err
+}
+
 // ListResourceGroups list all resource groups
 func (mc *MilvusClient) ListResourceGroups(ctx context.Context, option client.ListResourceGroupsOption, callOptions ...grpc.CallOption) ([]string, error) {
 	resourceGroups, err := mc.mClient.ListResourceGroups(ctx, option, callOptions...)
@@ -451,5 +456,17 @@ func (mc *MilvusClient) ListPrivilegeGroups(ctx context.Context, option client.L
 
 func (mc *MilvusClient) OperatePrivilegeGroup(ctx context.Context, option client.OperatePrivilegeGroupOption, callOptions ...grpc.CallOption) error {
 	err := mc.mClient.OperatePrivilegeGroup(ctx, option, callOptions...)
+	return err
+}
+
+// RunAnalyzer run analyzer with params
+func (mc *MilvusClient) RunAnalyzer(ctx context.Context, option client.RunAnalyzerOption, callOptions ...grpc.CallOption) ([]*entity.AnalyzerResult, error) {
+	tokenSets, err := mc.mClient.RunAnalyzer(ctx, option, callOptions...)
+	return tokenSets, err
+}
+
+// AddCollectionField Add collection field
+func (mc *MilvusClient) AddCollectionField(ctx context.Context, option client.AddCollectionFieldOption, callOptions ...grpc.CallOption) error {
+	err := mc.mClient.AddCollectionField(ctx, option, callOptions...)
 	return err
 }

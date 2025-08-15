@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	_ "github.com/milvus-io/milvus/internal/storage/compress" // register a custom zstd codec here, to avoid to much memory usage when serializing.
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -242,6 +243,12 @@ func (w *NativePayloadWriter) AddDataToPayload(data interface{}, validData []boo
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
 		return w.AddInt8VectorToPayload(val, w.dim.GetValue())
+	case schemapb.DataType_ArrayOfVector:
+		val, ok := data.(*schemapb.VectorField)
+		if !ok {
+			return merr.WrapErrParameterInvalidMsg("incorrect data type")
+		}
+		return w.AddOneVectorArrayToPayload(val)
 	default:
 		return errors.New("unsupported datatype")
 	}
@@ -701,6 +708,26 @@ func (w *NativePayloadWriter) AddInt8VectorToPayload(data []int8, dim int) error
 	return nil
 }
 
+func (w *NativePayloadWriter) AddOneVectorArrayToPayload(data *schemapb.VectorField) error {
+	if w.finished {
+		return errors.New("can't append data to finished vector array payload")
+	}
+
+	bytes, err := proto.Marshal(data)
+	if err != nil {
+		return errors.New("Marshal VectorField failed")
+	}
+
+	builder, ok := w.builder.(*array.BinaryBuilder)
+	if !ok {
+		return errors.New("failed to cast VectorArrayBuilder")
+	}
+
+	builder.Append(bytes)
+
+	return nil
+}
+
 func (w *NativePayloadWriter) FinishPayloadWriter() error {
 	if w.finished {
 		return errors.New("can't reuse a finished writer")
@@ -807,6 +834,8 @@ func MilvusDataTypeToArrowType(dataType schemapb.DataType, dim int) arrow.DataTy
 		return &arrow.FixedSizeBinaryType{
 			ByteWidth: dim,
 		}
+	case schemapb.DataType_ArrayOfVector:
+		return &arrow.BinaryType{}
 	default:
 		panic("unsupported data type")
 	}

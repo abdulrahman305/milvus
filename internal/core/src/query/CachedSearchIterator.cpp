@@ -9,19 +9,21 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <algorithm>
+
 #include "query/CachedSearchIterator.h"
 #include "query/SearchBruteForce.h"
-#include <algorithm>
 
 namespace milvus::query {
 
+// For sealed segment with vector index
 CachedSearchIterator::CachedSearchIterator(
     const milvus::index::VectorIndex& index,
     const knowhere::DataSetPtr& query_ds,
     const SearchInfo& search_info,
     const BitsetView& bitset) {
     if (query_ds == nullptr) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Query dataset is nullptr, cannot initialize iterator");
     }
     nq_ = query_ds->GetRows();
@@ -36,27 +38,7 @@ CachedSearchIterator::CachedSearchIterator(
     if (expected_iterators.has_value()) {
         iterators_ = std::move(expected_iterators.value());
     } else {
-        PanicInfo(ErrorCode::UnexpectedError,
-                  "Failed to create iterators from index");
-    }
-}
-
-CachedSearchIterator::CachedSearchIterator(
-    const dataset::SearchDataset& query_ds,
-    const dataset::RawDataset& raw_ds,
-    const SearchInfo& search_info,
-    const std::map<std::string, std::string>& index_info,
-    const BitsetView& bitset,
-    const milvus::DataType& data_type) {
-    nq_ = query_ds.num_queries;
-    Init(search_info);
-
-    auto expected_iterators = GetBruteForceSearchIterators(
-        query_ds, raw_ds, search_info, index_info, bitset, data_type);
-    if (expected_iterators.has_value()) {
-        iterators_ = std::move(expected_iterators.value());
-    } else {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Failed to create iterators from index");
     }
 }
@@ -84,13 +66,14 @@ CachedSearchIterator::InitializeChunkedIterators(
                               std::make_move_iterator(chunk_iterators.begin()),
                               std::make_move_iterator(chunk_iterators.end()));
         } else {
-            PanicInfo(ErrorCode::UnexpectedError,
+            ThrowInfo(ErrorCode::UnexpectedError,
                       "Failed to create iterators from index");
         }
         offset += chunk_size;
     }
 }
 
+// For growing segment with chunked data, BF
 CachedSearchIterator::CachedSearchIterator(
     const dataset::SearchDataset& query_ds,
     const segcore::VectorBase* vec_data,
@@ -100,12 +83,12 @@ CachedSearchIterator::CachedSearchIterator(
     const BitsetView& bitset,
     const milvus::DataType& data_type) {
     if (vec_data == nullptr) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Vector data is nullptr, cannot initialize iterator");
     }
 
     if (row_count <= 0) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Number of rows is 0, cannot initialize iterator");
     }
 
@@ -121,24 +104,25 @@ CachedSearchIterator::CachedSearchIterator(
         index_info,
         bitset,
         data_type,
-        [&vec_data, vec_size_per_chunk, row_count](
-            int64_t chunk_id) -> std::pair<const void*, int64_t> {
-            const auto chunk_data = vec_data->get_chunk_data(chunk_id);
+        [&vec_data, vec_size_per_chunk, row_count](int64_t chunk_id) {
+            const void* chunk_data = vec_data->get_chunk_data(chunk_id);
+            // no need to store a PinWrapper for growing, because vec_data is guaranteed to not be evicted.
             int64_t chunk_size = std::min(
                 vec_size_per_chunk, row_count - chunk_id * vec_size_per_chunk);
-            return {chunk_data, chunk_size};
+            return std::make_pair(chunk_data, chunk_size);
         });
 }
 
+// For sealed segment with chunked data, BF
 CachedSearchIterator::CachedSearchIterator(
-    const std::shared_ptr<ChunkedColumnBase>& column,
+    ChunkedColumnInterface* column,
     const dataset::SearchDataset& query_ds,
     const SearchInfo& search_info,
     const std::map<std::string, std::string>& index_info,
     const BitsetView& bitset,
     const milvus::DataType& data_type) {
     if (column == nullptr) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Column is nullptr, cannot initialize iterator");
     }
 
@@ -147,17 +131,22 @@ CachedSearchIterator::CachedSearchIterator(
     Init(search_info);
 
     iterators_.reserve(nq_ * num_chunks_);
+    pin_wrappers_.reserve(num_chunks_);
+
     InitializeChunkedIterators(
         query_ds,
         search_info,
         index_info,
         bitset,
         data_type,
-        [&column](int64_t chunk_id) {
-            const char* chunk_data = column->Data(chunk_id);
+        [this, column](int64_t chunk_id) {
+            auto pw = column->DataOfChunk(chunk_id).transform<const void*>(
+                [](const auto& x) { return static_cast<const void*>(x); });
             int64_t chunk_size = column->chunk_row_nums(chunk_id);
-            return std::make_pair(static_cast<const void*>(chunk_data),
-                                  chunk_size);
+            // pw guarantees chunk_data is kept alive.
+            auto chunk_data = pw.get();
+            pin_wrappers_.emplace_back(std::move(pw));
+            return std::make_pair(chunk_data, chunk_size);
         });
 }
 
@@ -169,7 +158,7 @@ CachedSearchIterator::NextBatch(const SearchInfo& search_info,
     }
 
     if (iterators_.size() != nq_ * num_chunks_) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Iterator size mismatch, expect %d, but got %d",
                   nq_ * num_chunks_,
                   iterators_.size());
@@ -192,13 +181,13 @@ CachedSearchIterator::NextBatch(const SearchInfo& search_info,
 void
 CachedSearchIterator::ValidateSearchInfo(const SearchInfo& search_info) {
     if (!search_info.iterator_v2_info_.has_value()) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Iterator v2 SearchInfo is not set");
     }
 
     auto iterator_v2_info = search_info.iterator_v2_info_.value();
     if (iterator_v2_info.batch_size != batch_size_) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Batch size mismatch, expect %d, but got %d",
                   batch_size_,
                   iterator_v2_info.batch_size);
@@ -325,19 +314,19 @@ CachedSearchIterator::WriteSingleQuerySearchResult(
 void
 CachedSearchIterator::Init(const SearchInfo& search_info) {
     if (!search_info.iterator_v2_info_.has_value()) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Iterator v2 info is not set, cannot initialize iterator");
     }
 
     auto iterator_v2_info = search_info.iterator_v2_info_.value();
     if (iterator_v2_info.batch_size == 0) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Batch size is 0, cannot initialize iterator");
     }
     batch_size_ = iterator_v2_info.batch_size;
 
     if (search_info.metric_type_.empty()) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Metric type is empty, cannot initialize iterator");
     }
     if (PositivelyRelated(search_info.metric_type_)) {
@@ -347,13 +336,13 @@ CachedSearchIterator::Init(const SearchInfo& search_info) {
     }
 
     if (nq_ == 0) {
-        PanicInfo(ErrorCode::UnexpectedError,
+        ThrowInfo(ErrorCode::UnexpectedError,
                   "Number of queries is 0, cannot initialize iterator");
     }
 
     // disable multi-query for now
     if (nq_ > 1) {
-        PanicInfo(
+        ThrowInfo(
             ErrorCode::UnexpectedError,
             "Number of queries is greater than 1, cannot initialize iterator");
     }

@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"time"
 )
@@ -36,16 +37,16 @@ func send(req *http.Request) ([]byte, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Call service faild, read response failed, errs:[%v]", err)
+		return nil, fmt.Errorf("Call service failed, read response failed, errs:[%v]", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Call service faild, errs:[%s, %s]", resp.Status, body)
+		return nil, fmt.Errorf("Call service failed, errs:[%s, %s]", resp.Status, body)
 	}
 	return body, nil
 }
 
-func RetrySend(ctx context.Context, data []byte, httpMethod string, url string, headers map[string]string, maxRetries int, retryDelay int) ([]byte, error) {
+func RetrySend(ctx context.Context, data []byte, httpMethod string, url string, headers map[string]string, maxRetries int) ([]byte, error) {
 	var err error
 	var body []byte
 	for i := 0; i < maxRetries; i++ {
@@ -60,7 +61,9 @@ func RetrySend(ctx context.Context, data []byte, httpMethod string, url string, 
 		if err == nil {
 			return body, nil
 		}
-		time.Sleep(time.Duration(retryDelay) * time.Second)
+		backoffDelay := 1 << uint(i) * time.Second
+		jitter := time.Duration(rand.Int63n(int64(backoffDelay / 4)))
+		time.Sleep(backoffDelay + jitter)
 	}
 	return nil, err
 }

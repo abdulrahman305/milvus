@@ -1,7 +1,10 @@
 package message
 
 import (
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 )
 
 var (
@@ -13,6 +16,8 @@ var (
 
 // BasicMessage is the basic interface of message.
 type BasicMessage interface {
+	zapcore.ObjectMarshaler
+
 	// MessageType returns the type of message.
 	MessageType() MessageType
 
@@ -21,7 +26,10 @@ type BasicMessage interface {
 	// from 1: new version after streamingnode.
 	Version() Version
 
-	// Message payload.
+	// Payload returns the message payload.
+	// If the underlying message is encrypted, the payload will be decrypted.
+	// !!! So if the message is encrypted, additional overhead will be paid for decryption.
+	// If the underlying message is not encrypted, the payload will be returned directly.
 	Payload() []byte
 
 	// EstimateSize returns the estimated size of message.
@@ -47,6 +55,12 @@ type BasicMessage interface {
 	// BroadcastHeader returns the broadcast common header of the message.
 	// If the message is not a broadcast message, it will return 0.
 	BroadcastHeader() *BroadcastHeader
+
+	// IsPersisted returns true if the message is persisted into underlying log storage.
+	IsPersisted() bool
+
+	// IntoMessageProto converts the message to a protobuf message.
+	IntoMessageProto() *messagespb.Message
 }
 
 // MutableMessage is the mutable message interface.
@@ -72,6 +86,11 @@ type MutableMessage interface {
 	// WithLastConfirmed sets the last confirmed message id of current message.
 	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
 	WithLastConfirmed(id MessageID) MutableMessage
+
+	// WithOldVersion sets the version of current message to be old version.
+	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
+	// TODO: used for old version message compatibility, will be removed in the future.
+	WithOldVersion() MutableMessage
 
 	// WithLastConfirmedUseMessageID sets the last confirmed message id of current message to be the same as message id.
 	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
@@ -150,6 +169,9 @@ type ImmutableTxnMessage interface {
 type specializedMutableMessage[H proto.Message, B proto.Message] interface {
 	BasicMessage
 
+	// VChannel returns the virtual channel of current message.
+	VChannel() string
+
 	// MessageHeader returns the message header.
 	// Modifications to the returned header will be reflected in the message.
 	Header() H
@@ -157,6 +179,9 @@ type specializedMutableMessage[H proto.Message, B proto.Message] interface {
 	// Body returns the message body.
 	// !!! Do these will trigger a unmarshal operation, so it should be used with caution.
 	Body() (B, error)
+
+	// MustBody return the message body, panic if error occurs.
+	MustBody() B
 
 	// OverwriteHeader overwrites the message header.
 	OverwriteHeader(header H)
@@ -173,4 +198,7 @@ type specializedImmutableMessage[H proto.Message, B proto.Message] interface {
 	// Body returns the message body.
 	// !!! Do these will trigger a unmarshal operation, so it should be used with caution.
 	Body() (B, error)
+
+	// MustBody return the message body, panic if error occurs.
+	MustBody() B
 }

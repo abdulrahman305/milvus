@@ -26,7 +26,8 @@ extern "C" {
 typedef void* CLoadFieldDataInfo;
 
 CStatus
-NewLoadFieldDataInfo(CLoadFieldDataInfo* c_load_field_data_info);
+NewLoadFieldDataInfo(CLoadFieldDataInfo* c_load_field_data_info,
+                     int64_t storage_version);
 
 void
 DeleteLoadFieldDataInfo(CLoadFieldDataInfo c_load_field_data_info);
@@ -40,14 +41,12 @@ CStatus
 AppendLoadFieldDataPath(CLoadFieldDataInfo c_load_field_data_info,
                         int64_t field_id,
                         int64_t entries_num,
+                        int64_t memory_size,
                         const char* file_path);
 
 void
 AppendMMapDirPath(CLoadFieldDataInfo c_load_field_data_info,
                   const char* dir_path);
-
-void
-SetUri(CLoadFieldDataInfo c_load_field_data_info, const char* uri);
 
 void
 SetStorageVersion(CLoadFieldDataInfo c_load_field_data_info,
@@ -57,6 +56,9 @@ void
 EnableMmap(CLoadFieldDataInfo c_load_field_data_info,
            int64_t field_id,
            bool enabled);
+
+void
+SetLoadPriority(CLoadFieldDataInfo c_load_field_data_info, int32_t priority);
 
 #ifdef __cplusplus
 }

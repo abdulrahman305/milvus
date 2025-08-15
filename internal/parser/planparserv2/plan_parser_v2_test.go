@@ -10,6 +10,7 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
@@ -154,6 +155,10 @@ func TestExpr_Call(t *testing.T) {
 	assert.Equal(t, int64(2), expr.GetCallExpr().GetFunctionParameters()[0].GetValueExpr().GetValue().GetInt64Val())
 	assert.Equal(t, false, expr.GetCallExpr().GetFunctionParameters()[1].GetValueExpr().GetValue().GetBoolVal())
 	assert.Equal(t, int64(20), expr.GetCallExpr().GetFunctionParameters()[2].GetCallExpr().GetFunctionParameters()[0].GetValueExpr().GetValue().GetInt64Val())
+
+	expr, err = ParseExpr(helper, "ceil(pow(1.5*Int32Field,0.58))", nil)
+	assert.Error(t, err)
+	assert.Nil(t, expr)
 }
 
 func TestExpr_Compare(t *testing.T) {
@@ -168,11 +173,26 @@ func TestExpr_Compare(t *testing.T) {
 		`Int64Field >= FloatField`,
 		`FloatField == DoubleField`,
 		`StringField != VarCharField`,
-		`JSONField["A"] > Int16Field`,
-		`$meta["A"] > Int16Field`,
 	}
 	for _, exprStr := range exprStrs {
 		assertValidExpr(t, helper, exprStr)
+	}
+
+	exprStrs = []string{
+		`BoolField == false + true`,
+		`StringField == "1" + "2"`,
+		`BoolField == false - true`,
+		`StringField == "1" - "2"`,
+		`BoolField == false * true`,
+		`StringField == "1" * "2"`,
+		`BoolField == false / true`,
+		`StringField == "1" / "2"`,
+		`BoolField == false % true`,
+		`StringField == "1" % "2"`,
+	}
+
+	for _, exprStr := range exprStrs {
+		assertInvalidExpr(t, helper, exprStr)
 	}
 }
 
@@ -421,11 +441,8 @@ func TestExpr_castValue(t *testing.T) {
 
 	exprStr := `Int64Field + 1.1 == 2.1`
 	expr, err := ParseExpr(helper, exprStr, nil)
-	assert.NoError(t, err, exprStr)
-	assert.NotNil(t, expr, exprStr)
-	assert.NotNil(t, expr.GetBinaryArithOpEvalRangeExpr())
-	assert.NotNil(t, expr.GetBinaryArithOpEvalRangeExpr().GetRightOperand().GetFloatVal())
-	assert.NotNil(t, expr.GetBinaryArithOpEvalRangeExpr().GetValue().GetFloatVal())
+	assert.Error(t, err, exprStr)
+	assert.Nil(t, expr, exprStr)
 
 	exprStr = `FloatField +1 == 2`
 	expr, err = ParseExpr(helper, exprStr, nil)
@@ -457,6 +474,8 @@ func TestExpr_BinaryArith(t *testing.T) {
 		`ArrayField[0] % 19 >= 20`,
 		`JSONField + 15 == 16`,
 		`15 + JSONField == 16`,
+		`Int64Field + (2**3) > 0`,
+		`1 + FloatField > 100`,
 	}
 	for _, exprStr := range exprStrs {
 		assertValidExpr(t, helper, exprStr)
@@ -466,6 +485,15 @@ func TestExpr_BinaryArith(t *testing.T) {
 	unsupported := []string{
 		`ArrayField + 15 == 16`,
 		`15 + ArrayField == 16`,
+		`Int64Field + 1.1 = 2.1`,
+		`Int64Field == 2.1`,
+		`Int64Field >= 2.1`,
+		`3 > Int64Field >= 2.1`,
+		`Int64Field + (2**-1) > 0`,
+		`Int64Field / 0 == 1`,
+		`Int64Field % 0 == 1`,
+		`FloatField / 0 == 1`,
+		`FloatField % 0 == 1`,
 	}
 	for _, exprStr := range unsupported {
 		assertInvalidExpr(t, helper, exprStr)
@@ -711,6 +739,7 @@ func TestExpr_Invalid(t *testing.T) {
 		`"str" != false`,
 		`VarCharField != FloatField`,
 		`FloatField == VarCharField`,
+		`A == -9223372036854775808`,
 		// ---------------------- relational --------------------
 		//`not_in_schema < 1`, // maybe in json
 		//`1 <= not_in_schema`, // maybe in json
@@ -948,6 +977,8 @@ func Test_JSONExpr(t *testing.T) {
 		`100 == $meta["A"] + 6`,
 		`exists $meta["A"]`,
 		`exists $meta["A"]["B"]["C"] `,
+		`exists $meta["A"] || exists JSONField["A"]`,
+		`exists $meta["A"] && exists JSONField["A"]`,
 		`A["B"][0] > 100`,
 		`$meta[0] > 100`,
 		`A["\"\"B\"\""] > 10`,
@@ -1516,7 +1547,7 @@ func TestRandomSampleWithFilter(t *testing.T) {
 		`VarCharField IS NOT NULL && random_sample(0.01)`,
 		`11.0 < DoubleField < 12.0 && random_sample(0.01)`,
 		`1 < JSONField < 3 && random_sample(0.01)`,
-		`Int64Field + 1.1 == 2.1 && random_sample(0.01)`,
+		`Int64Field + 1 == 2 && random_sample(0.01)`,
 		`Int64Field % 10 != 9 && random_sample(0.01)`,
 		`A * 15 > 16 && random_sample(0.01)`,
 		`(Int16Field - 3 == 4) and (Int32Field * 5 != 6) && random_sample(0.01)`,
@@ -1702,4 +1733,41 @@ func TestNestedPathWithChinese(t *testing.T) {
 	assert.Equal(t, "A", paths[0])
 	assert.Equal(t, "年份", paths[1])
 	assert.Equal(t, "月份", paths[2])
+}
+
+func Test_JSONPathNullExpr(t *testing.T) {
+	schema := newTestSchemaHelper(t)
+
+	exprPairs := [][]string{
+		{`A["a"] is null`, `not exists A["a"]`},
+		{`A["a"] is not null`, `exists A["a"]`},
+		{`dyn_field is null`, `not exists dyn_field`},
+		{`dyn_field is not null`, `exists dyn_field`},
+	}
+
+	for _, expr := range exprPairs {
+		plan, err := CreateSearchPlan(schema, expr[0], "FloatVectorField", &planpb.QueryInfo{
+			Topk:         0,
+			MetricType:   "",
+			SearchParams: "",
+			RoundDecimal: 0,
+		}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, plan)
+
+		plan2, err := CreateSearchPlan(schema, expr[1], "FloatVectorField", &planpb.QueryInfo{
+			Topk:         0,
+			MetricType:   "",
+			SearchParams: "",
+			RoundDecimal: 0,
+		}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, plan2)
+
+		planStr, err := proto.Marshal(plan)
+		assert.NoError(t, err)
+		plan2Str, err := proto.Marshal(plan2)
+		assert.NoError(t, err)
+		assert.Equal(t, planStr, plan2Str)
+	}
 }

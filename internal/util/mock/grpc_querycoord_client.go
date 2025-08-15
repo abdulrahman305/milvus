@@ -50,11 +50,11 @@ func (m *GrpcQueryCoordClient) GetStatisticsChannel(ctx context.Context, in *int
 	return &milvuspb.StringResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) ShowCollections(ctx context.Context, in *querypb.ShowCollectionsRequest, opts ...grpc.CallOption) (*querypb.ShowCollectionsResponse, error) {
+func (m *GrpcQueryCoordClient) ShowLoadCollections(ctx context.Context, in *querypb.ShowCollectionsRequest, opts ...grpc.CallOption) (*querypb.ShowCollectionsResponse, error) {
 	return &querypb.ShowCollectionsResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) ShowPartitions(ctx context.Context, in *querypb.ShowPartitionsRequest, opts ...grpc.CallOption) (*querypb.ShowPartitionsResponse, error) {
+func (m *GrpcQueryCoordClient) ShowLoadPartitions(ctx context.Context, in *querypb.ShowPartitionsRequest, opts ...grpc.CallOption) (*querypb.ShowPartitionsResponse, error) {
 	return &querypb.ShowPartitionsResponse{}, m.Err
 }
 
@@ -78,7 +78,7 @@ func (m *GrpcQueryCoordClient) GetPartitionStates(ctx context.Context, in *query
 	return &querypb.GetPartitionStatesResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) GetSegmentInfo(ctx context.Context, in *querypb.GetSegmentInfoRequest, opts ...grpc.CallOption) (*querypb.GetSegmentInfoResponse, error) {
+func (m *GrpcQueryCoordClient) GetLoadSegmentInfo(ctx context.Context, in *querypb.GetSegmentInfoRequest, opts ...grpc.CallOption) (*querypb.GetSegmentInfoResponse, error) {
 	return &querypb.GetSegmentInfoResponse{}, m.Err
 }
 
@@ -188,4 +188,8 @@ func (m *GrpcQueryCoordClient) CheckQueryNodeDistribution(ctx context.Context, r
 
 func (m *GrpcQueryCoordClient) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadConfigRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcQueryCoordClient) ListLoadedSegments(ctx context.Context, req *querypb.ListLoadedSegmentsRequest, opts ...grpc.CallOption) (*querypb.ListLoadedSegmentsResponse, error) {
+	return &querypb.ListLoadedSegmentsResponse{}, m.Err
 }

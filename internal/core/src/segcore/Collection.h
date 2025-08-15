@@ -28,8 +28,13 @@ class Collection {
     void
     parseIndexMeta(const void* index_meta_proto_blob, const int64_t length);
 
+    void
+    parse_schema(const void* schema_proto_blob,
+                 const int64_t length,
+                 const uint64_t version);
+
  public:
-    SchemaPtr&
+    SchemaPtr
     get_schema() {
         return schema_;
     }

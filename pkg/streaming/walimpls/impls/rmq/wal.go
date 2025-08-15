@@ -26,7 +26,7 @@ type walImpl struct {
 }
 
 func (w *walImpl) WALName() string {
-	return walName
+	return WALName
 }
 
 // Append appends a message to the wal.
@@ -34,10 +34,10 @@ func (w *walImpl) Append(ctx context.Context, msg message.MutableMessage) (messa
 	if w.Channel().AccessMode != types.AccessModeRW {
 		panic("write on a wal that is not in read-write mode")
 	}
-
+	pb := msg.IntoMessageProto()
 	id, err := w.p.SendForStreamingService(&common.ProducerMessage{
-		Payload:    msg.Payload(),
-		Properties: msg.Properties().ToRawMap(),
+		Payload:    pb.Payload,
+		Properties: pb.Properties,
 	})
 	if err != nil {
 		w.Log().RatedWarn(1, "send message to rmq failed", zap.Error(err))
@@ -102,6 +102,13 @@ func (w *walImpl) Read(ctx context.Context, opt walimpls.ReadOption) (s walimpls
 		}
 	}
 	return newScanner(scannerName, exclude, consumer), nil
+}
+
+func (w *walImpl) Truncate(ctx context.Context, id message.MessageID) error {
+	if w.Channel().AccessMode != types.AccessModeRW {
+		panic("truncate on a wal that is not in read-write mode")
+	}
+	return nil
 }
 
 // Close closes the wal.

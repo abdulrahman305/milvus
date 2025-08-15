@@ -1,23 +1,22 @@
-// // Licensed to the LF AI & Data foundation under one
-// // or more contributor license agreements. See the NOTICE file
-// // distributed with this work for additional information
-// // regarding copyright ownership. The ASF licenses this file
-// // to you under the Apache License, Version 2.0 (the
-// // "License"); you may not use this file except in compliance
-// // with the License. You may obtain a copy of the License at
-// //
-// //	http://www.apache.org/licenses/LICENSE-2.0
-// //
-// // Unless required by applicable law or agreed to in writing, software
-// // distributed under the License is distributed on an "AS IS" BASIS,
-// // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// // See the License for the specific language governing permissions and
-// // limitations under the License.
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 package proxy
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 
 	"github.com/cockroachdb/errors"
@@ -55,7 +54,6 @@ type upsertTask struct {
 	rowIDs           []int64
 	result           *milvuspb.MutationResult
 	idAllocator      *allocator.IDAllocator
-	segIDAssigner    *segIDAssigner
 	collectionID     UniqueID
 	chMgr            channelsMgr
 	chTicker         channelsTimeTicker
@@ -65,8 +63,8 @@ type upsertTask struct {
 	partitionKeyMode bool
 	partitionKeys    *schemapb.FieldData
 	// automatic generate pk as new pk wehen autoID == true
-	// delete task need use the oldIds
-	oldIds          *schemapb.IDs
+	// delete task need use the oldIDs
+	oldIDs          *schemapb.IDs
 	schemaTimestamp uint64
 }
 
@@ -205,10 +203,20 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 		}
 	}
 
+	err := checkAndFlattenStructFieldData(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+	if err != nil {
+		return err
+	}
+
+	allFields := make([]*schemapb.FieldSchema, 0, len(it.schema.Fields)+5)
+	allFields = append(allFields, it.schema.Fields...)
+	for _, structField := range it.schema.GetStructArrayFields() {
+		allFields = append(allFields, structField.GetFields()...)
+	}
+
 	// use the passed pk as new pk when autoID == false
 	// automatic generate pk as new pk wehen autoID == true
-	var err error
-	it.result.IDs, it.oldIds, err = checkUpsertPrimaryFieldData(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+	it.result.IDs, it.oldIDs, err = checkUpsertPrimaryFieldData(allFields, it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
 	log := log.Ctx(ctx).With(zap.String("collectionName", it.upsertMsg.InsertMsg.CollectionName))
 	if err != nil {
 		log.Warn("check primary field data and hash primary key failed when upsert",
@@ -217,7 +225,7 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 	}
 
 	// check varchar/text with analyzer was utf-8 format
-	err = checkInputUtf8Compatiable(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+	err = checkInputUtf8Compatiable(allFields, it.upsertMsg.InsertMsg)
 	if err != nil {
 		log.Warn("check varchar/text format failed", zap.Error(err))
 		return err
@@ -340,7 +348,10 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 	if it.schemaTimestamp != 0 {
 		if it.schemaTimestamp != colInfo.updateTimestamp {
 			err := merr.WrapErrCollectionSchemaMisMatch(collectionName)
-			log.Info("collection schema mismatch", zap.String("collectionName", collectionName), zap.Error(err))
+			log.Info("collection schema mismatch", zap.String("collectionName", collectionName),
+				zap.Uint64("requestSchemaTs", it.schemaTimestamp),
+				zap.Uint64("collectionSchemaTs", colInfo.updateTimestamp),
+				zap.Error(err))
 			return err
 		}
 	}
@@ -429,189 +440,6 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 	}
 	it.result.UpsertCnt = it.result.InsertCnt
 	log.Debug("Proxy Upsert PreExecute done")
-	return nil
-}
-
-func (it *upsertTask) insertExecute(ctx context.Context, msgPack *msgstream.MsgPack) error {
-	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy insertExecute upsert %d", it.ID()))
-	defer tr.Elapse("insert execute done when insertExecute")
-
-	collectionName := it.upsertMsg.InsertMsg.CollectionName
-	collID, err := globalMetaCache.GetCollectionID(ctx, it.req.GetDbName(), collectionName)
-	if err != nil {
-		return err
-	}
-	it.upsertMsg.InsertMsg.CollectionID = collID
-	it.upsertMsg.InsertMsg.BeginTimestamp = it.BeginTs()
-	it.upsertMsg.InsertMsg.EndTimestamp = it.EndTs()
-	log := log.Ctx(ctx).With(
-		zap.Int64("collectionID", collID))
-	getCacheDur := tr.RecordSpan()
-
-	_, err = it.chMgr.getOrCreateDmlStream(ctx, collID)
-	if err != nil {
-		return err
-	}
-	getMsgStreamDur := tr.RecordSpan()
-	channelNames, err := it.chMgr.getVChannels(collID)
-	if err != nil {
-		log.Warn("get vChannels failed when insertExecute",
-			zap.Error(err))
-		it.result.Status = merr.Status(err)
-		return err
-	}
-
-	log.Debug("send insert request to virtual channels when insertExecute",
-		zap.String("collection", it.req.GetCollectionName()),
-		zap.String("partition", it.req.GetPartitionName()),
-		zap.Int64("collection_id", collID),
-		zap.Strings("virtual_channels", channelNames),
-		zap.Int64("task_id", it.ID()),
-		zap.Duration("get cache duration", getCacheDur),
-		zap.Duration("get msgStream duration", getMsgStreamDur))
-
-	// assign segmentID for insert data and repack data by segmentID
-	var insertMsgPack *msgstream.MsgPack
-	if it.partitionKeys == nil {
-		insertMsgPack, err = repackInsertData(it.TraceCtx(), channelNames, it.upsertMsg.InsertMsg, it.result, it.idAllocator, it.segIDAssigner)
-	} else {
-		insertMsgPack, err = repackInsertDataWithPartitionKey(it.TraceCtx(), channelNames, it.partitionKeys, it.upsertMsg.InsertMsg, it.result, it.idAllocator, it.segIDAssigner)
-	}
-	if err != nil {
-		log.Warn("assign segmentID and repack insert data failed when insertExecute",
-			zap.Error(err))
-		it.result.Status = merr.Status(err)
-		return err
-	}
-	assignSegmentIDDur := tr.RecordSpan()
-	log.Debug("assign segmentID for insert data success when insertExecute",
-		zap.String("collectionName", it.req.CollectionName),
-		zap.Duration("assign segmentID duration", assignSegmentIDDur))
-	msgPack.Msgs = append(msgPack.Msgs, insertMsgPack.Msgs...)
-
-	log.Debug("Proxy Insert Execute done when upsert",
-		zap.String("collectionName", collectionName))
-
-	return nil
-}
-
-func (it *upsertTask) deleteExecute(ctx context.Context, msgPack *msgstream.MsgPack) (err error) {
-	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy deleteExecute upsert %d", it.ID()))
-	collID := it.upsertMsg.DeleteMsg.CollectionID
-	log := log.Ctx(ctx).With(
-		zap.Int64("collectionID", collID))
-	// hash primary keys to channels
-	channelNames, err := it.chMgr.getVChannels(collID)
-	if err != nil {
-		log.Warn("get vChannels failed when deleteExecute", zap.Error(err))
-		it.result.Status = merr.Status(err)
-		return err
-	}
-	it.upsertMsg.DeleteMsg.PrimaryKeys = it.oldIds
-	it.upsertMsg.DeleteMsg.HashValues = typeutil.HashPK2Channels(it.upsertMsg.DeleteMsg.PrimaryKeys, channelNames)
-
-	// repack delete msg by dmChannel
-	result := make(map[uint32]msgstream.TsMsg)
-	collectionName := it.upsertMsg.DeleteMsg.CollectionName
-	collectionID := it.upsertMsg.DeleteMsg.CollectionID
-	partitionID := it.upsertMsg.DeleteMsg.PartitionID
-	partitionName := it.upsertMsg.DeleteMsg.PartitionName
-	proxyID := it.upsertMsg.DeleteMsg.Base.SourceID
-	for index, key := range it.upsertMsg.DeleteMsg.HashValues {
-		ts := it.upsertMsg.DeleteMsg.Timestamps[index]
-		_, ok := result[key]
-		if !ok {
-			msgid, err := it.idAllocator.AllocOne()
-			if err != nil {
-				return errors.Wrap(err, "failed to allocate MsgID for delete of upsert")
-			}
-			sliceRequest := &msgpb.DeleteRequest{
-				Base: commonpbutil.NewMsgBase(
-					commonpbutil.WithMsgType(commonpb.MsgType_Delete),
-					commonpbutil.WithTimeStamp(ts),
-					// id of upsertTask were set as ts in scheduler
-					// msgid of delete msg must be set
-					// or it will be seen as duplicated msg in mq
-					commonpbutil.WithMsgID(msgid),
-					commonpbutil.WithSourceID(proxyID),
-				),
-				CollectionID:   collectionID,
-				PartitionID:    partitionID,
-				CollectionName: collectionName,
-				PartitionName:  partitionName,
-				PrimaryKeys:    &schemapb.IDs{},
-			}
-			deleteMsg := &msgstream.DeleteMsg{
-				BaseMsg: msgstream.BaseMsg{
-					Ctx: ctx,
-				},
-				DeleteRequest: sliceRequest,
-			}
-			result[key] = deleteMsg
-		}
-		curMsg := result[key].(*msgstream.DeleteMsg)
-		curMsg.HashValues = append(curMsg.HashValues, it.upsertMsg.DeleteMsg.HashValues[index])
-		curMsg.Timestamps = append(curMsg.Timestamps, it.upsertMsg.DeleteMsg.Timestamps[index])
-		typeutil.AppendIDs(curMsg.PrimaryKeys, it.upsertMsg.DeleteMsg.PrimaryKeys, index)
-		curMsg.NumRows++
-		curMsg.ShardName = channelNames[key]
-	}
-
-	// send delete request to log broker
-	deleteMsgPack := &msgstream.MsgPack{
-		BeginTs: it.upsertMsg.DeleteMsg.BeginTs(),
-		EndTs:   it.upsertMsg.DeleteMsg.EndTs(),
-	}
-	for _, msg := range result {
-		if msg != nil {
-			deleteMsgPack.Msgs = append(deleteMsgPack.Msgs, msg)
-		}
-	}
-	msgPack.Msgs = append(msgPack.Msgs, deleteMsgPack.Msgs...)
-
-	log.Debug("Proxy Upsert deleteExecute done", zap.Int64("collection_id", collID),
-		zap.Strings("virtual_channels", channelNames), zap.Int64("taskID", it.ID()),
-		zap.Duration("prepare duration", tr.ElapseSpan()))
-	return nil
-}
-
-func (it *upsertTask) Execute(ctx context.Context) (err error) {
-	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Upsert-Execute")
-	defer sp.End()
-	log := log.Ctx(ctx).With(zap.String("collectionName", it.req.CollectionName))
-
-	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute upsert %d", it.ID()))
-	stream, err := it.chMgr.getOrCreateDmlStream(ctx, it.collectionID)
-	if err != nil {
-		return err
-	}
-	msgPack := &msgstream.MsgPack{
-		BeginTs: it.BeginTs(),
-		EndTs:   it.EndTs(),
-	}
-	err = it.insertExecute(ctx, msgPack)
-	if err != nil {
-		log.Warn("Fail to insertExecute", zap.Error(err))
-		return err
-	}
-
-	err = it.deleteExecute(ctx, msgPack)
-	if err != nil {
-		log.Warn("Fail to deleteExecute", zap.Error(err))
-		return err
-	}
-
-	tr.RecordSpan()
-	err = stream.Produce(ctx, msgPack)
-	if err != nil {
-		it.result.Status = merr.Status(err)
-		return err
-	}
-	sendMsgDur := tr.RecordSpan()
-	metrics.ProxySendMutationReqLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.UpsertLabel).Observe(float64(sendMsgDur.Milliseconds()))
-	totalDur := tr.ElapseSpan()
-	log.Debug("Proxy Upsert Execute done", zap.Int64("taskID", it.ID()),
-		zap.Duration("total duration", totalDur))
 	return nil
 }
 

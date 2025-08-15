@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -58,11 +59,11 @@ type Client struct {
 // NewClient creates a client for DataNode.
 func NewClient(ctx context.Context, addr string, serverID int64, encryption bool) (types.DataNodeClient, error) {
 	if addr == "" {
-		return nil, fmt.Errorf("address is empty")
+		return nil, errors.New("address is empty")
 	}
 	sess := sessionutil.NewSession(ctx)
 	if sess == nil {
-		err := fmt.Errorf("new session error, maybe can not connect to etcd")
+		err := errors.New("new session error, maybe can not connect to etcd")
 		log.Ctx(ctx).Debug("DataNodeClient New Etcd Session failed", zap.Error(err))
 		return nil, err
 	}
@@ -338,5 +339,23 @@ func (c *Client) QueryJobsV2(ctx context.Context, req *workerpb.QueryJobsV2Reque
 func (c *Client) DropJobsV2(ctx context.Context, req *workerpb.DropJobsV2Request, opt ...grpc.CallOption) (*commonpb.Status, error) {
 	return wrapGrpcCall(ctx, c, func(client DataNodeClient) (*commonpb.Status, error) {
 		return client.DropJobsV2(ctx, req)
+	})
+}
+
+func (c *Client) CreateTask(ctx context.Context, in *workerpb.CreateTaskRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return wrapGrpcCall(ctx, c, func(client DataNodeClient) (*commonpb.Status, error) {
+		return client.CreateTask(ctx, in)
+	})
+}
+
+func (c *Client) QueryTask(ctx context.Context, in *workerpb.QueryTaskRequest, opts ...grpc.CallOption) (*workerpb.QueryTaskResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client DataNodeClient) (*workerpb.QueryTaskResponse, error) {
+		return client.QueryTask(ctx, in)
+	})
+}
+
+func (c *Client) DropTask(ctx context.Context, in *workerpb.DropTaskRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return wrapGrpcCall(ctx, c, func(client DataNodeClient) (*commonpb.Status, error) {
+		return client.DropTask(ctx, in)
 	})
 }

@@ -38,18 +38,18 @@ type Broker interface {
 	DescribeCollectionInternal(ctx context.Context, collectionID int64) (*milvuspb.DescribeCollectionResponse, error)
 	ShowPartitionsInternal(ctx context.Context, collectionID int64) ([]int64, error)
 	ShowCollections(ctx context.Context, dbName string) (*milvuspb.ShowCollectionsResponse, error)
-	ShowCollectionIDs(ctx context.Context) (*rootcoordpb.ShowCollectionIDsResponse, error)
+	ShowCollectionIDs(ctx context.Context, dbNames ...string) (*rootcoordpb.ShowCollectionIDsResponse, error)
 	ListDatabases(ctx context.Context) (*milvuspb.ListDatabasesResponse, error)
 	HasCollection(ctx context.Context, collectionID int64) (bool, error)
 }
 
 type coordinatorBroker struct {
-	rootCoord types.RootCoordClient
+	mixCoord types.MixCoord
 }
 
-func NewCoordinatorBroker(rootCoord types.RootCoordClient) *coordinatorBroker {
+func NewCoordinatorBroker(mixCoord types.MixCoord) *coordinatorBroker {
 	return &coordinatorBroker{
-		rootCoord: rootCoord,
+		mixCoord: mixCoord,
 	}
 }
 
@@ -58,7 +58,7 @@ func (b *coordinatorBroker) DescribeCollectionInternal(ctx context.Context, coll
 	defer cancel()
 	log := log.Ctx(ctx).With(zap.Int64("collectionID", collectionID))
 
-	resp, err := b.rootCoord.DescribeCollectionInternal(ctx, &milvuspb.DescribeCollectionRequest{
+	resp, err := b.mixCoord.DescribeCollectionInternal(ctx, &milvuspb.DescribeCollectionRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_DescribeCollection),
 			commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -79,7 +79,7 @@ func (b *coordinatorBroker) ShowPartitionsInternal(ctx context.Context, collecti
 	defer cancel()
 	log := log.Ctx(ctx).With(zap.Int64("collectionID", collectionID))
 
-	resp, err := b.rootCoord.ShowPartitionsInternal(ctx, &milvuspb.ShowPartitionsRequest{
+	resp, err := b.mixCoord.ShowPartitionsInternal(ctx, &milvuspb.ShowPartitionsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_ShowPartitions),
 			commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -101,7 +101,7 @@ func (b *coordinatorBroker) ShowCollections(ctx context.Context, dbName string) 
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 	log := log.Ctx(ctx).With(zap.String("dbName", dbName))
-	resp, err := b.rootCoord.ShowCollections(ctx, &milvuspb.ShowCollectionsRequest{
+	resp, err := b.mixCoord.ShowCollections(ctx, &milvuspb.ShowCollectionsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_ShowCollections),
 		),
@@ -118,14 +118,15 @@ func (b *coordinatorBroker) ShowCollections(ctx context.Context, dbName string) 
 	return resp, nil
 }
 
-func (b *coordinatorBroker) ShowCollectionIDs(ctx context.Context) (*rootcoordpb.ShowCollectionIDsResponse, error) {
+func (b *coordinatorBroker) ShowCollectionIDs(ctx context.Context, dbNames ...string) (*rootcoordpb.ShowCollectionIDsResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
-	resp, err := b.rootCoord.ShowCollectionIDs(ctx, &rootcoordpb.ShowCollectionIDsRequest{
+	resp, err := b.mixCoord.ShowCollectionIDs(ctx, &rootcoordpb.ShowCollectionIDsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_ShowCollections),
 		),
 		AllowUnavailable: true,
+		DbNames:          dbNames,
 	})
 
 	if err = merr.CheckRPCCall(resp, err); err != nil {
@@ -140,7 +141,7 @@ func (b *coordinatorBroker) ListDatabases(ctx context.Context) (*milvuspb.ListDa
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 	log := log.Ctx(ctx)
-	resp, err := b.rootCoord.ListDatabases(ctx, &milvuspb.ListDatabasesRequest{
+	resp, err := b.mixCoord.ListDatabases(ctx, &milvuspb.ListDatabasesRequest{
 		Base: commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_ListDatabases)),
 	})
 	if err := merr.CheckRPCCall(resp, err); err != nil {
@@ -154,7 +155,7 @@ func (b *coordinatorBroker) ListDatabases(ctx context.Context) (*milvuspb.ListDa
 func (b *coordinatorBroker) HasCollection(ctx context.Context, collectionID int64) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
-	resp, err := b.rootCoord.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
+	resp, err := b.mixCoord.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_DescribeCollection),
 			commonpbutil.WithSourceID(paramtable.GetNodeID()),

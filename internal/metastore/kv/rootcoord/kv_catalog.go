@@ -36,6 +36,7 @@ import (
 // prefix/partitions/collection_id/partition_id		-> PartitionInfo
 // prefix/aliases/alias_name						-> AliasInfo
 // prefix/fields/collection_id/field_id				-> FieldSchema
+// prefix/file_resource/resource_id             -> Resource
 
 type Catalog struct {
 	Txn      kv.TxnKV
@@ -78,6 +79,14 @@ func BuildFunctionPrefix(collectionID typeutil.UniqueID) string {
 
 func BuildFunctionKey(collectionID typeutil.UniqueID, functionID int64) string {
 	return fmt.Sprintf("%s/%d", BuildFunctionPrefix(collectionID), functionID)
+}
+
+func BuildStructArrayFieldPrefix(collectionID typeutil.UniqueID) string {
+	return fmt.Sprintf("%s/%d", StructArrayFieldMetaPrefix, collectionID)
+}
+
+func BuildStructArrayFieldKey(collectionId typeutil.UniqueID, fieldId int64) string {
+	return fmt.Sprintf("%s/%d", BuildStructArrayFieldPrefix(collectionId), fieldId)
 }
 
 func BuildAliasKey210(alias string) string {
@@ -203,6 +212,17 @@ func (kc *Catalog) CreateCollection(ctx context.Context, coll *model.Collection,
 		k := BuildFieldKey(coll.CollectionID, field.FieldID)
 		fieldInfo := model.MarshalFieldModel(field)
 		v, err := proto.Marshal(fieldInfo)
+		if err != nil {
+			return err
+		}
+		kvs[k] = string(v)
+	}
+
+	// save struct array fields to new path
+	for _, structArrayField := range coll.StructArrayFields {
+		k := BuildStructArrayFieldKey(coll.CollectionID, structArrayField.FieldID)
+		structArrayFieldInfo := model.MarshalStructArrayFieldModel(structArrayField)
+		v, err := proto.Marshal(structArrayFieldInfo)
 		if err != nil {
 			return err
 		}
@@ -389,7 +409,7 @@ func (kc *Catalog) batchListPartitionsAfter210(ctx context.Context, ts typeutil.
 }
 
 func fieldVersionAfter210(collMeta *pb.CollectionInfo) bool {
-	return len(collMeta.GetSchema().GetFields()) <= 0
+	return len(collMeta.GetSchema().GetFields()) <= 0 && len(collMeta.GetSchema().GetStructArrayFields()) <= 0
 }
 
 func (kc *Catalog) listFieldsAfter210(ctx context.Context, collectionID typeutil.UniqueID, ts typeutil.Timestamp) ([]*model.Field, error) {
@@ -434,6 +454,24 @@ func (kc *Catalog) batchListFieldsAfter210(ctx context.Context, ts typeutil.Time
 		ret[collectionID] = append(ret[collectionID], model.UnmarshalFieldModel(fieldMeta))
 	}
 	return ret, nil
+}
+
+func (kc *Catalog) listStructArrayFieldsAfter210(ctx context.Context, collectionID typeutil.UniqueID, ts typeutil.Timestamp) ([]*model.StructArrayField, error) {
+	prefix := BuildStructArrayFieldPrefix(collectionID)
+	_, values, err := kc.Snapshot.LoadWithPrefix(ctx, prefix, ts)
+	if err != nil {
+		return nil, err
+	}
+	structFields := make([]*model.StructArrayField, 0, len(values))
+	for _, v := range values {
+		partitionMeta := &schemapb.StructArrayFieldSchema{}
+		err := proto.Unmarshal([]byte(v), partitionMeta)
+		if err != nil {
+			return nil, err
+		}
+		structFields = append(structFields, model.UnmarshalStructArrayFieldModel(partitionMeta))
+	}
+	return structFields, nil
 }
 
 func (kc *Catalog) listFunctions(ctx context.Context, collectionID typeutil.UniqueID, ts typeutil.Timestamp) ([]*model.Function, error) {
@@ -498,6 +536,12 @@ func (kc *Catalog) appendPartitionAndFieldsInfo(ctx context.Context, collMeta *p
 		return nil, err
 	}
 	collection.Fields = fields
+
+	structArrayFields, err := kc.listStructArrayFieldsAfter210(ctx, collection.CollectionID, ts)
+	if err != nil {
+		return nil, err
+	}
+	collection.StructArrayFields = structArrayFields
 
 	functions, err := kc.listFunctions(ctx, collection.CollectionID, ts)
 	if err != nil {
@@ -610,6 +654,9 @@ func (kc *Catalog) DropCollection(ctx context.Context, collectionInfo *model.Col
 	for _, field := range collectionInfo.Fields {
 		delMetakeysSnap = append(delMetakeysSnap, BuildFieldKey(collectionInfo.CollectionID, field.FieldID))
 	}
+	for _, structArrayField := range collectionInfo.StructArrayFields {
+		delMetakeysSnap = append(delMetakeysSnap, BuildStructArrayFieldKey(collectionInfo.CollectionID, structArrayField.FieldID))
+	}
 	for _, function := range collectionInfo.Functions {
 		delMetakeysSnap = append(delMetakeysSnap, BuildFunctionKey(collectionInfo.CollectionID, function.ID))
 	}
@@ -629,9 +676,12 @@ func (kc *Catalog) DropCollection(ctx context.Context, collectionInfo *model.Col
 	return kc.Snapshot.MultiSaveAndRemove(ctx, nil, collectionKeys, ts)
 }
 
-func (kc *Catalog) alterModifyCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts typeutil.Timestamp) error {
+func (kc *Catalog) alterModifyCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts typeutil.Timestamp, fieldModify bool) error {
 	if oldColl.TenantID != newColl.TenantID || oldColl.CollectionID != newColl.CollectionID {
-		return fmt.Errorf("altering tenant id or collection id is forbidden")
+		return errors.New("altering tenant id or collection id is forbidden")
+	}
+	if oldColl.DBID != newColl.DBID {
+		return errors.New("altering dbID should use `AlterCollectionDB` interface")
 	}
 	oldCollClone := oldColl.Clone()
 	oldCollClone.DBID = newColl.DBID
@@ -646,30 +696,73 @@ func (kc *Catalog) alterModifyCollection(ctx context.Context, oldColl *model.Col
 	oldCollClone.ConsistencyLevel = newColl.ConsistencyLevel
 	oldCollClone.State = newColl.State
 	oldCollClone.Properties = newColl.Properties
+	oldCollClone.Fields = newColl.Fields
+	oldCollClone.StructArrayFields = newColl.StructArrayFields
+	oldCollClone.UpdateTimestamp = newColl.UpdateTimestamp
 
-	oldKey := BuildCollectionKey(oldColl.DBID, oldColl.CollectionID)
 	newKey := BuildCollectionKey(newColl.DBID, oldColl.CollectionID)
 	value, err := proto.Marshal(model.MarshalCollectionModel(oldCollClone))
 	if err != nil {
 		return err
 	}
 	saves := map[string]string{newKey: string(value)}
-	if oldKey == newKey {
-		return kc.Snapshot.Save(ctx, newKey, string(value), ts)
+	// no default aliases will be created.
+	// save fields info to new path.
+	if fieldModify {
+		for _, field := range newColl.Fields {
+			k := BuildFieldKey(newColl.CollectionID, field.FieldID)
+			fieldInfo := model.MarshalFieldModel(field)
+			v, err := proto.Marshal(fieldInfo)
+			if err != nil {
+				return err
+			}
+			saves[k] = string(v)
+		}
+
+		for _, structArrayField := range newColl.StructArrayFields {
+			k := BuildStructArrayFieldKey(newColl.CollectionID, structArrayField.FieldID)
+			structArrayFieldInfo := model.MarshalStructArrayFieldModel(structArrayField)
+			v, err := proto.Marshal(structArrayFieldInfo)
+			if err != nil {
+				return err
+			}
+			saves[k] = string(v)
+		}
 	}
-	return kc.Snapshot.MultiSaveAndRemove(ctx, saves, []string{oldKey}, ts)
+
+	return etcd.SaveByBatchWithLimit(saves, util.MaxEtcdTxnNum/2, func(partialKvs map[string]string) error {
+		return kc.Snapshot.MultiSave(ctx, partialKvs, ts)
+	})
 }
 
-func (kc *Catalog) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, alterType metastore.AlterType, ts typeutil.Timestamp) error {
-	if alterType == metastore.MODIFY {
-		return kc.alterModifyCollection(ctx, oldColl, newColl, ts)
+func (kc *Catalog) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, alterType metastore.AlterType, ts typeutil.Timestamp, fieldModify bool) error {
+	switch alterType {
+	case metastore.MODIFY:
+		return kc.alterModifyCollection(ctx, oldColl, newColl, ts, fieldModify)
+	default:
+		return fmt.Errorf("altering collection doesn't support %s", alterType.String())
 	}
-	return fmt.Errorf("altering collection doesn't support %s", alterType.String())
+}
+
+func (kc *Catalog) AlterCollectionDB(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts typeutil.Timestamp) error {
+	if oldColl.TenantID != newColl.TenantID || oldColl.CollectionID != newColl.CollectionID {
+		return errors.New("altering tenant id or collection id is forbidden")
+	}
+	oldKey := BuildCollectionKey(oldColl.DBID, oldColl.CollectionID)
+	newKey := BuildCollectionKey(newColl.DBID, newColl.CollectionID)
+
+	value, err := proto.Marshal(model.MarshalCollectionModel(newColl))
+	if err != nil {
+		return err
+	}
+	saves := map[string]string{newKey: string(value)}
+
+	return kc.Snapshot.MultiSaveAndRemove(ctx, saves, []string{oldKey}, ts)
 }
 
 func (kc *Catalog) alterModifyPartition(ctx context.Context, oldPart *model.Partition, newPart *model.Partition, ts typeutil.Timestamp) error {
 	if oldPart.CollectionID != newPart.CollectionID || oldPart.PartitionID != newPart.PartitionID {
-		return fmt.Errorf("altering collection id or partition id is forbidden")
+		return errors.New("altering collection id or partition id is forbidden")
 	}
 	oldPartClone := oldPart.Clone()
 	newPartClone := newPart.Clone()
@@ -845,7 +938,7 @@ func (kc *Catalog) fixDefaultDBIDConsistency(ctx context.Context, collMeta *pb.C
 		coll := model.UnmarshalCollectionModel(collMeta)
 		cloned := coll.Clone()
 		cloned.DBID = util.DefaultDBID
-		kc.alterModifyCollection(ctx, coll, cloned, ts)
+		kc.AlterCollectionDB(ctx, coll, cloned, ts)
 
 		collMeta.DbId = util.DefaultDBID
 	}
@@ -1088,7 +1181,7 @@ func (kc *Catalog) ListRole(ctx context.Context, tenant string, entity *milvuspb
 		}
 	} else {
 		if funcutil.IsEmptyString(entity.Name) {
-			return results, fmt.Errorf("role name in the role entity is empty")
+			return results, errors.New("role name in the role entity is empty")
 		}
 		roleKey := funcutil.HandleTenantForEtcdKey(RolePrefix, tenant, entity.Name)
 		_, err := kc.Txn.Load(ctx, roleKey)
@@ -1163,7 +1256,7 @@ func (kc *Catalog) ListUser(ctx context.Context, tenant string, entity *milvuspb
 		}
 	} else {
 		if funcutil.IsEmptyString(entity.Name) {
-			return results, fmt.Errorf("username in the user entity is empty")
+			return results, errors.New("username in the user entity is empty")
 		}
 		_, err = kc.GetCredential(ctx, entity.Name)
 		if err != nil {

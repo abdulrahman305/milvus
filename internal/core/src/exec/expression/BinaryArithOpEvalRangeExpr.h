@@ -31,6 +31,16 @@ namespace exec {
 
 namespace {
 
+template <typename T, typename U>
+decltype(auto)
+safe_mod(T a, U b) {
+    if constexpr (std::is_floating_point_v<T> || std::is_floating_point_v<U>) {
+        return std::fmod(a, b);
+    } else {
+        return a % b;
+    }
+}
+
 template <proto::plan::OpType cmp_op>
 struct CmpOpHelper {
     using op = void;
@@ -126,7 +136,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) == val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -148,7 +158,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) != val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -171,7 +181,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) > val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -194,7 +204,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) >= val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -216,7 +226,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) < val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -238,7 +248,7 @@ struct ArithOpElementFunc {
                         res[i] =
                             (long(src[offset]) % long(right_operand)) <= val;
                     } else {
-                        PanicInfo(OpTypeInvalid,
+                        ThrowInfo(OpTypeInvalid,
                                   fmt::format("unsupported arith type:{} for "
                                               "ArithOpElementFunc",
                                               arith_op));
@@ -259,14 +269,14 @@ struct ArithOpElementFunc {
                 res.inplace_arith_compare<T, arith_op_cvt, cmp_op_cvt>(
                     src, right_operand, val, size);
             } else {
-                PanicInfo(
+                ThrowInfo(
                     OpTypeInvalid,
                     fmt::format(
                         "unsupported arith type:{} for ArithOpElementFunc",
                         arith_op));
             }
         } else {
-            PanicInfo(
+            ThrowInfo(
                 OpTypeInvalid,
                 fmt::format("unsupported cmp type:{} for ArithOpElementFunc",
                             cmp_op));
@@ -318,7 +328,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) == val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -340,7 +350,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) != val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -362,7 +372,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) > val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -384,7 +394,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) >= val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -406,7 +416,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) < val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -428,7 +438,7 @@ struct ArithOpIndexFunc {
                                      proto::plan::ArithOpType::Mod) {
                     res[i] = (long(raw.value()) % long(right_operand)) <= val;
                 } else {
-                    PanicInfo(
+                    ThrowInfo(
                         OpTypeInvalid,
                         fmt::format(
                             "unsupported arith type:{} for ArithOpElementFunc",
@@ -449,7 +459,8 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
@@ -457,12 +468,28 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
                       expr->column_.nested_path_,
                       DataType::NONE,
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
+
+    std::string
+    ToString() const override {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
 
  private:
     template <typename T>
@@ -484,6 +511,17 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
     template <typename ValueType>
     VectorPtr
     ExecRangeVisitorImplForArray(OffsetVector* input = nullptr);
+
+    template <typename T>
+    bool
+    CanUseIndex() {
+        if (is_index_mode_ && IndexHasRawData<T>()) {
+            use_index_ = true;
+            return true;
+        }
+        use_index_ = false;
+        return false;
+    }
 
  private:
     std::shared_ptr<const milvus::expr::BinaryArithOpEvalRangeExpr> expr_;

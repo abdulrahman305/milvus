@@ -212,6 +212,7 @@ var (
 			Name:      "entity_num",
 			Help:      "number of entities, clustered by collection and their status(loaded/total)",
 		}, []string{
+			databaseLabelName,
 			collectionName,
 			statusLabelName,
 		})
@@ -223,6 +224,7 @@ var (
 			Name:      "indexed_entity_num",
 			Help:      "indexed number of entities, clustered by collection, index name and whether it's a vector index",
 		}, []string{
+			databaseLabelName,
 			collectionName,
 			indexName,
 			isVectorIndex,
@@ -246,7 +248,7 @@ var (
 )
 
 // RegisterRootCoord registers RootCoord metrics
-func RegisterRootCoord(registry *prometheus.Registry) {
+func RegisterMixCoord(registry *prometheus.Registry) {
 	registry.Register(RootCoordProxyCounter)
 
 	// for time tick
@@ -286,6 +288,8 @@ func RegisterRootCoord(registry *prometheus.Registry) {
 	registry.MustRegister(DiskQuota)
 
 	RegisterStreamingServiceClient(registry)
+	RegisterQueryCoord(registry)
+	RegisterDataCoord(registry)
 }
 
 func CleanupRootCoordDBMetrics(dbName string) {

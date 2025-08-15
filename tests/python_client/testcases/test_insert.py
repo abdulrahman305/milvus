@@ -527,7 +527,7 @@ class TestInsertOperation(TestcaseBase):
         expected: error raised
         """
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix))
-        nb = 1
+        nb = 10
         data = []
         fields = collection_w.schema.fields
         for field in fields:
@@ -747,12 +747,9 @@ class TestInsertOperation(TestcaseBase):
         c_name = cf.gen_unique_str(prefix)
         schema = cf.gen_default_collection_schema(primary_field=pk_field, auto_id=True)
         collection_w = self.init_collection_wrap(name=c_name, schema=schema)
-        data = []
         nb = 100
-        for field in collection_w.schema.fields:
-            field_data = cf.gen_data_by_collection_field(field, nb=nb)
-            if field.name != pk_field:
-                data.append(field_data)
+        data = cf.gen_column_data_by_schema(nb=nb, schema=collection_w.schema)
+
         collection_w.insert(data=data)
         assert collection_w.num_entities == nb
 
@@ -1246,7 +1243,7 @@ class TestInsertInvalid(TestcaseBase):
                                                     primary_field=primary_field, is_index=False,
                                                     is_all_data_type=True, with_json=True)[0]
         nb = 100
-        data = cf.gen_data_by_collection_schema(collection_w.schema, nb=nb)
+        data = cf.gen_column_data_by_schema(schema=collection_w.schema, nb=nb)
         for dirty_i in [0, nb // 2, nb - 1]:      # check the dirty data at first, middle and last
             log.debug(f"dirty_i: {dirty_i}")
             for i in range(len(data)):
@@ -1428,8 +1425,8 @@ class TestInsertInvalid(TestcaseBase):
         collection_w.insert(data=data, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("index ", ct.all_index_types[9:11])
-    @pytest.mark.parametrize("invalid_vector_type ", ["FLOAT_VECTOR", "FLOAT16_VECTOR", "BFLOAT16_VECTOR"])
+    @pytest.mark.parametrize("index ", ct.all_index_types[10:12])
+    @pytest.mark.parametrize("invalid_vector_type ", ct.all_dense_vector_types)
     def test_invalid_sparse_vector_data(self, index, invalid_vector_type):
         """
         target: insert illegal data type
@@ -2154,7 +2151,7 @@ class TestUpsertValid(TestcaseBase):
         assert len(res) == 0
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("index ", ct.all_index_types[9:11])
+    @pytest.mark.parametrize("index ", ct.all_index_types[10:12])
     def test_upsert_sparse_data(self, index):
         """
         target: multiple upserts and counts(*)
@@ -2173,9 +2170,10 @@ class TestUpsertValid(TestcaseBase):
         collection_w.load()
         for i in range(5):
             collection_w.upsert(data=data)
-            collection_w.query(expr=f'{ct.default_int64_field_name} >= 0', output_fields=[ct.default_count_output]
-                                        , check_task=CheckTasks.check_query_results,
-                                         check_items={"exp_res": [{"count(*)": ct.default_nb}]})
+            collection_w.query(expr=f'{ct.default_int64_field_name} >= 0',
+                               output_fields=[ct.default_count_output],
+                               check_task=CheckTasks.check_query_results,
+                               check_items={"exp_res": [{"count(*)": ct.default_nb}]})
 
 
 class TestUpsertInvalid(TestcaseBase):
@@ -2193,7 +2191,7 @@ class TestUpsertInvalid(TestcaseBase):
                                                     primary_field=primary_field, is_index=False,
                                                     is_all_data_type=True, with_json=True)[0]
         nb = 100
-        data = cf.gen_data_by_collection_schema(collection_w.schema, nb=nb)
+        data = cf.gen_column_data_by_schema(schema=collection_w.schema, nb=nb)
         for dirty_i in [0, nb // 2, nb - 1]:  # check the dirty data at first, middle and last
             log.debug(f"dirty_i: {dirty_i}")
             for i in range(len(data)):

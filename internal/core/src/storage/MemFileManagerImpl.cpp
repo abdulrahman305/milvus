@@ -20,9 +20,11 @@
 
 #include "common/Common.h"
 #include "common/FieldData.h"
+#include "common/Types.h"
 #include "log/Log.h"
 #include "storage/Util.h"
 #include "storage/FileManager.h"
+#include "index/Utils.h"
 
 namespace milvus::storage {
 
@@ -31,6 +33,7 @@ MemFileManagerImpl::MemFileManagerImpl(
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
                       fileManagerContext.indexMeta) {
     rcm_ = fileManagerContext.chunkManagerPtr;
+    fs_ = fileManagerContext.fs;
 }
 
 bool
@@ -96,21 +99,22 @@ MemFileManagerImpl::LoadFile(const std::string& filename) noexcept {
     return true;
 }
 
-std::map<std::string, FieldDataPtr>
+std::map<std::string, std::unique_ptr<DataCodec>>
 MemFileManagerImpl::LoadIndexToMemory(
-    const std::vector<std::string>& remote_files) {
-    std::map<std::string, FieldDataPtr> file_to_index_data;
+    const std::vector<std::string>& remote_files,
+    milvus::proto::common::LoadPriority priority) {
+    std::map<std::string, std::unique_ptr<DataCodec>> file_to_index_data;
     auto parallel_degree =
         static_cast<uint64_t>(DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE);
     std::vector<std::string> batch_files;
 
     auto LoadBatchIndexFiles = [&]() {
-        auto index_datas = GetObjectData(rcm_.get(), batch_files);
+        auto index_datas = GetObjectData(
+            rcm_.get(), batch_files, milvus::PriorityForLoad(priority));
         for (size_t idx = 0; idx < batch_files.size(); ++idx) {
             auto file_name =
                 batch_files[idx].substr(batch_files[idx].find_last_of('/') + 1);
-            file_to_index_data[file_name] =
-                index_datas[idx].get()->GetFieldData();
+            file_to_index_data[file_name] = index_datas[idx].get();
         }
     };
 
@@ -132,8 +136,23 @@ MemFileManagerImpl::LoadIndexToMemory(
 }
 
 std::vector<FieldDataPtr>
-MemFileManagerImpl::CacheRawDataToMemory(
-    std::vector<std::string> remote_files) {
+MemFileManagerImpl::CacheRawDataToMemory(const Config& config) {
+    auto storage_version =
+        index::GetValueFromConfig<int64_t>(config, STORAGE_VERSION_KEY)
+            .value_or(0);
+    if (storage_version == STORAGE_V2) {
+        return cache_raw_data_to_memory_storage_v2(config);
+    }
+    return cache_raw_data_to_memory_internal(config);
+}
+
+std::vector<FieldDataPtr>
+MemFileManagerImpl::cache_raw_data_to_memory_internal(const Config& config) {
+    auto insert_files = index::GetValueFromConfig<std::vector<std::string>>(
+        config, INSERT_FILES_KEY);
+    AssertInfo(insert_files.has_value(),
+               "insert file paths is empty when build index");
+    auto remote_files = insert_files.value();
     SortByPath(remote_files);
 
     auto parallel_degree =
@@ -161,6 +180,28 @@ MemFileManagerImpl::CacheRawDataToMemory(
 
     AssertInfo(field_datas.size() == remote_files.size(),
                "inconsistent file num and raw data num!");
+    return field_datas;
+}
+
+std::vector<FieldDataPtr>
+MemFileManagerImpl::cache_raw_data_to_memory_storage_v2(const Config& config) {
+    auto data_type = index::GetValueFromConfig<DataType>(config, DATA_TYPE_KEY);
+    AssertInfo(data_type.has_value(),
+               "[StorageV2] data type is empty when build index");
+    auto dim = index::GetValueFromConfig<int64_t>(config, DIM_KEY).value_or(0);
+    auto segment_insert_files =
+        index::GetValueFromConfig<std::vector<std::vector<std::string>>>(
+            config, SEGMENT_INSERT_FILES_KEY);
+    AssertInfo(segment_insert_files.has_value(),
+               "[StorageV2] insert file paths for storage v2 is empty when "
+               "build index");
+    auto remote_files = segment_insert_files.value();
+    for (auto& files : remote_files) {
+        SortByPath(files);
+    }
+    auto field_datas = GetFieldDatasFromStorageV2(
+        remote_files, field_meta_.field_id, data_type.value(), dim, fs_);
+    // field data list could differ for storage v2 group list
     return field_datas;
 }
 
@@ -221,17 +262,34 @@ GetOptFieldIvfData(const DataType& dt,
 }
 
 std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
-MemFileManagerImpl::CacheOptFieldToMemory(OptFieldT& fields_map) {
-    const uint32_t num_of_fields = fields_map.size();
+MemFileManagerImpl::CacheOptFieldToMemory(const Config& config) {
+    auto storage_version =
+        index::GetValueFromConfig<int64_t>(config, STORAGE_VERSION_KEY)
+            .value_or(0);
+    if (storage_version == STORAGE_V2) {
+        return cache_opt_field_memory_v2(config);
+    }
+    return cache_opt_field_memory(config);
+}
+
+std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+MemFileManagerImpl::cache_opt_field_memory(const Config& config) {
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> res;
+    auto opt_fields =
+        index::GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
+    if (!opt_fields.has_value()) {
+        return res;
+    }
+    auto fields_map = opt_fields.value();
+    auto num_of_fields = fields_map.size();
     if (0 == num_of_fields) {
         return {};
     } else if (num_of_fields > 1) {
-        PanicInfo(
+        ThrowInfo(
             ErrorCode::NotImplemented,
             "vector index build with multiple fields is not supported yet");
     }
 
-    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> res;
     for (auto& [field_id, tup] : fields_map) {
         const auto& field_type = std::get<1>(tup);
         auto& field_paths = std::get<2>(tup);
@@ -243,6 +301,45 @@ MemFileManagerImpl::CacheOptFieldToMemory(OptFieldT& fields_map) {
         SortByPath(field_paths);
         std::vector<FieldDataPtr> field_datas =
             FetchFieldData(rcm_.get(), field_paths);
+        res[field_id] = GetOptFieldIvfData(field_type, field_datas);
+    }
+    return res;
+}
+
+std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+MemFileManagerImpl::cache_opt_field_memory_v2(const Config& config) {
+    auto opt_fields =
+        index::GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
+    if (!opt_fields.has_value()) {
+        return {};
+    }
+    auto fields_map = opt_fields.value();
+    auto num_of_fields = fields_map.size();
+    if (0 == num_of_fields) {
+        return {};
+    } else if (num_of_fields > 1) {
+        ThrowInfo(
+            ErrorCode::NotImplemented,
+            "vector index build with multiple fields is not supported yet");
+    }
+
+    auto segment_insert_files =
+        index::GetValueFromConfig<std::vector<std::vector<std::string>>>(
+            config, SEGMENT_INSERT_FILES_KEY);
+    AssertInfo(segment_insert_files.has_value(),
+               "insert file paths for storage v2 is empty when build index");
+    auto remote_files = segment_insert_files.value();
+    for (auto& files : remote_files) {
+        SortByPath(files);
+    }
+
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> res;
+    for (auto& [field_id, tup] : fields_map) {
+        const auto& field_type = std::get<1>(tup);
+
+        auto field_datas = GetFieldDatasFromStorageV2(
+            remote_files, field_id, field_type, 1, fs_);
+
         res[field_id] = GetOptFieldIvfData(field_type, field_datas);
     }
     return res;
