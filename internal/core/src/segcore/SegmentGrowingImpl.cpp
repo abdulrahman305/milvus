@@ -782,7 +782,7 @@ SegmentGrowingImpl::bulk_subscript(FieldId field_id,
                 count,
                 result->mutable_vectors()->mutable_bfloat16_vector()->data());
         } else if (field_meta.get_data_type() ==
-                   DataType::VECTOR_SPARSE_FLOAT) {
+                   DataType::VECTOR_SPARSE_U32_F32) {
             bulk_subscript_sparse_float_vector_impl(
                 field_id,
                 (const ConcurrentVector<SparseFloatVector>*)vec_ptr,
@@ -893,6 +893,16 @@ SegmentGrowingImpl::bulk_subscript(FieldId field_id,
                                             ->mutable_double_data()
                                             ->mutable_data()
                                             ->mutable_data());
+            break;
+        }
+        case DataType::TIMESTAMPTZ: {
+            bulk_subscript_impl<int64_t>(vec_ptr,
+                                         seg_offsets,
+                                         count,
+                                         result->mutable_scalars()
+                                             ->mutable_timestamptz_data()
+                                             ->mutable_data()
+                                             ->mutable_data());
             break;
         }
         case DataType::VARCHAR:

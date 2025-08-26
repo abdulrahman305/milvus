@@ -813,7 +813,7 @@ ChunkedSegmentSealedImpl::get_vector(FieldId field_id,
     if (has_raw_data) {
         // If index has raw data, get vector from memory.
         auto ids_ds = GenIdsDataset(count, ids);
-        if (field_meta.get_data_type() == DataType::VECTOR_SPARSE_FLOAT) {
+        if (field_meta.get_data_type() == DataType::VECTOR_SPARSE_U32_F32) {
             auto res = vec_index->GetSparseVector(ids_ds);
             return segcore::CreateVectorDataArrayFrom(
                 res.get(), count, field_meta);
@@ -1705,6 +1705,16 @@ ChunkedSegmentSealedImpl::get_raw_data(FieldId field_id,
                                                     ->mutable_data());
             break;
         }
+        case DataType::TIMESTAMPTZ: {
+            bulk_subscript_impl<int64_t>(column.get(),
+                                         seg_offsets,
+                                         count,
+                                         ret->mutable_scalars()
+                                             ->mutable_timestamptz_data()
+                                             ->mutable_data()
+                                             ->mutable_data());
+            break;
+        }
         case DataType::VECTOR_FLOAT: {
             bulk_subscript_impl(field_meta.get_sizeof(),
                                 column.get(),
@@ -1752,7 +1762,7 @@ ChunkedSegmentSealedImpl::get_raw_data(FieldId field_id,
                 ret->mutable_vectors()->mutable_int8_vector()->data());
             break;
         }
-        case DataType::VECTOR_SPARSE_FLOAT: {
+        case DataType::VECTOR_SPARSE_U32_F32: {
             auto dst = ret->mutable_vectors()->mutable_sparse_float_vector();
             int64_t max_dim = 0;
             column->BulkValueAt(
@@ -1761,7 +1771,7 @@ ChunkedSegmentSealedImpl::get_raw_data(FieldId field_id,
                     auto row =
                         offset != INVALID_SEG_OFFSET
                             ? static_cast<
-                                  const knowhere::sparse::SparseRow<float>*>(
+                                  const knowhere::sparse::SparseRow<sparseValueType>*>(
                                   static_cast<const void*>(value))
                             : nullptr;
                     if (row == nullptr) {
@@ -2108,7 +2118,7 @@ ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
     auto& index_params = field_index_meta.GetIndexParams();
 
     bool is_sparse =
-        field_meta.get_data_type() == DataType::VECTOR_SPARSE_FLOAT;
+        field_meta.get_data_type() == DataType::VECTOR_SPARSE_U32_F32;
 
     bool enable_growing_mmap = storage::MmapManager::GetInstance()
                                    .GetMmapConfig()
