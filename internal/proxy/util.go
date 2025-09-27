@@ -27,6 +27,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/metadata"
@@ -42,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	typeutil2 "github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -590,6 +592,10 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	if field.ElementType == schemapb.DataType_ArrayOfStruct || field.ElementType == schemapb.DataType_ArrayOfVector ||
 		field.ElementType == schemapb.DataType_Array {
 		return fmt.Errorf("Nested array is not supported %s", field.Name)
+	}
+
+	if field.ElementType == schemapb.DataType_JSON {
+		return fmt.Errorf("JSON is not supported for fields in struct, fieldName = %s", field.Name)
 	}
 
 	if field.DataType == schemapb.DataType_Array {
@@ -1182,14 +1188,14 @@ func fillFieldPropertiesBySchema(columns []*schemapb.FieldData, schema *schemapb
 			// Set the ElementType because it may not be set in the insert request.
 			if fieldData.Type == schemapb.DataType_Array {
 				fd, ok := fieldData.Field.(*schemapb.FieldData_Scalars)
-				if !ok {
+				if !ok || fd.Scalars.GetArrayData() == nil {
 					return fmt.Errorf("field convert FieldData_Scalars fail in fieldData, fieldName: %s,"+
 						" collectionName:%s", fieldData.FieldName, schema.Name)
 				}
 				fd.Scalars.GetArrayData().ElementType = fieldSchema.ElementType
 			} else if fieldData.Type == schemapb.DataType_ArrayOfVector {
 				fd, ok := fieldData.Field.(*schemapb.FieldData_Vectors)
-				if !ok {
+				if !ok || fd.Vectors.GetVectorArray() == nil {
 					return fmt.Errorf("field convert FieldData_Vectors fail in fieldData, fieldName: %s,"+
 						" collectionName:%s", fieldData.FieldName, schema.Name)
 				}
@@ -1283,6 +1289,10 @@ func getMaxMvccTsFromChannels(channelsTs map[string]uint64, beginTs typeutil.Tim
 }
 
 func validateName(entity string, nameType string) error {
+	return validateNameWithCustomChars(entity, nameType, Params.ProxyCfg.NameValidationAllowedChars.GetValue())
+}
+
+func validateNameWithCustomChars(entity string, nameType string, allowedChars string) error {
 	entity = strings.TrimSpace(entity)
 
 	if entity == "" {
@@ -1305,15 +1315,15 @@ func validateName(entity string, nameType string) error {
 
 	for i := 1; i < len(entity); i++ {
 		c := entity[i]
-		if c != '_' && c != '$' && !isAlpha(c) && !isNumber(c) {
-			return merr.WrapErrParameterInvalidMsg("%s can only contain numbers, letters, dollars and underscores, found %c at %d", nameType, c, i)
+		if c != '_' && !isAlpha(c) && !isNumber(c) && !strings.ContainsRune(allowedChars, rune(c)) {
+			return merr.WrapErrParameterInvalidMsg("%s can only contain numbers, letters, underscores, and allowed characters (%s), found %c at %d", nameType, allowedChars, c, i)
 		}
 	}
 	return nil
 }
 
 func ValidateRoleName(entity string) error {
-	return validateName(entity, "role name")
+	return validateNameWithCustomChars(entity, "role name", Params.ProxyCfg.RoleNameValidationAllowedChars.GetValue())
 }
 
 func IsDefaultRole(roleName string) bool {
@@ -1740,6 +1750,10 @@ func checkFieldsDataBySchema(allFields []*schemapb.FieldSchema, schema *schemapb
 		dataNameSet.Insert(fieldName)
 	}
 
+	allowInsertAutoID, _ := common.IsAllowInsertAutoID(schema.GetProperties()...)
+	hasPkData := false
+	needAutoGenPk := false
+
 	for _, fieldSchema := range allFields {
 		if fieldSchema.AutoID && !fieldSchema.IsPrimaryKey {
 			log.Warn("not primary key field, but set autoID true", zap.String("field", fieldSchema.GetName()))
@@ -1748,16 +1762,18 @@ func checkFieldsDataBySchema(allFields []*schemapb.FieldSchema, schema *schemapb
 
 		if fieldSchema.IsPrimaryKey {
 			primaryKeyNum++
+			hasPkData = dataNameSet.Contain(fieldSchema.GetName())
+			needAutoGenPk = fieldSchema.AutoID && (!allowInsertAutoID || !hasPkData)
 		}
 		if fieldSchema.GetDefaultValue() != nil && fieldSchema.IsPrimaryKey {
 			return merr.WrapErrParameterInvalidMsg("primary key can't be with default value")
 		}
-		if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && inInsert) || IsBM25FunctionOutputField(fieldSchema, schema) {
+		if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || IsBM25FunctionOutputField(fieldSchema, schema) {
 			// when inInsert, no need to pass when pk is autoid and SkipAutoIDCheck is false
 			autoGenFieldNum++
 		}
 		if _, ok := dataNameSet[fieldSchema.GetName()]; !ok {
-			if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && inInsert) || IsBM25FunctionOutputField(fieldSchema, schema) {
+			if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || IsBM25FunctionOutputField(fieldSchema, schema) {
 				// autoGenField
 				continue
 			}
@@ -1900,9 +1916,9 @@ func checkPrimaryFieldData(allFields []*schemapb.FieldSchema, schema *schemapb.C
 	var primaryFieldData *schemapb.FieldData
 	// when checkPrimaryFieldData in insert
 
-	skipAutoIDCheck := Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() &&
-		primaryFieldSchema.AutoID &&
-		typeutil.IsPrimaryFieldDataExist(insertMsg.GetFieldsData(), primaryFieldSchema)
+	allowInsertAutoID, _ := common.IsAllowInsertAutoID(schema.GetProperties()...)
+	skipAutoIDCheck := primaryFieldSchema.AutoID &&
+		typeutil.IsPrimaryFieldDataExist(insertMsg.GetFieldsData(), primaryFieldSchema) && (Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() || allowInsertAutoID)
 
 	if !primaryFieldSchema.AutoID || skipAutoIDCheck {
 		primaryFieldData, err = typeutil.GetPrimaryFieldData(insertMsg.GetFieldsData(), primaryFieldSchema)
@@ -1913,7 +1929,7 @@ func checkPrimaryFieldData(allFields []*schemapb.FieldSchema, schema *schemapb.C
 	} else {
 		// check primary key data not exist
 		if typeutil.IsPrimaryFieldDataExist(insertMsg.GetFieldsData(), primaryFieldSchema) {
-			return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("can not assign primary field data when auto id enabled %v", primaryFieldSchema.Name))
+			return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("can not assign primary field data when auto id enabled and allow_insert_auto_id is false %v", primaryFieldSchema.Name))
 		}
 		// if autoID == true, currently support autoID for int64 and varchar PrimaryField
 		primaryFieldData, err = autoGenPrimaryFieldData(primaryFieldSchema, insertMsg.GetRowIDs())
@@ -2324,6 +2340,59 @@ func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstre
 	return nil
 }
 
+func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+	namespaceEnabeld, _, err := common.ParseNamespaceProp(schema.Properties...)
+	if err != nil {
+		return err
+	}
+	namespaceIsSet := insertMsg.InsertRequest.Namespace != nil
+
+	if namespaceEnabeld != namespaceIsSet {
+		if namespaceIsSet {
+			return fmt.Errorf("namespace data is set but namespace disabled")
+		}
+		return fmt.Errorf("namespace data is not set but namespace enabled")
+	}
+	if !namespaceEnabeld {
+		return nil
+	}
+
+	// check namespace field exists
+	namespaceField := typeutil.GetFieldByName(schema, common.NamespaceFieldName)
+	if namespaceField == nil {
+		return fmt.Errorf("namespace field not found")
+	}
+
+	// check namespace field data is already set
+	for _, fieldData := range insertMsg.FieldsData {
+		if fieldData.FieldId == namespaceField.FieldID {
+			return fmt.Errorf("namespace field data is already set by users")
+		}
+	}
+
+	// set namespace field data
+	namespaceData := make([]string, insertMsg.NRows())
+	namespace := *insertMsg.InsertRequest.Namespace
+	for i := range namespaceData {
+		namespaceData[i] = namespace
+	}
+	insertMsg.FieldsData = append(insertMsg.FieldsData, &schemapb.FieldData{
+		FieldName: namespaceField.Name,
+		FieldId:   namespaceField.FieldID,
+		Type:      namespaceField.DataType,
+		Field: &schemapb.FieldData_Scalars{
+			Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_StringData{
+					StringData: &schemapb.StringArray{
+						Data: namespaceData,
+					},
+				},
+			},
+		},
+	})
+	return nil
+}
+
 func GetCachedCollectionSchema(ctx context.Context, dbName string, colName string) (*schemaInfo, error) {
 	if globalMetaCache != nil {
 		return globalMetaCache.GetCollectionSchema(ctx, dbName, colName)
@@ -2349,6 +2418,26 @@ func SetReportValue(status *commonpb.Status, value int) {
 		status.ExtraInfo = make(map[string]string)
 	}
 	status.ExtraInfo["report_value"] = strconv.Itoa(value)
+}
+
+func SetStorageCost(status *commonpb.Status, storageCost segcore.StorageCost) {
+	if storageCost.ScannedTotalBytes <= 0 {
+		return
+	}
+	if !merr.Ok(status) {
+		return
+	}
+	if status.ExtraInfo == nil {
+		status.ExtraInfo = make(map[string]string)
+		// set report_value to 0 for compatibility, when extra info is not nil, there are always the default report_value
+		// see https://github.com/milvus-io/pymilvus/pull/2999, pymilvus didn't check the report_value is set and use the value
+		status.ExtraInfo["report_value"] = strconv.Itoa(0)
+	}
+
+	status.ExtraInfo["scanned_remote_bytes"] = strconv.FormatInt(storageCost.ScannedRemoteBytes, 10)
+	status.ExtraInfo["scanned_total_bytes"] = strconv.FormatInt(storageCost.ScannedTotalBytes, 10)
+	cacheHitRatio := float64(storageCost.ScannedTotalBytes-storageCost.ScannedRemoteBytes) / float64(storageCost.ScannedTotalBytes)
+	status.ExtraInfo["cache_hit_ratio"] = strconv.FormatFloat(cacheHitRatio, 'f', -1, 64)
 }
 
 func GetCostValue(status *commonpb.Status) int {
@@ -2536,6 +2625,16 @@ func GetFunctionOutputFields(collSchema *schemapb.CollectionSchema) []string {
 	return fields
 }
 
+func GetBM25FunctionOutputFields(collSchema *schemapb.CollectionSchema) []string {
+	fields := make([]string, 0)
+	for _, fSchema := range collSchema.Functions {
+		if fSchema.Type == schemapb.FunctionType_BM25 {
+			fields = append(fields, fSchema.OutputFieldNames...)
+		}
+	}
+	return fields
+}
+
 func getCollectionTTL(pairs []*commonpb.KeyValuePair) uint64 {
 	properties := make(map[string]string)
 	for _, pair := range pairs {
@@ -2646,4 +2745,268 @@ func hasTimestamptzField(schema *schemapb.CollectionSchema) bool {
 		}
 	}
 	return false
+}
+
+func getDefaultTimezoneVal(props ...*commonpb.KeyValuePair) (bool, string) {
+	for _, p := range props {
+		// used in collection or database
+		if p.GetKey() == common.DatabaseDefaultTimezone || p.GetKey() == common.CollectionDefaultTimezone {
+			return true, p.Value
+		}
+	}
+	return false, ""
+}
+
+func checkTimezone(props ...*commonpb.KeyValuePair) error {
+	hasTImezone, timezoneStr := getDefaultTimezoneVal(props...)
+	if hasTImezone {
+		_, err := time.LoadLocation(timezoneStr)
+		if err != nil {
+			return merr.WrapErrParameterInvalidMsg("invalid timezone, should be a IANA timezone name: %s", err.Error())
+		}
+	}
+	return nil
+}
+
+func getColTimezone(colInfo *collectionInfo) (bool, string) {
+	return getDefaultTimezoneVal(colInfo.properties...)
+}
+
+func getDbTimezone(dbInfo *databaseInfo) (bool, string) {
+	return getDefaultTimezoneVal(dbInfo.properties...)
+}
+
+func timestamptzIsoStr2Utc(columns []*schemapb.FieldData, colTimezone string) error {
+	naiveLayouts := []string{
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	for _, fieldData := range columns {
+		if fieldData.GetType() != schemapb.DataType_Timestamptz {
+			continue
+		}
+
+		scalarField := fieldData.GetScalars()
+		if scalarField == nil || scalarField.GetStringData() == nil {
+			log.Warn("field data is not string data", zap.String("fieldName", fieldData.GetFieldName()))
+			return merr.WrapErrParameterInvalidMsg("field data is not string data")
+		}
+
+		stringData := scalarField.GetStringData().GetData()
+		utcTimestamps := make([]int64, len(stringData))
+
+		for i, isoStr := range stringData {
+			var t time.Time
+			var err error
+			// parse directly
+			t, err = time.Parse(time.RFC3339Nano, isoStr)
+			if err == nil {
+				utcTimestamps[i] = t.UnixMicro()
+				continue
+			}
+			// no timezone, try to find timezone in collecion -> database level
+			defaultTZ := "UTC"
+			if colTimezone != "" {
+				defaultTZ = colTimezone
+			}
+
+			location, err := time.LoadLocation(defaultTZ)
+			if err != nil {
+				log.Error("invalid timezone", zap.String("timezone", defaultTZ), zap.Error(err))
+				return merr.WrapErrParameterInvalidMsg("got invalid default timezone: %s", defaultTZ)
+			}
+			var parsed bool
+			for _, layout := range naiveLayouts {
+				t, err = time.ParseInLocation(layout, isoStr, location)
+				if err == nil {
+					parsed = true
+					break
+				}
+			}
+			if !parsed {
+				log.Warn("Can not parse timestamptz string", zap.String("timestamp_string", isoStr))
+				return merr.WrapErrParameterInvalidMsg("got invalid timestamptz string: %s", isoStr)
+			}
+			utcTimestamps[i] = t.UnixMicro()
+		}
+		// Replace data in place
+		fieldData.GetScalars().Data = &schemapb.ScalarField_TimestamptzData{
+			TimestamptzData: &schemapb.TimestamptzArray{
+				Data: utcTimestamps,
+			},
+		}
+	}
+	return nil
+}
+
+func timestamptzUTC2IsoStr(results []*schemapb.FieldData, userDefineTimezone string, colTimezone string) error {
+	// Determine the target timezone based on priority: collection -> database -> UTC.
+	defaultTZ := "UTC"
+	if userDefineTimezone != "" {
+		defaultTZ = userDefineTimezone
+	} else if colTimezone != "" {
+		defaultTZ = colTimezone
+	}
+
+	location, err := time.LoadLocation(defaultTZ)
+	if err != nil {
+		log.Error("invalid timezone", zap.String("timezone", defaultTZ), zap.Error(err))
+		return merr.WrapErrParameterInvalidMsg("got invalid default timezone: %s", defaultTZ)
+	}
+
+	for _, fieldData := range results {
+		if fieldData.GetType() != schemapb.DataType_Timestamptz {
+			continue
+		}
+		scalarField := fieldData.GetScalars()
+		if scalarField == nil || scalarField.GetTimestamptzData() == nil {
+			if longData := scalarField.GetLongData(); longData != nil && len(longData.GetData()) > 0 {
+				log.Warn("field data is not Timestamptz data", zap.String("fieldName", fieldData.GetFieldName()))
+				return merr.WrapErrParameterInvalidMsg("field data for '%s' is not Timestamptz data", fieldData.GetFieldName())
+			}
+		}
+
+		utcTimestamps := scalarField.GetTimestamptzData().GetData()
+		isoStrings := make([]string, len(utcTimestamps))
+
+		for i, ts := range utcTimestamps {
+			t := time.UnixMicro(ts).UTC()
+			localTime := t.In(location)
+			isoStrings[i] = localTime.Format(time.RFC3339Nano)
+		}
+
+		// Replace the TimestamptzData with the new StringData in place.
+		fieldData.GetScalars().Data = &schemapb.ScalarField_StringData{
+			StringData: &schemapb.StringArray{
+				Data: isoStrings,
+			},
+		}
+	}
+	return nil
+}
+
+// extractFields is a helper function to extract specific integer fields from a time.Time object.
+// Supported fields are: "year", "month", "day", "hour", "minute", "second", "microsecond", "nanosecond".
+func extractFields(t time.Time, fieldList []string) ([]int64, error) {
+	extractedValues := make([]int64, 0, len(fieldList))
+	for _, field := range fieldList {
+		var val int64
+		switch strings.ToLower(field) {
+		case common.TszYear:
+			val = int64(t.Year())
+		case common.TszMonth:
+			val = int64(t.Month())
+		case common.TszDay:
+			val = int64(t.Day())
+		case common.TszHour:
+			val = int64(t.Hour())
+		case common.TszMinute:
+			val = int64(t.Minute())
+		case common.TszSecond:
+			val = int64(t.Second())
+		case common.TszMicrosecond:
+			val = int64(t.Nanosecond() / 1000)
+		default:
+			return nil, merr.WrapErrParameterInvalidMsg("unsupported field for extraction: %s, fields should be seprated by ',' or ' '", field)
+		}
+		extractedValues = append(extractedValues, val)
+	}
+	return extractedValues, nil
+}
+
+func extractFieldsFromResults(results []*schemapb.FieldData, precedenceTimezone []string, fieldList []string) error {
+	var targetLocation *time.Location
+
+	for _, tz := range precedenceTimezone {
+		if tz != "" {
+			loc, err := time.LoadLocation(tz)
+			if err != nil {
+				log.Error("invalid timezone provided in precedence list", zap.String("timezone", tz), zap.Error(err))
+				return merr.WrapErrParameterInvalidMsg("got invalid timezone: %s", tz)
+			}
+			targetLocation = loc
+			break // Use the first valid timezone found.
+		}
+	}
+
+	if targetLocation == nil {
+		targetLocation = time.UTC
+	}
+
+	for _, fieldData := range results {
+		if fieldData.GetType() != schemapb.DataType_Timestamptz {
+			continue
+		}
+
+		scalarField := fieldData.GetScalars()
+		if scalarField == nil || scalarField.GetTimestamptzData() == nil {
+			if longData := scalarField.GetLongData(); longData != nil && len(longData.GetData()) > 0 {
+				log.Warn("field data is not Timestamptz data, but found LongData instead", zap.String("fieldName", fieldData.GetFieldName()))
+				return merr.WrapErrParameterInvalidMsg("field data for '%s' is not Timestamptz data", fieldData.GetFieldName())
+			}
+			continue
+		}
+
+		utcTimestamps := scalarField.GetTimestamptzData().GetData()
+		extractedResults := make([]*schemapb.ScalarField, 0, len(fieldList))
+
+		for _, ts := range utcTimestamps {
+			t := time.UnixMicro(ts).UTC()
+			localTime := t.In(targetLocation)
+
+			values, err := extractFields(localTime, fieldList)
+			if err != nil {
+				return err
+			}
+			valuesScalarField := &schemapb.ScalarField_LongData{
+				LongData: &schemapb.LongArray{
+					Data: values,
+				},
+			}
+			extractedResults = append(extractedResults, &schemapb.ScalarField{
+				Data: valuesScalarField,
+			})
+		}
+
+		fieldData.GetScalars().Data = &schemapb.ScalarField_ArrayData{
+			ArrayData: &schemapb.ArrayArray{
+				Data:        extractedResults,
+				ElementType: schemapb.DataType_Int64,
+			},
+		}
+		fieldData.Type = schemapb.DataType_Array
+	}
+	return nil
+}
+
+func genFunctionFields(ctx context.Context, insertMsg *msgstream.InsertMsg, schema *schemaInfo, partialUpdate bool) error {
+	allowNonBM25Outputs := common.GetCollectionAllowInsertNonBM25FunctionOutputs(schema.Properties)
+	fieldIDs := lo.Map(insertMsg.FieldsData, func(fieldData *schemapb.FieldData, _ int) int64 {
+		id, _ := schema.MapFieldID(fieldData.FieldName)
+		return id
+	})
+
+	// Since PartialUpdate is supported, the field_data here may not be complete
+	needProcessFunctions, err := typeutil.GetNeedProcessFunctions(fieldIDs, schema.Functions, allowNonBM25Outputs, partialUpdate)
+	if err != nil {
+		log.Ctx(ctx).Warn("Check upsert field error,", zap.String("collectionName", schema.Name), zap.Error(err))
+		return err
+	}
+
+	if embedding.HasNonBM25Functions(schema.CollectionSchema.Functions, []int64{}) {
+		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-genFunctionFields-call-function-udf")
+		defer sp.End()
+		exec, err := embedding.NewFunctionExecutor(schema.CollectionSchema, needProcessFunctions)
+		if err != nil {
+			return err
+		}
+		sp.AddEvent("Create-function-udf")
+		if err := exec.ProcessInsert(ctx, insertMsg); err != nil {
+			return err
+		}
+		sp.AddEvent("Call-function-udf")
+	}
+	return nil
 }

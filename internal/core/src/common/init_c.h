@@ -43,10 +43,10 @@ void
 SetDefaultExprEvalBatchSize(int64_t val);
 
 void
-SetDefaultOptimizeExprEnable(bool val);
+SetDefaultDeleteDumpBatchSize(int64_t val);
 
 void
-SetDefaultJSONKeyStatsCommitInterval(int64_t val);
+SetDefaultOptimizeExprEnable(bool val);
 
 void
 SetDefaultGrowingJSONKeyStatsEnable(bool val);

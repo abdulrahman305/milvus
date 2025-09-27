@@ -3317,7 +3317,7 @@ class TestMilvusClientRenameCollectionInValid(TestMilvusClientV2Base):
         expected: create collection with default schema, index, and load successfully
         """
         client = self._client()
-        error = {ct.err_code: 100, ct.err_msg: f"collection not found[database=1][collection={name}]"}
+        error = {ct.err_code: 100, ct.err_msg: "collection not found"}
         self.rename_collection(client, name, "new_collection",
                                check_task=CheckTasks.err_res, check_items=error)
 
@@ -3330,7 +3330,7 @@ class TestMilvusClientRenameCollectionInValid(TestMilvusClientV2Base):
         """
         client = self._client()
         collection_name = "nonexisted"
-        error = {ct.err_code: 100, ct.err_msg: f"collection not found[database=1][collection={collection_name}]"}
+        error = {ct.err_code: 100, ct.err_msg: "collection not found"}
         self.rename_collection(client, collection_name, "new_collection",
                                check_task=CheckTasks.err_res, check_items=error)
 
@@ -3345,8 +3345,8 @@ class TestMilvusClientRenameCollectionInValid(TestMilvusClientV2Base):
         collection_name = cf.gen_unique_str(prefix)
         # 1. create collection
         self.create_collection(client, collection_name, default_dim)
-        error = {ct.err_code: 65535, ct.err_msg: f"duplicated new collection name default:{collection_name} "
-                                                 f"with other collection name or alias"}
+        error = {ct.err_code: 65535, ct.err_msg: f"duplicated new collection name {collection_name} in database "
+                                                 f"default with other collection name or alias"}
         self.rename_collection(client, collection_name, collection_name,
                                check_task=CheckTasks.err_res, check_items=error)
 
@@ -3362,7 +3362,7 @@ class TestMilvusClientRenameCollectionInValid(TestMilvusClientV2Base):
         # 1. create collection
         self.create_collection(client, collection_name, default_dim)
         self.drop_collection(client, collection_name)
-        error = {ct.err_code: 100, ct.err_msg: f"{collection_name}: collection not found[collection=default]"}
+        error = {ct.err_code: 100, ct.err_msg: "collection not found"}
         self.rename_collection(client, collection_name, "new_collection",
                                check_task=CheckTasks.err_res, check_items=error)
 
@@ -3525,18 +3525,19 @@ class TestMilvusClientCollectionPropertiesInvalid(TestMilvusClientV2Base):
         # 1. create collection
         self.create_collection(client, collection_name, default_dim, id_type="string", max_length=ct.default_length)
         self.describe_collection(client, collection_name,
-                                     check_task=CheckTasks.check_describe_collection_property,
-                                     check_items={"collection_name": collection_name,
-                                                  "dim": default_dim,
-                                                  "consistency_level": 0})
-        error = {ct.err_code: 65535, ct.err_msg: f"The collection properties to alter and keys to delete must not be empty at the same time"}
+                                 check_task=CheckTasks.check_describe_collection_property,
+                                 check_items={"collection_name": collection_name,
+                                              "dim": default_dim,
+                                              "consistency_level": 0})
+        error = {ct.err_code: 65535, ct.err_msg: f"alter collection with empty properties and "
+                                                 f"delete keys, expect to set either properties or delete keys"}
         self.drop_collection_properties(client, collection_name, property_keys,
-                                     check_task=CheckTasks.err_res,
-                                     check_items=error)
+                                        check_task=CheckTasks.err_res,
+                                        check_items=error)
 
         self.drop_collection(client, collection_name)
 
-    #TODO properties with non-existent params
+    # TODO properties with non-existent params
 
 
 class TestMilvusClientCollectionPropertiesValid(TestMilvusClientV2Base):

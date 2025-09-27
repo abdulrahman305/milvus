@@ -12,7 +12,6 @@ import (
 // appendToWAL appends the message to the wal.
 func (w *walAccesserImpl) appendToWAL(ctx context.Context, msg message.MutableMessage) (*types.AppendResult, error) {
 	pchannel := funcutil.ToPhysicalChannel(msg.VChannel())
-	// get producer of pchannel.
 	p := w.getProducer(pchannel)
 	return p.Produce(ctx, msg)
 }
@@ -40,6 +39,9 @@ func assertValidMessage(msgs ...message.MutableMessage) {
 		if msg.MessageType().IsSystem() {
 			panic("system message is not allowed to append from client")
 		}
+		if msg.MessageType().IsSelfControlled() {
+			panic("self controlled message is not allowed to append from client")
+		}
 		if msg.VChannel() == "" {
 			panic("we don't support sent all vchannel message at client now")
 		}
@@ -50,6 +52,9 @@ func assertValidMessage(msgs ...message.MutableMessage) {
 func assertValidBroadcastMessage(msg message.BroadcastMutableMessage) {
 	if msg.MessageType().IsSystem() {
 		panic("system message is not allowed to broadcast append from client")
+	}
+	if msg.MessageType().IsSelfControlled() {
+		panic("self controlled message is not allowed to broadcast append from client")
 	}
 }
 

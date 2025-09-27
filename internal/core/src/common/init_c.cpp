@@ -56,13 +56,13 @@ SetDefaultExprEvalBatchSize(int64_t val) {
 }
 
 void
-SetDefaultOptimizeExprEnable(bool val) {
-    milvus::SetDefaultOptimizeExprEnable(val);
+SetDefaultDeleteDumpBatchSize(int64_t val) {
+    milvus::SetDefaultDeleteDumpBatchSize(val);
 }
 
 void
-SetDefaultJSONKeyStatsCommitInterval(int64_t val) {
-    milvus::SetDefaultJSONKeyStatsCommitInterval(val);
+SetDefaultOptimizeExprEnable(bool val) {
+    milvus::SetDefaultOptimizeExprEnable(val);
 }
 
 void

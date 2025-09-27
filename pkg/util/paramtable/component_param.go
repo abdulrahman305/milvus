@@ -57,6 +57,7 @@ const (
 	DefaultSearchCacheBudgetGBRatio = 0.10
 	DefaultLoadNumThreadRatio       = 8.0
 	DefaultBeamWidthRatio           = 4.0
+	MaxClusterIDBits                = 3
 )
 
 // ComponentParam is used to quickly and easily access all components' configurations.
@@ -238,6 +239,7 @@ type commonConfig struct {
 	BeamWidthRatio                      ParamItem `refreshable:"true"`
 	GracefulTime                        ParamItem `refreshable:"true"`
 	GracefulStopTimeout                 ParamItem `refreshable:"true"`
+	EnableNamespace                     ParamItem `refreshable:"false"`
 
 	StorageType ParamItem `refreshable:"false"`
 	SimdType    ParamItem `refreshable:"false"`
@@ -278,7 +280,15 @@ type commonConfig struct {
 	LockSlowLogWarnThreshold    ParamItem `refreshable:"true"`
 	MaxWLockConditionalWaitTime ParamItem `refreshable:"true"`
 
-	EnableStorageV2           ParamItem `refreshable:"false"`
+	// storage v2
+	EnableStorageV2                      ParamItem `refreshable:"false"`
+	Stv2SplitSystemColumn                ParamItem `refreshable:"true"`
+	Stv2SystemColumnIncludePK            ParamItem `refreshable:"true"`
+	Stv2SystemColumnIncludePartitionKey  ParamItem `refreshable:"true"`
+	Stv2SystemColumnIncludeClusteringKey ParamItem `refreshable:"true"`
+	Stv2SplitByAvgSize                   ParamItem `refreshable:"true"`
+	Stv2SplitAvgSizeThreshold            ParamItem `refreshable:"true"`
+
 	StoragePathPrefix         ParamItem `refreshable:"false"`
 	StorageZstdConcurrency    ParamItem `refreshable:"false"`
 	TTMsgEnabled              ParamItem `refreshable:"true"`
@@ -317,6 +327,11 @@ type commonConfig struct {
 	EnableConfigParamTypeCheck ParamItem `refreshable:"true"`
 
 	EnablePosixMode ParamItem `refreshable:"false"`
+
+	UsingJSONStatsForQuery ParamItem `refreshable:"true"`
+	ClusterID              ParamItem `refreshable:"false"`
+
+	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 }
 
 func (p *commonConfig) init(base *BaseTable) {
@@ -622,6 +637,15 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 	}
 	p.GracefulStopTimeout.Init(base.mgr)
 
+	p.EnableNamespace = ParamItem{
+		Key:          "common.namespace.enabled",
+		Version:      "2.6.0",
+		DefaultValue: "false",
+		Doc:          "whether to enable namespace, this parameter may be deprecated in the future. Just keep it for compatibility.",
+		Export:       true,
+	}
+	p.EnableNamespace.Init(base.mgr)
+
 	p.StorageType = ParamItem{
 		Key:          "common.storageType",
 		Version:      "2.0.0",
@@ -914,6 +938,60 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 	}
 	p.EnableStorageV2.Init(base.mgr)
 
+	p.Stv2SplitSystemColumn = ParamItem{
+		Key:          "common.storage.stv2.splitSystemColumn.enabled",
+		Version:      "2.6.2",
+		DefaultValue: "true",
+		Doc:          "enable split system column policy in storage v2",
+		Export:       true,
+	}
+	p.Stv2SplitSystemColumn.Init(base.mgr)
+
+	p.Stv2SystemColumnIncludePK = ParamItem{
+		Key:          "common.storage.stv2.splitSystemColumn.includePK",
+		Version:      "2.6.2",
+		DefaultValue: "true",
+		Doc:          "whether split system column policy include pk field",
+		Export:       true,
+	}
+	p.Stv2SystemColumnIncludePK.Init(base.mgr)
+
+	p.Stv2SystemColumnIncludePartitionKey = ParamItem{
+		Key:          "common.storage.stv2.splitSystemColumn.includePartitionKey",
+		Version:      "2.6.2",
+		DefaultValue: "true",
+		Doc:          "whether split system column policy include partition key field",
+		Export:       false,
+	}
+	p.Stv2SystemColumnIncludePartitionKey.Init(base.mgr)
+
+	p.Stv2SystemColumnIncludeClusteringKey = ParamItem{
+		Key:          "common.storage.stv2.splitSystemColumn.includeClusteringKey",
+		Version:      "2.6.2",
+		DefaultValue: "true",
+		Doc:          "whether split system column policy include clustering key field",
+		Export:       false,
+	}
+	p.Stv2SystemColumnIncludeClusteringKey.Init(base.mgr)
+
+	p.Stv2SplitByAvgSize = ParamItem{
+		Key:          "common.storage.stv2.splitByAvgSize.enabled",
+		Version:      "2.6.2",
+		DefaultValue: "false",
+		Doc:          "enable split by average size policy in storage v2",
+		Export:       true,
+	}
+	p.Stv2SplitByAvgSize.Init(base.mgr)
+
+	p.Stv2SplitAvgSizeThreshold = ParamItem{
+		Key:          "common.storage.stv2.splitByAvgSize.threshold",
+		Version:      "2.6.2",
+		DefaultValue: "1024",
+		Doc:          "split by average size policy threshold(in bytes) in storage v2",
+		Export:       true,
+	}
+	p.Stv2SplitAvgSizeThreshold.Init(base.mgr)
+
 	p.StoragePathPrefix = ParamItem{
 		Key:          "common.storage.pathPrefix",
 		Version:      "2.3.4",
@@ -1130,6 +1208,15 @@ This helps Milvus-CDC synchronize incremental data`,
 	}
 	p.EnabledOptimizeExpr.Init(base.mgr)
 
+	p.UsingJSONStatsForQuery = ParamItem{
+		Key:          "common.UsingJSONStatsForQuery",
+		Version:      "2.5.6",
+		DefaultValue: "true",
+		Doc:          "Indicates whether to use json stats when query",
+		Export:       true,
+	}
+	p.UsingJSONStatsForQuery.Init(base.mgr)
+
 	p.EnabledJSONKeyStats = ParamItem{
 		Key:          "common.enabledJSONKeyStats",
 		Version:      "2.5.5",
@@ -1165,6 +1252,35 @@ This helps Milvus-CDC synchronize incremental data`,
 		Export:       true,
 	}
 	p.EnablePosixMode.Init(base.mgr)
+
+	p.ClusterID = ParamItem{
+		Key:          "common.clusterID",
+		Version:      "2.6.3",
+		DefaultValue: "0",
+		Doc:          "cluster id",
+		Export:       true,
+		PanicIfEmpty: true,
+		Formatter: func(v string) string {
+			if getAsInt(v) < 0 {
+				return ""
+			}
+			maxClusterID := (int64(1) << MaxClusterIDBits) - 1
+			if getAsInt64(v) > maxClusterID {
+				return ""
+			}
+			return v
+		},
+	}
+	p.ClusterID.Init(base.mgr)
+
+	p.HybridSearchRequeryPolicy = ParamItem{
+		Key:          "common.requery.hybridSearchPolicy",
+		Version:      "2.6.3",
+		DefaultValue: "OutputVector",
+		Doc:          `the policy to decide when to do requery in hybrid search, support "always", "outputvector" and "outputfields"`,
+		Export:       false,
+	}
+	p.HybridSearchRequeryPolicy.Init(base.mgr)
 }
 
 type gpuConfig struct {
@@ -1616,40 +1732,42 @@ type proxyConfig struct {
 	// Alias  string
 	SoPath ParamItem `refreshable:"false"`
 
-	TimeTickInterval             ParamItem `refreshable:"false"`
-	HealthCheckTimeout           ParamItem `refreshable:"true"`
-	MsgStreamTimeTickBufSize     ParamItem `refreshable:"true"`
-	MaxNameLength                ParamItem `refreshable:"true"`
-	MaxUsernameLength            ParamItem `refreshable:"true"`
-	MinPasswordLength            ParamItem `refreshable:"true"`
-	MaxPasswordLength            ParamItem `refreshable:"true"`
-	MaxFieldNum                  ParamItem `refreshable:"true"`
-	MaxVectorFieldNum            ParamItem `refreshable:"true"`
-	MaxShardNum                  ParamItem `refreshable:"true"`
-	MaxDimension                 ParamItem `refreshable:"true"`
-	GinLogging                   ParamItem `refreshable:"false"`
-	GinLogSkipPaths              ParamItem `refreshable:"false"`
-	MaxUserNum                   ParamItem `refreshable:"true"`
-	MaxRoleNum                   ParamItem `refreshable:"true"`
-	MaxTaskNum                   ParamItem `refreshable:"false"`
-	DDLConcurrency               ParamItem `refreshable:"true"`
-	DCLConcurrency               ParamItem `refreshable:"true"`
-	ShardLeaderCacheInterval     ParamItem `refreshable:"false"`
-	ReplicaSelectionPolicy       ParamItem `refreshable:"false"`
-	CheckQueryNodeHealthInterval ParamItem `refreshable:"false"`
-	CostMetricsExpireTime        ParamItem `refreshable:"false"`
-	CheckWorkloadRequestNum      ParamItem `refreshable:"false"`
-	WorkloadToleranceFactor      ParamItem `refreshable:"false"`
-	RetryTimesOnReplica          ParamItem `refreshable:"true"`
-	RetryTimesOnHealthCheck      ParamItem `refreshable:"true"`
-	PartitionNameRegexp          ParamItem `refreshable:"true"`
-	MustUsePartitionKey          ParamItem `refreshable:"true"`
-	SkipAutoIDCheck              ParamItem `refreshable:"true"`
-	SkipPartitionKeyCheck        ParamItem `refreshable:"true"`
-	MaxVarCharLength             ParamItem `refreshable:"false"`
-	MaxTextLength                ParamItem `refreshable:"false"`
-	MaxResultEntries             ParamItem `refreshable:"true"`
-	EnableCachedServiceProvider  ParamItem `refreshable:"true"`
+	TimeTickInterval               ParamItem `refreshable:"false"`
+	HealthCheckTimeout             ParamItem `refreshable:"true"`
+	MsgStreamTimeTickBufSize       ParamItem `refreshable:"true"`
+	MaxNameLength                  ParamItem `refreshable:"true"`
+	MaxUsernameLength              ParamItem `refreshable:"true"`
+	MinPasswordLength              ParamItem `refreshable:"true"`
+	MaxPasswordLength              ParamItem `refreshable:"true"`
+	MaxFieldNum                    ParamItem `refreshable:"true"`
+	MaxVectorFieldNum              ParamItem `refreshable:"true"`
+	MaxShardNum                    ParamItem `refreshable:"true"`
+	MaxDimension                   ParamItem `refreshable:"true"`
+	GinLogging                     ParamItem `refreshable:"false"`
+	GinLogSkipPaths                ParamItem `refreshable:"false"`
+	MaxUserNum                     ParamItem `refreshable:"true"`
+	MaxRoleNum                     ParamItem `refreshable:"true"`
+	NameValidationAllowedChars     ParamItem `refreshable:"true"`
+	RoleNameValidationAllowedChars ParamItem `refreshable:"true"`
+	MaxTaskNum                     ParamItem `refreshable:"false"`
+	DDLConcurrency                 ParamItem `refreshable:"true"`
+	DCLConcurrency                 ParamItem `refreshable:"true"`
+	ShardLeaderCacheInterval       ParamItem `refreshable:"false"`
+	ReplicaSelectionPolicy         ParamItem `refreshable:"false"`
+	CheckQueryNodeHealthInterval   ParamItem `refreshable:"false"`
+	CostMetricsExpireTime          ParamItem `refreshable:"false"`
+	CheckWorkloadRequestNum        ParamItem `refreshable:"false"`
+	WorkloadToleranceFactor        ParamItem `refreshable:"false"`
+	RetryTimesOnReplica            ParamItem `refreshable:"true"`
+	RetryTimesOnHealthCheck        ParamItem `refreshable:"true"`
+	PartitionNameRegexp            ParamItem `refreshable:"true"`
+	MustUsePartitionKey            ParamItem `refreshable:"true"`
+	SkipAutoIDCheck                ParamItem `refreshable:"true"`
+	SkipPartitionKeyCheck          ParamItem `refreshable:"true"`
+	MaxVarCharLength               ParamItem `refreshable:"false"`
+	MaxTextLength                  ParamItem `refreshable:"false"`
+	MaxResultEntries               ParamItem `refreshable:"true"`
+	EnableCachedServiceProvider    ParamItem `refreshable:"true"`
 
 	AccessLog AccessLogConfig
 
@@ -1663,6 +1781,8 @@ type proxyConfig struct {
 	SlowQuerySpanInSeconds ParamItem `refreshable:"true"`
 	SlowLogSpanInSeconds   ParamItem `refreshable:"true"`
 	QueryNodePoolingSize   ParamItem `refreshable:"false"`
+
+	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 }
 
 func (p *proxyConfig) init(base *BaseTable) {
@@ -1843,6 +1963,22 @@ please adjust in embedded Milvus: false`,
 		PanicIfEmpty: true,
 	}
 	p.MaxRoleNum.Init(base.mgr)
+
+	p.NameValidationAllowedChars = ParamItem{
+		Key:          "proxy.nameValidation.allowedChars",
+		DefaultValue: "$",
+		Doc:          "Additional characters allowed in names beyond underscores, letters and numbers. To allow hyphens in names, add '-' here.",
+		Export:       true,
+	}
+	p.NameValidationAllowedChars.Init(base.mgr)
+
+	p.RoleNameValidationAllowedChars = ParamItem{
+		Key:          "proxy.roleNameValidation.allowedChars",
+		DefaultValue: "$",
+		Doc:          "Additional characters allowed in role names beyond underscores, letters and numbers. Add '-' to allow hyphens in role names.",
+		Export:       true,
+	}
+	p.RoleNameValidationAllowedChars.Init(base.mgr)
 
 	p.SoPath = ParamItem{
 		Key:          "proxy.soPath",
@@ -2246,6 +2382,8 @@ type queryCoordConfig struct {
 
 	// query node task parallelism factor
 	QueryNodeTaskParallelismFactor ParamItem `refreshable:"true"`
+
+	BalanceCheckCollectionMaxCount ParamItem `refreshable:"true"`
 }
 
 func (p *queryCoordConfig) init(base *BaseTable) {
@@ -2878,6 +3016,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 		Export:       false,
 	}
 	p.QueryNodeTaskParallelismFactor.Init(base.mgr)
+
+	p.BalanceCheckCollectionMaxCount = ParamItem{
+		Key:          "queryCoord.balanceCheckCollectionMaxCount",
+		Version:      "2.6.2",
+		DefaultValue: "100",
+		Doc:          "the max collection count for each balance check",
+		Export:       false,
+	}
+	p.BalanceCheckCollectionMaxCount.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -2919,9 +3066,11 @@ type queryNodeConfig struct {
 	TieredEvictableMemoryCacheRatio ParamItem `refreshable:"false"`
 	TieredEvictableDiskCacheRatio   ParamItem `refreshable:"false"`
 	TieredCacheTouchWindowMs        ParamItem `refreshable:"false"`
+	TieredBackgroundEvictionEnabled ParamItem `refreshable:"false"`
 	TieredEvictionIntervalMs        ParamItem `refreshable:"false"`
-	TieredLoadingResourceFactor     ParamItem `refreshable:"false"`
 	CacheCellUnaccessedSurvivalTime ParamItem `refreshable:"false"`
+	TieredLoadingResourceFactor     ParamItem `refreshable:"false"`
+	StorageUsageTrackingEnabled     ParamItem `refreshable:"false"`
 
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
@@ -2946,6 +3095,7 @@ type queryNodeConfig struct {
 	MmapVectorIndex                     ParamItem `refreshable:"false"`
 	MmapScalarField                     ParamItem `refreshable:"false"`
 	MmapScalarIndex                     ParamItem `refreshable:"false"`
+	MmapJSONStats                       ParamItem `refreshable:"false"`
 	GrowingMmapEnabled                  ParamItem `refreshable:"false"`
 	FixedFileSizeForMmapManager         ParamItem `refreshable:"false"`
 	MaxMmapDiskPercentageForMmapManager ParamItem `refreshable:"false"`
@@ -3001,6 +3151,10 @@ type queryNodeConfig struct {
 	EnableWorkerSQCostMetrics ParamItem `refreshable:"true"`
 
 	ExprEvalBatchSize ParamItem `refreshable:"false"`
+
+	// delete snapshot dump batch size
+	DeleteDumpBatchSize ParamItem `refreshable:"false"`
+
 	// expr cache
 	ExprResCacheEnabled       ParamItem `refreshable:"false"`
 	ExprResCacheCapacityBytes ParamItem `refreshable:"false"`
@@ -3018,6 +3172,7 @@ type queryNodeConfig struct {
 	QueryStreamMaxBatchSize                 ParamItem `refreshable:"false"`
 
 	// BF
+	EnableSparseFilterInQuery      ParamItem `refreshable:"true"`
 	SkipGrowingSegmentBF           ParamItem `refreshable:"true"`
 	BloomFilterApplyParallelFactor ParamItem `refreshable:"true"`
 
@@ -3025,7 +3180,6 @@ type queryNodeConfig struct {
 	WorkerPoolingSize ParamItem `refreshable:"false"`
 
 	// Json Key Stats
-	JSONKeyStatsCommitInterval        ParamItem `refreshable:"false"`
 	EnabledGrowingSegmentJSONKeyStats ParamItem `refreshable:"false"`
 
 	// Idf Oracle
@@ -3257,6 +3411,17 @@ eviction is necessary and the amount of data to evict from memory/disk.
 	}
 	p.TieredCacheTouchWindowMs.Init(base.mgr)
 
+	p.TieredBackgroundEvictionEnabled = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.backgroundEvictionEnabled",
+		Version:      "2.6.2",
+		DefaultValue: "false",
+		Doc: `Enable background eviction for Tiered Storage. Defaults to false.
+Background eviction is used to do periodic eviction in a separate thread.
+And it will only work when both 'evictionEnabled' and 'backgroundEvictionEnabled' are set to 'true'.`,
+		Export: true,
+	}
+	p.TieredBackgroundEvictionEnabled.Init(base.mgr)
+
 	p.TieredEvictionIntervalMs = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.evictionIntervalMs",
 		Version:      "2.6.0",
@@ -3268,10 +3433,37 @@ eviction is necessary and the amount of data to evict from memory/disk.
 			}
 			return fmt.Sprintf("%d", window)
 		},
-		Doc:    "Interval in milliseconds to run periodic eviction.",
+		Doc:    "Interval in milliseconds to run periodic eviction. 'backgroundEvictionEnabled' is required.",
 		Export: false,
 	}
 	p.TieredEvictionIntervalMs.Init(base.mgr)
+
+	p.CacheCellUnaccessedSurvivalTime = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.cacheTtl",
+		Version:      "2.6.0",
+		DefaultValue: "0",
+		Formatter: func(v string) string {
+			timeout := getAsInt64(v)
+			if timeout <= 0 {
+				return "0"
+			}
+			return fmt.Sprintf("%d", timeout)
+		},
+		Doc: `Time in seconds after which an unaccessed cache cell will be evicted. 'backgroundEvictionEnabled' is required.
+If a cached data hasn't been accessed again after this time since its last access, it will be evicted.
+If set to 0, time based eviction is disabled.`,
+		Export: true,
+	}
+	p.CacheCellUnaccessedSurvivalTime.Init(base.mgr)
+
+	p.StorageUsageTrackingEnabled = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.storageUsageTrackingEnabled",
+		Version:      "2.6.3",
+		DefaultValue: "false",
+		Doc:          "Enable storage usage tracking for Tiered Storage. Defaults to false.",
+		Export:       true,
+	}
+	p.StorageUsageTrackingEnabled.Init(base.mgr)
 
 	p.TieredLoadingResourceFactor = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.loadingResourceFactor",
@@ -3288,24 +3480,6 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Export: false,
 	}
 	p.TieredLoadingResourceFactor.Init(base.mgr)
-
-	p.CacheCellUnaccessedSurvivalTime = ParamItem{
-		Key:          "queryNode.segcore.tieredStorage.cacheTtl",
-		Version:      "2.6.0",
-		DefaultValue: "0",
-		Formatter: func(v string) string {
-			timeout := getAsInt64(v)
-			if timeout <= 0 {
-				return "0"
-			}
-			return fmt.Sprintf("%d", timeout)
-		},
-		Doc: `Time in seconds after which an unaccessed cache cell will be evicted. 
-If a cached data hasn't been accessed again after this time since its last access, it will be evicted.
-If set to 0, time based eviction is disabled.`,
-		Export: true,
-	}
-	p.CacheCellUnaccessedSurvivalTime.Init(base.mgr)
 
 	p.EnableDisk = ParamItem{
 		Key:          "queryNode.enableDisk",
@@ -3550,7 +3724,8 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 		Doc:          "Deprecated: The folder that storing data files for mmap, setting to a path will enable Milvus to load data with mmap",
 		Formatter: func(v string) string {
 			if len(v) == 0 {
-				return path.Join(base.Get("localStorage.path"), "mmap")
+				localStoragePath := getLocalStoragePath(base)
+				return path.Join(localStoragePath, "mmap")
 			}
 			return v
 		},
@@ -3626,6 +3801,15 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 		Export: true,
 	}
 	p.MmapScalarIndex.Init(base.mgr)
+
+	p.MmapJSONStats = ParamItem{
+		Key:          "queryNode.mmap.jsonStats",
+		Version:      "2.6.1",
+		DefaultValue: "true",
+		Doc:          "Enable mmap for loading json stats",
+		Export:       true,
+	}
+	p.MmapJSONStats.Init(base.mgr)
 
 	p.GrowingMmapEnabled = ParamItem{
 		Key:          "queryNode.mmap.growingMmapEnabled",
@@ -3814,7 +3998,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 		Formatter: func(v string) string {
 			if len(v) == 0 {
 				// use local storage path to check correct device
-				localStoragePath := base.Get("localStorage.path")
+				localStoragePath := getLocalStoragePath(base)
 				if _, err := os.Stat(localStoragePath); os.IsNotExist(err) {
 					if err := os.MkdirAll(localStoragePath, os.ModePerm); err != nil {
 						log.Fatal("failed to mkdir", zap.String("localStoragePath", localStoragePath), zap.Error(err))
@@ -4010,6 +4194,15 @@ user-task-polling:
 	}
 	p.ExprEvalBatchSize.Init(base.mgr)
 
+	p.DeleteDumpBatchSize = ParamItem{
+		Key:          "queryNode.segcore.deleteDumpBatchSize",
+		Version:      "2.6.2",
+		DefaultValue: "10000",
+		Doc:          "Batch size for delete snapshot dump in segcore.",
+		Export:       true,
+	}
+	p.DeleteDumpBatchSize.Init(base.mgr)
+
 	// expr cache
 	p.ExprResCacheEnabled = ParamItem{
 		Key:          "queryNode.exprCache.enabled",
@@ -4030,15 +4223,6 @@ user-task-polling:
 		Export:       true,
 	}
 	p.ExprResCacheCapacityBytes.Init(base.mgr)
-
-	p.JSONKeyStatsCommitInterval = ParamItem{
-		Key:          "queryNode.segcore.jsonKeyStatsCommitInterval",
-		Version:      "2.5.0",
-		DefaultValue: "200",
-		Doc:          "the commit interval for the JSON key Stats to commit",
-		Export:       true,
-	}
-	p.JSONKeyStatsCommitInterval.Init(base.mgr)
 
 	p.CleanExcludeSegInterval = ParamItem{
 		Key:          "queryCoord.cleanExcludeSegmentInterval",
@@ -4108,6 +4292,14 @@ user-task-polling:
 	}
 	p.BloomFilterApplyParallelFactor.Init(base.mgr)
 
+	p.EnableSparseFilterInQuery = ParamItem{
+		Key:          "queryNode.enableSparseFilterInQuery",
+		Version:      "2.6.2",
+		DefaultValue: "true",
+		Doc:          "Enable use sparse filter in query.",
+	}
+	p.EnableSparseFilterInQuery.Init(base.mgr)
+
 	p.SkipGrowingSegmentBF = ParamItem{
 		Key:          "queryNode.skipGrowingSegmentBF",
 		Version:      "2.5",
@@ -4164,6 +4356,7 @@ type dataCoordConfig struct {
 	SegmentFlushInterval           ParamItem `refreshable:"true"`
 	BlockingL0EntryNum             ParamItem `refreshable:"true"`
 	BlockingL0SizeInMB             ParamItem `refreshable:"true"`
+	DVForceAllIndexReady           ParamItem `refreshable:"true"`
 
 	// compaction
 	EnableCompaction                       ParamItem `refreshable:"false"`
@@ -4180,7 +4373,7 @@ type dataCoordConfig struct {
 	SegmentSmallProportion           ParamItem `refreshable:"true"`
 	SegmentCompactableProportion     ParamItem `refreshable:"true"`
 	SegmentExpansionRate             ParamItem `refreshable:"true"`
-	CompactionTimeoutInSeconds       ParamItem `refreshable:"true"`
+	CompactionTimeoutInSeconds       ParamItem `refreshable:"true"` // deprecated
 	CompactionDropToleranceInSeconds ParamItem `refreshable:"true"`
 	CompactionGCIntervalInSeconds    ParamItem `refreshable:"true"`
 	CompactionCheckIntervalInSeconds ParamItem `refreshable:"false"` // deprecated
@@ -4211,7 +4404,7 @@ type dataCoordConfig struct {
 	ClusteringCompactionPreferSegmentSizeRatio ParamItem `refreshable:"true"`
 	ClusteringCompactionMaxSegmentSizeRatio    ParamItem `refreshable:"true"`
 	ClusteringCompactionMaxTrainSizeRatio      ParamItem `refreshable:"true"`
-	ClusteringCompactionTimeoutInSeconds       ParamItem `refreshable:"true"`
+	ClusteringCompactionTimeoutInSeconds       ParamItem `refreshable:"true"` // deprecated
 	ClusteringCompactionMaxCentroidsNum        ParamItem `refreshable:"true"`
 	ClusteringCompactionMinCentroidsNum        ParamItem `refreshable:"true"`
 	ClusteringCompactionMinClusterSizeRatio    ParamItem `refreshable:"true"`
@@ -4271,12 +4464,14 @@ type dataCoordConfig struct {
 	StatsTaskSlotUsage            ParamItem `refreshable:"true"`
 	AnalyzeTaskSlotUsage          ParamItem `refreshable:"true"`
 
-	EnableSortCompaction              ParamItem `refreshable:"true"`
-	TaskCheckInterval                 ParamItem `refreshable:"true"`
-	SortCompactionTriggerCount        ParamItem `refreshable:"true"`
-	JSONStatsTriggerCount             ParamItem `refreshable:"true"`
-	JSONStatsTriggerInterval          ParamItem `refreshable:"true"`
-	JSONKeyStatsMemoryBudgetInTantivy ParamItem `refreshable:"false"`
+	EnableSortCompaction             ParamItem `refreshable:"true"`
+	TaskCheckInterval                ParamItem `refreshable:"true"`
+	SortCompactionTriggerCount       ParamItem `refreshable:"true"`
+	JSONStatsTriggerCount            ParamItem `refreshable:"true"`
+	JSONStatsTriggerInterval         ParamItem `refreshable:"true"`
+	JSONStatsMaxShreddingColumns     ParamItem `refreshable:"true"`
+	JSONStatsShreddingRatioThreshold ParamItem `refreshable:"true"`
+	JSONStatsWriteBatchSize          ParamItem `refreshable:"true"`
 
 	RequestTimeoutSeconds ParamItem `refreshable:"true"`
 }
@@ -4459,6 +4654,15 @@ exceeds this threshold, the earliest growing segments will be sealed.`,
 	}
 	p.BlockingL0SizeInMB.Init(base.mgr)
 
+	p.DVForceAllIndexReady = ParamItem{
+		Key:          "dataCoord.dataview.forceAllIndexReady",
+		Version:      "2.6.2",
+		DefaultValue: "false",
+		Doc:          `If set to true, Milvus will wait all indices ready before the segment appears in indexed dataview.`,
+		Export:       false,
+	}
+	p.DVForceAllIndexReady.Init(base.mgr)
+
 	p.EnableCompaction = ParamItem{
 		Key:          "dataCoord.enableCompaction",
 		Version:      "2.0.0",
@@ -4581,7 +4785,7 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 		Key:          "dataCoord.compaction.dropTolerance",
 		Version:      "2.4.2",
 		Doc:          "Compaction task will be cleaned after finish longer than this time(in seconds)",
-		DefaultValue: "86400",
+		DefaultValue: "3600",
 		Export:       true,
 	}
 	p.CompactionDropToleranceInSeconds.Init(base.mgr)
@@ -5364,14 +5568,39 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	}
 	p.RequestTimeoutSeconds.Init(base.mgr)
 
-	p.JSONKeyStatsMemoryBudgetInTantivy = ParamItem{
-		Key:          "dataCoord.jsonKeyStatsMemoryBudgetInTantivy",
-		Version:      "2.5.5",
-		DefaultValue: "16777216",
-		Doc:          "the memory budget for the JSON index In Tantivy, the unit is bytes",
+	p.JSONStatsMaxShreddingColumns = ParamItem{
+		Key:          "dataCoord.jsonStatsMaxShreddingColumns",
+		Version:      "2.6.1",
+		DefaultValue: "1024",
+		Doc:          "the max number of columns to shred",
+		Export:       true,
+		Formatter: func(value string) string {
+			v := getAsInt(value)
+			if v > 10000 {
+				return "10000"
+			}
+			return strconv.Itoa(v)
+		},
+	}
+	p.JSONStatsMaxShreddingColumns.Init(base.mgr)
+
+	p.JSONStatsShreddingRatioThreshold = ParamItem{
+		Key:          "dataCoord.jsonStatsShreddingRatioThreshold",
+		Version:      "2.6.1",
+		DefaultValue: "0.3",
+		Doc:          "the ratio threshold to shred",
 		Export:       true,
 	}
-	p.JSONKeyStatsMemoryBudgetInTantivy.Init(base.mgr)
+	p.JSONStatsShreddingRatioThreshold.Init(base.mgr)
+
+	p.JSONStatsWriteBatchSize = ParamItem{
+		Key:          "dataCoord.jsonStatsWriteBatchSize",
+		Version:      "2.6.1",
+		DefaultValue: "81920",
+		Doc:          "the batch size to write",
+		Export:       true,
+	}
+	p.JSONStatsWriteBatchSize.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -5919,7 +6148,10 @@ type streamingConfig struct {
 	WALBalancerPolicyVChannelFairRebalanceMaxStep       ParamItem `refreshable:"true"`
 
 	// broadcaster
-	WALBroadcasterConcurrencyRatio ParamItem `refreshable:"false"`
+	WALBroadcasterConcurrencyRatio       ParamItem `refreshable:"false"`
+	WALBroadcasterTombstoneCheckInternal ParamItem `refreshable:"true"`
+	WALBroadcasterTombstoneMaxCount      ParamItem `refreshable:"true"`
+	WALBroadcasterTombstoneMaxLifetime   ParamItem `refreshable:"true"`
 
 	// txn
 	TxnDefaultKeepaliveTimeout ParamItem `refreshable:"true"`
@@ -6098,6 +6330,39 @@ it also determine the depth of depth first search method that is used to find th
 		Export:       true,
 	}
 	p.WALBroadcasterConcurrencyRatio.Init(base.mgr)
+
+	p.WALBroadcasterTombstoneCheckInternal = ParamItem{
+		Key:     "streaming.walBroadcaster.tombstone.checkInternal",
+		Version: "2.6.0",
+		Doc: `The interval of garbage collection of tombstone, 5m by default.
+Tombstone is used to reject duplicate submissions of DDL messages,
+too few tombstones may lead to ABA issues in the state of milvus cluster.`,
+		DefaultValue: "5m",
+		Export:       false,
+	}
+	p.WALBroadcasterTombstoneCheckInternal.Init(base.mgr)
+
+	p.WALBroadcasterTombstoneMaxCount = ParamItem{
+		Key:     "streaming.walBroadcaster.tombstone.maxCount",
+		Version: "2.6.0",
+		Doc: `The max count of tombstone, 256 by default. 
+Tombstone is used to reject duplicate submissions of DDL messages,
+too few tombstones may lead to ABA issues in the state of milvus cluster.`,
+		DefaultValue: "256",
+		Export:       false,
+	}
+	p.WALBroadcasterTombstoneMaxCount.Init(base.mgr)
+
+	p.WALBroadcasterTombstoneMaxLifetime = ParamItem{
+		Key:     "streaming.walBroadcaster.tombstone.maxLifetime",
+		Version: "2.6.0",
+		Doc: `The max lifetime of tombstone, 30m by default.
+Tombstone is used to reject duplicate submissions of DDL messages,
+too few tombstones may lead to ABA issues in the state of milvus cluster.`,
+		DefaultValue: "30m",
+		Export:       false,
+	}
+	p.WALBroadcasterTombstoneMaxLifetime.Init(base.mgr)
 
 	// txn
 	p.TxnDefaultKeepaliveTimeout = ParamItem{
@@ -6311,4 +6576,13 @@ func (params *ComponentParam) Reset(key string) error {
 
 func (params *ComponentParam) GetWithDefault(key string, dft string) string {
 	return params.baseTable.GetWithDefault(key, dft)
+}
+
+func getLocalStoragePath(base *BaseTable) string {
+	localStoragePath := base.Get("localStorage.path")
+	if len(localStoragePath) == 0 {
+		localStoragePath = defaultLocalStoragePath
+		log.Warn("localStorage.path is not set, using default value", zap.String("localStorage.path", localStoragePath))
+	}
+	return localStoragePath
 }

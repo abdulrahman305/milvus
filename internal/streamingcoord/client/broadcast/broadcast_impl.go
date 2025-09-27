@@ -10,9 +10,8 @@ import (
 )
 
 // NewGRPCBroadcastService creates a new broadcast service with grpc.
-func NewGRPCBroadcastService(walName string, service lazygrpc.Service[streamingpb.StreamingCoordBroadcastServiceClient]) *GRPCBroadcastServiceImpl {
+func NewGRPCBroadcastService(service lazygrpc.Service[streamingpb.StreamingCoordBroadcastServiceClient]) *GRPCBroadcastServiceImpl {
 	return &GRPCBroadcastServiceImpl{
-		walName: walName,
 		service: service,
 	}
 }
@@ -20,7 +19,6 @@ func NewGRPCBroadcastService(walName string, service lazygrpc.Service[streamingp
 // GRPCBroadcastServiceImpl is the implementation of BroadcastService based on grpc service.
 // If the streaming coord is not deployed at current node, these implementation will be used.
 type GRPCBroadcastServiceImpl struct {
-	walName string
 	service lazygrpc.Service[streamingpb.StreamingCoordBroadcastServiceClient]
 }
 
@@ -37,7 +35,7 @@ func (c *GRPCBroadcastServiceImpl) Broadcast(ctx context.Context, msg message.Br
 	}
 	results := make(map[string]*types.AppendResult, len(resp.Results))
 	for channel, result := range resp.Results {
-		msgID, err := message.UnmarshalMessageID(c.walName, result.Id.Id)
+		msgID, err := message.UnmarshalMessageID(result.Id)
 		if err != nil {
 			return nil, err
 		}
@@ -54,14 +52,15 @@ func (c *GRPCBroadcastServiceImpl) Broadcast(ctx context.Context, msg message.Br
 	}, nil
 }
 
-func (c *GRPCBroadcastServiceImpl) Ack(ctx context.Context, req types.BroadcastAckRequest) error {
+func (c *GRPCBroadcastServiceImpl) Ack(ctx context.Context, msg message.ImmutableMessage) error {
 	client, err := c.service.GetService(ctx)
 	if err != nil {
 		return err
 	}
 	_, err = client.Ack(ctx, &streamingpb.BroadcastAckRequest{
-		BroadcastId: req.BroadcastID,
-		Vchannel:    req.VChannel,
+		BroadcastId: msg.BroadcastHeader().BroadcastID,
+		Vchannel:    msg.VChannel(),
+		Message:     msg.IntoImmutableMessageProto(),
 	})
 	return err
 }

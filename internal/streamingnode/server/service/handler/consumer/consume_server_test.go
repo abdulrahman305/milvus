@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_wal"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_walmanager"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
@@ -20,11 +21,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mocks/proto/mock_streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/mocks/streaming/util/mock_message"
-	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/walimplstest"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
@@ -58,7 +57,7 @@ func TestCreateConsumeServer(t *testing.T) {
 	// Return error if send created failed.
 	l := mock_wal.NewMockWAL(t)
 	manager.ExpectedCalls = nil
-	l.EXPECT().WALName().Return("test")
+	l.EXPECT().WALName().Return(message.WALNameTest)
 	manager.EXPECT().GetAvailableWAL(types.PChannelInfo{Name: "test", Term: int64(1)}).Return(l, nil)
 	grpcConsumeServer.EXPECT().Send(mock.Anything).Return(errors.New("send created failed"))
 	assertCreateConsumeServerFail(t, manager, grpcConsumeServer)
@@ -80,7 +79,7 @@ func TestCreateConsumeServer(t *testing.T) {
 	}, nil)
 	l = mock_wal.NewMockWAL(t)
 	l.EXPECT().Read(mock.Anything, mock.Anything).Return(nil, errors.New("create scanner failed"))
-	l.EXPECT().WALName().Return("test")
+	l.EXPECT().WALName().Return(message.WALNameTest)
 	manager.ExpectedCalls = nil
 	manager.EXPECT().GetAvailableWAL(types.PChannelInfo{Name: "test", Term: int64(1)}).Return(l, nil)
 	assertCreateConsumeServerFail(t, manager, grpcConsumeServer)
@@ -189,9 +188,8 @@ func TestConsumerServeSendArm(t *testing.T) {
 
 	// test send.
 	msg := mock_message.NewMockImmutableMessage(t)
-	msg.EXPECT().MessageID().Return(walimplstest.NewTestMessageID(1))
 	msg.EXPECT().EstimateSize().Return(0)
-	msg.EXPECT().IntoMessageProto().Return(&messagespb.Message{})
+	msg.EXPECT().IntoImmutableMessageProto().Return(&commonpb.ImmutableMessage{})
 	scanCh <- msg
 
 	// test send txn message.

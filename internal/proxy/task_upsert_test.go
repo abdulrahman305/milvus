@@ -33,6 +33,7 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
@@ -500,6 +501,8 @@ func TestUpsertTask_Function(t *testing.T) {
 		schema:      info,
 		result:      &milvuspb.MutationResult{},
 	}
+	err = genFunctionFields(task.ctx, task.upsertMsg.InsertMsg, task.schema, task.req.GetPartialUpdate())
+	assert.NoError(t, err)
 	err = task.insertPreExecute(ctx)
 	assert.NoError(t, err)
 
@@ -665,7 +668,7 @@ func TestRetrieveByPKs_Success(t *testing.T) {
 					},
 				},
 			},
-		}, nil).Build()
+		}, segcore.StorageCost{}, nil).Build()
 
 		globalMetaCache = &MetaCache{}
 		mockey.Mock(globalMetaCache.GetPartitionID).Return(int64(1002), nil).Build()
@@ -736,7 +739,7 @@ func TestRetrieveByPKs_PartitionKeyMode(t *testing.T) {
 		mockey.Mock((*Proxy).query).Return(&milvuspb.QueryResults{
 			Status:     merr.Success(),
 			FieldsData: []*schemapb.FieldData{},
-		}, nil).Build()
+		}, segcore.StorageCost{}, nil).Build()
 
 		task := createTestUpdateTask()
 		task.partitionKeyMode = true

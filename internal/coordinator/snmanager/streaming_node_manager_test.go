@@ -8,6 +8,9 @@ import (
 	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
+	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -18,24 +21,29 @@ type pChannelInfoAssigned struct {
 }
 
 func TestStreamingNodeManager(t *testing.T) {
+	StaticStreamingNodeManager.Close()
 	m := newStreamingNodeManager()
 	b := mock_balancer.NewMockBalancer(t)
 
 	ch := make(chan pChannelInfoAssigned, 1)
 	b.EXPECT().GetAllStreamingNodes(mock.Anything).Return(map[int64]*types.StreamingNodeInfo{}, nil)
-	b.EXPECT().WatchChannelAssignments(mock.Anything, mock.Anything).Run(
-		func(ctx context.Context, cb func(typeutil.VersionInt64Pair, []types.PChannelInfoAssigned) error) {
+	b.EXPECT().WatchChannelAssignments(mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, cb balancer.WatchChannelAssignmentsCallback) error {
 			for {
 				select {
 				case <-ctx.Done():
-					return
+					return ctx.Err()
 				case p := <-ch:
-					cb(p.version, p.pchannels)
+					cb(balancer.WatchChannelAssignmentsCallbackParam{
+						Version:            p.version,
+						CChannelAssignment: &streamingpb.CChannelAssignment{Meta: &streamingpb.CChannelMeta{Pchannel: "pchannel"}},
+						Relations:          p.pchannels,
+					})
 				}
 			}
 		})
 	b.EXPECT().RegisterStreamingEnabledNotifier(mock.Anything).Return()
-	m.SetBalancerReady(b)
+	balance.Register(b)
 
 	streamingNodes := m.GetStreamingQueryNodeIDs()
 	assert.Empty(t, streamingNodes)

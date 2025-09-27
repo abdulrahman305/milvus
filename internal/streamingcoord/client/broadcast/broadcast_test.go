@@ -12,16 +12,15 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks/util/streamingutil/service/mock_lazygrpc"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/pkg/v2/mocks/proto/mock_streamingpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/walimplstest"
 )
 
 func TestBroadcast(t *testing.T) {
 	s := newMockServer(t, 0)
-	bs := NewGRPCBroadcastService(walimplstest.WALName, s)
+	bs := NewGRPCBroadcastService(s)
 	msg := message.NewDropCollectionMessageBuilderV1().
 		WithHeader(&message.DropCollectionMessageHeader{}).
 		WithBody(&msgpb.DropCollectionRequest{}).
@@ -29,10 +28,9 @@ func TestBroadcast(t *testing.T) {
 		MustBuildBroadcast()
 	_, err := bs.Broadcast(context.Background(), msg)
 	assert.NoError(t, err)
-	err = bs.Ack(context.Background(), types.BroadcastAckRequest{
-		VChannel:    "v1",
-		BroadcastID: 1,
-	})
+	msg1 := msg.WithBroadcastID(1).SplitIntoMutableMessage()
+	immutableMsg1 := msg1[0].IntoImmutableMessage(rmq.NewRmqID(1))
+	err = bs.Ack(context.Background(), immutableMsg1)
 	assert.NoError(t, err)
 }
 
@@ -43,9 +41,7 @@ func newMockServer(t *testing.T, sendDelay time.Duration) lazygrpc.Service[strea
 	c.EXPECT().Broadcast(mock.Anything, mock.Anything).Return(&streamingpb.BroadcastResponse{
 		Results: map[string]*streamingpb.ProduceMessageResponseResult{
 			"v1": {
-				Id: &messagespb.MessageID{
-					Id: walimplstest.NewTestMessageID(1).Marshal(),
-				},
+				Id: walimplstest.NewTestMessageID(1).IntoProto(),
 			},
 		},
 		BroadcastId: 1,

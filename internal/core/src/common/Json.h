@@ -39,7 +39,18 @@
 #include "rapidjson/writer.h"
 #include "rapidjson/stringbuffer.h"
 
+#define SIMDJSON_CHECK_ERROR(result)               \
+    do {                                           \
+        if ((result).error() != simdjson::SUCCESS) \
+            return (result).error();               \
+    } while (0)
 namespace milvus {
+
+bool
+isObjectEmpty(simdjson::ondemand::value value);
+bool
+isDocEmpty(simdjson::ondemand::document document);
+
 // function to extract specific keys and convert them to json
 // rapidjson is suitable for extract and reconstruct serialization
 // instead of simdjson which not suitable for serialization
@@ -210,10 +221,12 @@ class Json {
     exist(std::string_view pointer) const {
         auto doc = this->doc();
         if (pointer.empty()) {
-            return doc.error() == simdjson::SUCCESS && !doc.is_null();
+            return doc.error() == simdjson::SUCCESS &&
+                   !isDocEmpty(std::move(doc));
         } else {
             auto res = doc.at_pointer(pointer);
-            return res.error() == simdjson::SUCCESS && !res.is_null();
+            return res.error() == simdjson::SUCCESS &&
+                   !isObjectEmpty(res.value());
         }
     }
 
@@ -263,6 +276,24 @@ class Json {
         return doc().at_pointer(pointer).get<T>();
     }
 
+    value_result<std::string>
+    at_string_any(std::string_view pointer) const {
+        if (data_.empty()) {
+            return std::string{};
+        }
+
+        auto doc_res = doc();
+        SIMDJSON_CHECK_ERROR(doc_res);
+
+        auto el_res = doc_res.value().at_pointer(pointer);
+        SIMDJSON_CHECK_ERROR(el_res);
+
+        auto json_str = simdjson::to_json_string(el_res.value());
+        SIMDJSON_CHECK_ERROR(json_str);
+
+        return std::string{json_str.value()};
+    }
+
     template <typename T>
     value_result<T>
     at(uint16_t offset, uint16_t length) const {
@@ -308,4 +339,61 @@ class Json {
         own_data_{};  // this could be empty, then the Json will be just s view on bytes
     simdjson::padded_string_view data_{};
 };
+
+inline bool
+isObjectEmpty(simdjson::ondemand::value value) {
+    if (value.is_null()) {
+        return true;
+    }
+
+    if (value.type().value() == simdjson::ondemand::json_type::object) {
+        auto object = value.get_object();
+        for (auto field : object) {
+            if (!isObjectEmpty(field.value())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (value.type().value() == simdjson::ondemand::json_type::array) {
+        auto array = value.get_array();
+        for (auto element : array) {
+            if (!isObjectEmpty(std::move(element))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+inline bool
+isDocEmpty(simdjson::ondemand::document document) {
+    if (document.is_null()) {
+        return true;
+    }
+
+    if (document.type().value() == simdjson::ondemand::json_type::object) {
+        auto object = document.get_object();
+        for (auto field : object) {
+            if (!isObjectEmpty(field.value())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (document.type().value() == simdjson::ondemand::json_type::array) {
+        auto array = document.get_array();
+        for (auto element : array) {
+            if (!isObjectEmpty(std::move(element))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
 }  // namespace milvus

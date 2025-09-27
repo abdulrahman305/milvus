@@ -19,6 +19,7 @@ package common
 import (
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"strconv"
 	"strings"
 
@@ -55,6 +56,9 @@ const (
 
 	// TimeStampFieldName defines the name of the Timestamp field
 	TimeStampFieldName = "Timestamp"
+
+	// NamespaceFieldName defines the name of the Namespace field
+	NamespaceFieldName = "$namespace_id"
 
 	// MetaFieldName is the field name of dynamic schema
 	MetaFieldName = "$meta"
@@ -121,6 +125,13 @@ const (
 
 	// JSONIndexPath storage path const for json index
 	JSONIndexPath = "json_key_index_log"
+
+	// JSONStatsPath storage path const for json stats
+	JSONStatsPath = "json_stats"
+)
+
+const (
+	JSONStatsDataFormatVersion = 2
 )
 
 // Search, Index parameter keys
@@ -156,6 +167,11 @@ const (
 	JSONCastFunctionKey = "json_cast_function"
 )
 
+// expr query params
+const (
+	ExprUseJSONStatsKey = "expr_use_json_stats"
+)
+
 // Doc-in-doc-out
 const (
 	EnableAnalyzerKey = `enable_analyzer`
@@ -168,6 +184,12 @@ const (
 	CollectionTTLConfigKey      = "collection.ttl.seconds"
 	CollectionAutoCompactionKey = "collection.autocompaction.enabled"
 	CollectionDescription       = "collection.description"
+
+	// Note:
+	// Function output fields cannot be included in inserted data.
+	// In particular, the `bm25` function output field is always disallowed
+	// and is not controlled by this option.
+	CollectionAllowInsertNonBM25FunctionOutputs = "collection.function.allowInsertNonBM25FunctionOutputs"
 
 	// rate limit
 	CollectionInsertRateMaxKey   = "collection.insertRate.max.mb"
@@ -217,12 +239,30 @@ const (
 	ReplicateIDKey             = "replicate.id"
 	ReplicateEndTSKey          = "replicate.endTS"
 	IndexNonEncoding           = "index.nonEncoding"
+	EnableDynamicSchemaKey     = `dynamicfield.enabled`
+	NamespaceEnabledKey        = "namespace.enabled"
+
+	// timezone releated
+	DatabaseDefaultTimezone   = "database.timezone"
+	CollectionDefaultTimezone = "collection.timezone"
+	AllowInsertAutoIDKey      = "allow_insert_auto_id"
 )
 
 const (
 	PropertiesKey        string = "properties"
 	TraceIDKey           string = "uber-trace-id"
 	ClientRequestMsecKey string = "client-request-unixmsec"
+)
+
+// Timestamptz field
+const (
+	TszYear        string = "year"
+	TszMonth       string = "month"
+	TszDay         string = "day"
+	TszHour        string = "hour"
+	TszMinute      string = "minute"
+	TszSecond      string = "second"
+	TszMicrosecond string = "microsecond"
 )
 
 func IsSystemField(fieldID int64) bool {
@@ -464,6 +504,16 @@ func GetReplicateEndTS(kvs []*commonpb.KeyValuePair) (uint64, bool) {
 	return 0, false
 }
 
+func IsEnableDynamicSchema(kvs []*commonpb.KeyValuePair) (found bool, value bool, err error) {
+	for _, kv := range kvs {
+		if kv.GetKey() == EnableDynamicSchemaKey {
+			value, err = strconv.ParseBool(kv.GetValue())
+			return true, value, err
+		}
+	}
+	return false, false, nil
+}
+
 func ValidateAutoIndexMmapConfig(autoIndexConfigEnable, isVectorField bool, indexParams map[string]string) error {
 	if !autoIndexConfigEnable {
 		return nil
@@ -474,4 +524,49 @@ func ValidateAutoIndexMmapConfig(autoIndexConfigEnable, isVectorField bool, inde
 		return errors.New("mmap index is not supported to config for the collection in auto index mode")
 	}
 	return nil
+}
+
+func ParseNamespaceProp(props ...*commonpb.KeyValuePair) (value bool, has bool, err error) {
+	for _, p := range props {
+		if p.GetKey() == NamespaceEnabledKey {
+			value, err := strconv.ParseBool(p.GetValue())
+			if err != nil {
+				return false, false, fmt.Errorf("invalid namespace prop value: %s", p.GetValue())
+			}
+			return value, true, nil
+		}
+	}
+	return false, false, nil
+}
+
+func AllocAutoID(allocFunc func(uint32) (int64, int64, error), rowNum uint32, clusterID uint64) (int64, int64, error) {
+	idStart, idEnd, err := allocFunc(rowNum)
+	if err != nil {
+		return 0, 0, err
+	}
+	reversed := bits.Reverse64(clusterID)
+	// right shift by 1 to preserve sign bit
+	reversed = reversed >> 1
+
+	return idStart | int64(reversed), idEnd | int64(reversed), nil
+}
+
+func GetCollectionAllowInsertNonBM25FunctionOutputs(kvs []*commonpb.KeyValuePair) bool {
+	for _, kv := range kvs {
+		if kv.Key == CollectionAllowInsertNonBM25FunctionOutputs {
+			enable, _ := strconv.ParseBool(kv.Value)
+			return enable
+		}
+	}
+	return false
+}
+
+func IsAllowInsertAutoID(kvs ...*commonpb.KeyValuePair) (bool, bool) {
+	for _, kv := range kvs {
+		if kv.Key == AllowInsertAutoIDKey {
+			enable, _ := strconv.ParseBool(kv.Value)
+			return enable, true
+		}
+	}
+	return false, false
 }

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -14,9 +15,11 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/contextutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -31,6 +34,8 @@ func RecoverBalancer(
 	incomingNewChannel ...string, // Concurrent incoming new channel directly from the configuration.
 	// we should add a rpc interface for creating new incoming new channel.
 ) (Balancer, error) {
+	sort.Strings(incomingNewChannel)
+
 	policyBuilder := mustGetPolicy(paramtable.Get().StreamingCfg.WALBalancerPolicyName.GetValue())
 	policy := policyBuilder.Build()
 	logger := resource.Resource().Logger().With(log.FieldComponent("balancer"), zap.String("policy", policyBuilder.Name()))
@@ -80,6 +85,20 @@ func (b *balancerImpl) RegisterStreamingEnabledNotifier(notifier *syncutil.Async
 	b.channelMetaManager.RegisterStreamingEnabledNotifier(notifier)
 }
 
+func (b *balancerImpl) GetLatestChannelAssignment() (*WatchChannelAssignmentsCallbackParam, error) {
+	if !b.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, status.NewOnShutdownError("balancer is closing")
+	}
+	defer b.lifetime.Done()
+
+	return b.channelMetaManager.GetLatestChannelAssignment()
+}
+
+// ReplicateRole returns the replicate role of the balancer.
+func (b *balancerImpl) ReplicateRole() replicateutil.Role {
+	return b.channelMetaManager.ReplicateRole()
+}
+
 // GetAllStreamingNodes fetches all streaming node info.
 func (b *balancerImpl) GetAllStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error) {
 	return resource.Resource().StreamingNodeManagerClient().GetAllStreamingNodes(ctx)
@@ -91,7 +110,7 @@ func (b *balancerImpl) GetLatestWALLocated(ctx context.Context, pchannel string)
 }
 
 // WatchChannelAssignments watches the balance result.
-func (b *balancerImpl) WatchChannelAssignments(ctx context.Context, cb func(version typeutil.VersionInt64Pair, relations []types.PChannelInfoAssigned) error) error {
+func (b *balancerImpl) WatchChannelAssignments(ctx context.Context, cb WatchChannelAssignmentsCallback) error {
 	if !b.lifetime.Add(typeutil.LifetimeStateWorking) {
 		return status.NewOnShutdownError("balancer is closing")
 	}
@@ -100,6 +119,22 @@ func (b *balancerImpl) WatchChannelAssignments(ctx context.Context, cb func(vers
 	ctx, cancel := contextutil.MergeContext(ctx, b.ctx)
 	defer cancel()
 	return b.channelMetaManager.WatchAssignmentResult(ctx, cb)
+}
+
+// UpdateReplicateConfiguration updates the replicate configuration.
+func (b *balancerImpl) UpdateReplicateConfiguration(ctx context.Context, msgs ...message.ImmutableAlterReplicateConfigMessageV2) error {
+	if !b.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return status.NewOnShutdownError("balancer is closing")
+	}
+	defer b.lifetime.Done()
+
+	ctx, cancel := contextutil.MergeContext(ctx, b.ctx)
+	defer cancel()
+
+	if err := b.channelMetaManager.UpdateReplicateConfiguration(ctx, msgs...); err != nil {
+		return err
+	}
+	return nil
 }
 
 // UpdateBalancePolicy update the balance policy.
@@ -217,6 +252,8 @@ func (b *balancerImpl) execute(ready260Future *syncutil.Future[error]) {
 				return // nodeChanged is only closed if context cancel.
 				// in other word, balancer is closed.
 			}
+			// trigger the watch update.
+			b.channelMetaManager.TriggerWatchUpdate()
 			// balance triggered by new streaming node changed.
 		case <-channelChanged.WaitChan():
 			// balance triggered by channel changed.

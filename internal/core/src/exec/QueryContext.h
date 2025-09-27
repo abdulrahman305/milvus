@@ -178,6 +178,7 @@ class QueryContext : public Context {
                  milvus::Timestamp timestamp,
                  milvus::Timestamp collection_ttl = 0,
                  int32_t consistency_level = 0,
+                 const query::PlanOptions& plan_options = query::PlanOptions(),
                  std::shared_ptr<QueryConfig> query_config =
                      std::make_shared<QueryConfig>(),
                  folly::Executor* executor = nullptr,
@@ -191,7 +192,8 @@ class QueryContext : public Context {
           collection_ttl_timestamp_(collection_ttl),
           query_config_(query_config),
           executor_(executor),
-          consistency_level_(consistency_level) {
+          consistency_level_(consistency_level),
+          plan_options_(plan_options) {
     }
 
     folly::Executor*
@@ -279,9 +281,24 @@ class QueryContext : public Context {
         return std::move(retrieve_result_);
     }
 
+    void
+    set_op_context(milvus::OpContext* op_context) {
+        op_context_ = op_context;
+    }
+
+    milvus::OpContext*
+    get_op_context() {
+        return op_context_;
+    }
+
     int32_t
     get_consistency_level() {
         return consistency_level_;
+    }
+
+    const query::PlanOptions&
+    get_plan_options() const {
+        return plan_options_;
     }
 
  private:
@@ -306,7 +323,12 @@ class QueryContext : public Context {
     milvus::SearchResult search_result_;
     milvus::RetrieveResult retrieve_result_;
 
+    // used for save op context
+    milvus::OpContext* op_context_{nullptr};
+
     int32_t consistency_level_ = 0;
+
+    query::PlanOptions plan_options_;
 };
 
 // Represent the state of one thread of query execution.

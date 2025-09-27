@@ -37,6 +37,8 @@ const (
 	defaultEtcdLogPath        = "stdout"
 	KafkaProducerConfigPrefix = "kafka.producer."
 	KafkaConsumerConfigPrefix = "kafka.consumer."
+
+	defaultLocalStoragePath = "/var/lib/milvus/data"
 )
 
 // ServiceParam is used to quickly and easily access all basic service configurations.
@@ -462,7 +464,7 @@ func (p *LocalStorageConfig) Init(base *BaseTable) {
 	p.Path = ParamItem{
 		Key:          "localStorage.path",
 		Version:      "2.0.0",
-		DefaultValue: "/var/lib/milvus/data",
+		DefaultValue: defaultLocalStoragePath,
 		Doc: `Local path to where vector data are stored during a search or a query to avoid repetitve access to MinIO or S3 service.
 Caution: Changing this parameter after using Milvus for a period of time will affect your access to old data.
 It is recommended to change this parameter before starting Milvus for the first time.`,
@@ -896,8 +898,8 @@ func (p *WoodpeckerConfig) Init(base *BaseTable) {
 	p.RootPath = ParamItem{
 		Key:          "woodpecker.storage.rootPath",
 		Version:      "2.6.0",
-		DefaultValue: "/var/lib/milvus/woodpecker",
-		Doc:          "The root path of the storage provider.",
+		DefaultValue: "default",
+		Doc:          "The root path of the storage provider. If set to 'default', uses localStorage.path as base directory and creates a woodpecker subdirectory. Otherwise, specifies a custom woodpecker data storage directory.",
 		Export:       true,
 	}
 	p.RootPath.Init(base.mgr)
@@ -1080,19 +1082,20 @@ The retention policy of pulsar can set shorter to save the storage space in this
 
 // --- kafka ---
 type KafkaConfig struct {
-	Address             ParamItem  `refreshable:"false"`
-	SaslUsername        ParamItem  `refreshable:"false"`
-	SaslPassword        ParamItem  `refreshable:"false"`
-	SaslMechanisms      ParamItem  `refreshable:"false"`
-	SecurityProtocol    ParamItem  `refreshable:"false"`
-	KafkaUseSSL         ParamItem  `refreshable:"false"`
-	KafkaTLSCert        ParamItem  `refreshable:"false"`
-	KafkaTLSKey         ParamItem  `refreshable:"false"`
-	KafkaTLSCACert      ParamItem  `refreshable:"false"`
-	KafkaTLSKeyPassword ParamItem  `refreshable:"false"`
-	ConsumerExtraConfig ParamGroup `refreshable:"false"`
-	ProducerExtraConfig ParamGroup `refreshable:"false"`
-	ReadTimeout         ParamItem  `refreshable:"true"`
+	Address              ParamItem  `refreshable:"false"`
+	SaslUsername         ParamItem  `refreshable:"false"`
+	SaslPassword         ParamItem  `refreshable:"false"`
+	SaslMechanisms       ParamItem  `refreshable:"false"`
+	SecurityProtocol     ParamItem  `refreshable:"false"`
+	KafkaUseSSL          ParamItem  `refreshable:"false"`
+	KafkaTLSCert         ParamItem  `refreshable:"false"`
+	KafkaTLSKey          ParamItem  `refreshable:"false"`
+	KafkaTLSCACert       ParamItem  `refreshable:"false"`
+	KafkaTLSKeyPassword  ParamItem  `refreshable:"false"`
+	ConsumerExtraConfig  ParamGroup `refreshable:"false"`
+	ProducerExtraConfig  ParamGroup `refreshable:"false"`
+	ReadTimeout          ParamItem  `refreshable:"true"`
+	QueuedMessagesKbytes ParamItem  `refreshable:"false"`
 }
 
 func (k *KafkaConfig) Init(base *BaseTable) {
@@ -1197,6 +1200,14 @@ func (k *KafkaConfig) Init(base *BaseTable) {
 		Export:       true,
 	}
 	k.ReadTimeout.Init(base.mgr)
+
+	k.QueuedMessagesKbytes = ParamItem{
+		Key:          "kafka.queuedmaxkbytes",
+		DefaultValue: "100000", // 100MB in kilo bytes
+		Version:      "2.1.0",
+		Export:       true,
+	}
+	k.QueuedMessagesKbytes.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -1502,7 +1513,7 @@ Leave it empty if you want to use AWS default endpoint`,
 		Version:      "2.3.0",
 		DefaultValue: DefaultMinioUseVirtualHost,
 		PanicIfEmpty: false,
-		Doc:          "Whether use virtual host mode for bucket",
+		Doc:          "Whether use virtual host mode for bucket. WARNING: For Aliyun OSS and Tencent COS, this parameter is useless and is set to true by default",
 		Export:       true,
 	}
 	p.UseVirtualHost.Init(base.mgr)
@@ -1540,7 +1551,8 @@ func (p *ProfileConfig) Init(base *BaseTable) {
 		Doc:          "The folder that storing pprof files, by default will use localStoragePath/pprof",
 		Formatter: func(v string) string {
 			if len(v) == 0 {
-				return path.Join(base.Get("localStorage.path"), "pprof")
+				localStoragePath := getLocalStoragePath(base)
+				return path.Join(localStoragePath, "pprof")
 			}
 			return v
 		},

@@ -12,12 +12,12 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/client"
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
-	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -31,6 +31,7 @@ func newWALAccesser(c *clientv3.Client) *walAccesserImpl {
 	handlerClient := handler.NewHandlerClient(streamingCoordClient.Assignment())
 	w := &walAccesserImpl{
 		lifetime:             typeutil.NewLifetime(),
+		clusterID:            paramtable.Get().CommonCfg.ClusterPrefix.GetValue(),
 		streamingCoordClient: streamingCoordClient,
 		handlerClient:        handlerClient,
 		producerMutex:        sync.Mutex{},
@@ -47,7 +48,8 @@ func newWALAccesser(c *clientv3.Client) *walAccesserImpl {
 // walAccesserImpl is the implementation of WALAccesser.
 type walAccesserImpl struct {
 	log.Binder
-	lifetime *typeutil.Lifetime
+	lifetime  *typeutil.Lifetime
+	clusterID string
 
 	// All services
 	streamingCoordClient client.Client
@@ -59,16 +61,25 @@ type walAccesserImpl struct {
 	dispatchExecutionPool *conc.Pool[struct{}]
 }
 
+func (w *walAccesserImpl) Replicate() ReplicateService {
+	return replicateService{w}
+}
+
 func (w *walAccesserImpl) Balancer() Balancer {
 	return balancerImpl{w}
 }
 
-func (w *walAccesserImpl) WALName() string {
-	return util.MustSelectWALName()
-}
-
 func (w *walAccesserImpl) Local() Local {
 	return localServiceImpl{w}
+}
+
+// ControlChannel returns the control channel name of the wal.
+func (w *walAccesserImpl) ControlChannel() string {
+	last, err := w.streamingCoordClient.Assignment().GetLatestAssignments(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	return funcutil.GetControlChannel(last.PChannelOfCChannel())
 }
 
 // RawAppend writes a record to the log.
@@ -84,7 +95,7 @@ func (w *walAccesserImpl) RawAppend(ctx context.Context, msg message.MutableMess
 }
 
 // Read returns a scanner for reading records from the wal.
-func (w *walAccesserImpl) Read(_ context.Context, opts ReadOption) Scanner {
+func (w *walAccesserImpl) Read(ctx context.Context, opts ReadOption) Scanner {
 	if !w.lifetime.Add(typeutil.LifetimeStateWorking) {
 		newErrScanner(ErrWALAccesserClosed)
 	}
