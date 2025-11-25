@@ -288,6 +288,7 @@ type commonConfig struct {
 	Stv2SystemColumnIncludeClusteringKey ParamItem `refreshable:"true"`
 	Stv2SplitByAvgSize                   ParamItem `refreshable:"true"`
 	Stv2SplitAvgSizeThreshold            ParamItem `refreshable:"true"`
+	UseLoonFFI                           ParamItem `refreshable:"true"`
 
 	StoragePathPrefix         ParamItem `refreshable:"false"`
 	StorageZstdConcurrency    ParamItem `refreshable:"false"`
@@ -700,7 +701,7 @@ The options include 'direct' and 'buffered'. The default value is 'buffered'.`,
 		Key:          "common.diskWriteBufferSizeKb",
 		Version:      "2.6.0",
 		DefaultValue: "64",
-		Doc: `Disk write buffer size in KB, only used when disk write mode is 'direct', default is 64KB.
+		Doc: `Disk write buffer size in KB, used for both 'direct' and 'buffered' modes, default is 64KB.
 Current valid range is [4, 65536]. If the value is not aligned to 4KB, it will be rounded up to the nearest multiple of 4KB.`,
 		Export: true,
 	}
@@ -846,7 +847,7 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 	p.SessionTTL = ParamItem{
 		Key:          "common.session.ttl",
 		Version:      "2.0.0",
-		DefaultValue: "10",
+		DefaultValue: "30",
 		Doc:          "ttl value when session granting a lease to register service",
 		Export:       true,
 	}
@@ -937,6 +938,14 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 		Export:       true,
 	}
 	p.EnableStorageV2.Init(base.mgr)
+
+	p.UseLoonFFI = ParamItem{
+		Key:          "common.storage.useLoonFFI",
+		Version:      "2.6.7",
+		DefaultValue: "false",
+		Export:       true,
+	}
+	p.UseLoonFFI.Init(base.mgr)
 
 	p.Stv2SplitSystemColumn = ParamItem{
 		Key:          "common.storage.stv2.splitSystemColumn.enabled",
@@ -1209,28 +1218,31 @@ This helps Milvus-CDC synchronize incremental data`,
 	p.EnabledOptimizeExpr.Init(base.mgr)
 
 	p.UsingJSONStatsForQuery = ParamItem{
-		Key:          "common.UsingJSONStatsForQuery",
-		Version:      "2.5.6",
+		Key:          "common.usingJSONShreddingForQuery",
+		Version:      "2.6.5",
 		DefaultValue: "true",
 		Doc:          "Indicates whether to use json stats when query",
+		FallbackKeys: []string{"common.UsingJSONStatsForQuery"},
 		Export:       true,
 	}
 	p.UsingJSONStatsForQuery.Init(base.mgr)
 
 	p.EnabledJSONKeyStats = ParamItem{
-		Key:          "common.enabledJSONKeyStats",
-		Version:      "2.5.5",
+		Key:          "common.enabledJSONShredding",
+		Version:      "2.6.5",
 		DefaultValue: "true",
 		Doc:          "Indicates sealedsegment whether to enable JSON key stats",
+		FallbackKeys: []string{"common.enabledJSONKeyStats"},
 		Export:       true,
 	}
 	p.EnabledJSONKeyStats.Init(base.mgr)
 
 	p.EnabledGrowingSegmentJSONKeyStats = ParamItem{
-		Key:          "common.enabledGrowingSegmentJSONKeyStats",
-		Version:      "2.5.5",
+		Key:          "common.enabledGrowingSegmentJSONShredding",
+		Version:      "2.6.5",
 		DefaultValue: "false",
 		Doc:          "Indicates growingsegment whether to enable JSON key stats",
+		FallbackKeys: []string{"common.enabledGrowingSegmentJSONKeyStats"},
 		Export:       true,
 	}
 	p.EnabledGrowingSegmentJSONKeyStats.Init(base.mgr)
@@ -1873,13 +1885,13 @@ func (p *proxyConfig) init(base *BaseTable) {
 		Version:      "2.4.0",
 		DefaultValue: "4",
 		PanicIfEmpty: true,
-		Doc:          "The maximum number of vector fields that can be specified in a collection. Value range: [1, 10].",
+		Doc:          "The maximum number of vector fields that can be specified in a collection",
 		Export:       true,
 	}
 	p.MaxVectorFieldNum.Init(base.mgr)
 
-	if p.MaxVectorFieldNum.GetAsInt() > 10 || p.MaxVectorFieldNum.GetAsInt() <= 0 {
-		panic(fmt.Sprintf("Maximum number of vector fields in a collection should be in (0, 10], not %d", p.MaxVectorFieldNum.GetAsInt()))
+	if p.MaxVectorFieldNum.GetAsInt() <= 0 {
+		panic("Maximum number of vector fields in a collection can't be negative")
 	}
 
 	p.MaxShardNum = ParamItem{
@@ -3037,8 +3049,8 @@ type queryNodeConfig struct {
 	StatsPublishInterval ParamItem `refreshable:"true"`
 
 	// segcore
-	KnowhereFetchThreadPoolSize   ParamItem `refreshable:"false"`
-	KnowhereThreadPoolSize        ParamItem `refreshable:"false"`
+	KnowhereFetchThreadPoolSize   ParamItem `refreshable:"true"`
+	KnowhereThreadPoolSize        ParamItem `refreshable:"true"`
 	ChunkRows                     ParamItem `refreshable:"false"`
 	EnableInterminSegmentIndex    ParamItem `refreshable:"false"`
 	InterimIndexNlist             ParamItem `refreshable:"false"`
@@ -3052,6 +3064,7 @@ type queryNodeConfig struct {
 	InterimIndexMemExpandRate     ParamItem `refreshable:"false"`
 	InterimIndexBuildParallelRate ParamItem `refreshable:"false"`
 	MultipleChunkedEnable         ParamItem `refreshable:"false"` // Deprecated
+	EnableGeometryCache           ParamItem `refreshable:"false"`
 
 	// TODO(tiered storage 2) this should be refreshable?
 	TieredWarmupScalarField         ParamItem `refreshable:"false"`
@@ -3495,13 +3508,13 @@ If set to 0, time based eviction is disabled.`,
 		Version:      "2.0.0",
 		DefaultValue: "4",
 		Formatter: func(v string) string {
-			factor := getAsInt64(v)
+			factor := getAsFloat(v)
 			if factor <= 0 || !p.EnableDisk.GetAsBool() {
 				factor = 1
 			} else if factor > 32 {
 				factor = 32
 			}
-			knowhereThreadPoolSize := uint32(hardware.GetCPUNum()) * uint32(factor)
+			knowhereThreadPoolSize := uint32(float64(hardware.GetCPUNum()) * factor)
 			return strconv.FormatUint(uint64(knowhereThreadPoolSize), 10)
 		},
 		Doc:    "The number of threads in knowhere's thread pool. If disk is enabled, the pool size will multiply with knowhereThreadPoolNumRatio([1, 32]).",
@@ -3512,15 +3525,19 @@ If set to 0, time based eviction is disabled.`,
 	p.KnowhereFetchThreadPoolSize = ParamItem{
 		Key:          "queryNode.segcore.knowhereFetchThreadPoolNumRatio",
 		Version:      "2.6.0",
-		DefaultValue: "4",
+		DefaultValue: "16",
 		Formatter: func(v string) string {
-			factor := getAsInt64(v)
+			factor := getAsFloat(v)
 			if factor <= 0 {
 				factor = 1
 			} else if factor > 32 {
 				factor = 32
 			}
-			knowhereFetchThreadPoolSize := uint32(hardware.GetCPUNum()) * uint32(factor)
+			knowhereFetchThreadPoolSize := uint32(float64(hardware.GetCPUNum()) * factor)
+			// avoid too many threads
+			if knowhereFetchThreadPoolSize > 100 {
+				knowhereFetchThreadPoolSize = 100
+			}
 			return strconv.FormatUint(uint64(knowhereFetchThreadPoolSize), 10)
 		},
 		Doc:    "The number of threads in knowhere's fetch thread pool for object storage. The pool size will multiply with knowhereThreadPoolNumRatio([1, 32])",
@@ -3626,6 +3643,15 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 		Export:       true,
 	}
 	p.MultipleChunkedEnable.Init(base.mgr)
+
+	p.EnableGeometryCache = ParamItem{
+		Key:          "queryNode.segcore.enableGeometryCache",
+		Version:      "2.6.5",
+		DefaultValue: "false",
+		Doc:          "Enable geometry cache for geometry data",
+		Export:       true,
+	}
+	p.EnableGeometryCache.Init(base.mgr)
 
 	p.InterimIndexNProbe = ParamItem{
 		Key:     "queryNode.segcore.interimIndex.nprobe",
@@ -3803,10 +3829,11 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapScalarIndex.Init(base.mgr)
 
 	p.MmapJSONStats = ParamItem{
-		Key:          "queryNode.mmap.jsonStats",
-		Version:      "2.6.1",
+		Key:          "queryNode.mmap.jsonShredding",
+		Version:      "2.6.5",
 		DefaultValue: "true",
 		Doc:          "Enable mmap for loading json stats",
+		FallbackKeys: []string{"queryNode.mmap.jsonStats"},
 		Export:       true,
 	}
 	p.MmapJSONStats.Init(base.mgr)
@@ -5539,20 +5566,22 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	p.SortCompactionTriggerCount.Init(base.mgr)
 
 	p.JSONStatsTriggerCount = ParamItem{
-		Key:          "dataCoord.jsonStatsTriggerCount",
-		Version:      "2.5.5",
+		Key:          "dataCoord.jsonShreddingTriggerCount",
+		Version:      "2.6.5",
 		Doc:          "jsonkey stats task count per trigger",
 		DefaultValue: "10",
+		FallbackKeys: []string{"dataCoord.jsonStatsTriggerCount"},
 		PanicIfEmpty: false,
 		Export:       true,
 	}
 	p.JSONStatsTriggerCount.Init(base.mgr)
 
 	p.JSONStatsTriggerInterval = ParamItem{
-		Key:          "dataCoord.jsonStatsTriggerInterval",
-		Version:      "2.5.5",
+		Key:          "dataCoord.jsonShreddingTriggerInterval",
+		Version:      "2.6.5",
 		Doc:          "jsonkey task interval per trigger",
 		DefaultValue: "10",
+		FallbackKeys: []string{"dataCoord.jsonStatsTriggerInterval"},
 		PanicIfEmpty: false,
 		Export:       true,
 	}
@@ -5569,11 +5598,12 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	p.RequestTimeoutSeconds.Init(base.mgr)
 
 	p.JSONStatsMaxShreddingColumns = ParamItem{
-		Key:          "dataCoord.jsonStatsMaxShreddingColumns",
-		Version:      "2.6.1",
+		Key:          "dataCoord.jsonShreddingMaxColumns",
+		Version:      "2.6.5",
 		DefaultValue: "1024",
 		Doc:          "the max number of columns to shred",
 		Export:       true,
+		FallbackKeys: []string{"dataCoord.jsonStatsMaxShreddingColumns"},
 		Formatter: func(value string) string {
 			v := getAsInt(value)
 			if v > 10000 {
@@ -5585,19 +5615,21 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	p.JSONStatsMaxShreddingColumns.Init(base.mgr)
 
 	p.JSONStatsShreddingRatioThreshold = ParamItem{
-		Key:          "dataCoord.jsonStatsShreddingRatioThreshold",
-		Version:      "2.6.1",
+		Key:          "dataCoord.jsonShreddingRatioThreshold",
+		Version:      "2.6.5",
 		DefaultValue: "0.3",
 		Doc:          "the ratio threshold to shred",
+		FallbackKeys: []string{"dataCoord.jsonStatsShreddingRatioThreshold"},
 		Export:       true,
 	}
 	p.JSONStatsShreddingRatioThreshold.Init(base.mgr)
 
 	p.JSONStatsWriteBatchSize = ParamItem{
-		Key:          "dataCoord.jsonStatsWriteBatchSize",
-		Version:      "2.6.1",
+		Key:          "dataCoord.jsonShreddingWriteBatchSize",
+		Version:      "2.6.5",
 		DefaultValue: "81920",
 		Doc:          "the batch size to write",
+		FallbackKeys: []string{"dataCoord.jsonStatsWriteBatchSize"},
 		Export:       true,
 	}
 	p.JSONStatsWriteBatchSize.Init(base.mgr)
@@ -6190,9 +6222,6 @@ type streamingConfig struct {
 	WALRecoveryPersistInterval      ParamItem `refreshable:"true"`
 	WALRecoveryMaxDirtyMessage      ParamItem `refreshable:"true"`
 	WALRecoveryGracefulCloseTimeout ParamItem `refreshable:"true"`
-
-	WALTruncateSampleInterval    ParamItem `refreshable:"true"`
-	WALTruncateRetentionInterval ParamItem `refreshable:"true"`
 }
 
 func (p *streamingConfig) init(base *BaseTable) {
@@ -6335,8 +6364,8 @@ it also determine the depth of depth first search method that is used to find th
 	p.WALBroadcasterConcurrencyRatio = ParamItem{
 		Key:          "streaming.walBroadcaster.concurrencyRatio",
 		Version:      "2.5.4",
-		Doc:          `The concurrency ratio based on number of CPU for wal broadcaster, 1 by default.`,
-		DefaultValue: "1",
+		Doc:          `The concurrency ratio based on number of CPU for wal broadcaster, 4 by default.`,
+		DefaultValue: "4",
 		Export:       true,
 	}
 	p.WALBroadcasterConcurrencyRatio.Init(base.mgr)
@@ -6355,10 +6384,10 @@ too few tombstones may lead to ABA issues in the state of milvus cluster.`,
 	p.WALBroadcasterTombstoneMaxCount = ParamItem{
 		Key:     "streaming.walBroadcaster.tombstone.maxCount",
 		Version: "2.6.0",
-		Doc: `The max count of tombstone, 256 by default. 
+		Doc: `The max count of tombstone, 8192 by default. 
 Tombstone is used to reject duplicate submissions of DDL messages,
 too few tombstones may lead to ABA issues in the state of milvus cluster.`,
-		DefaultValue: "256",
+		DefaultValue: "8192",
 		Export:       false,
 	}
 	p.WALBroadcasterTombstoneMaxCount.Init(base.mgr)
@@ -6366,10 +6395,10 @@ too few tombstones may lead to ABA issues in the state of milvus cluster.`,
 	p.WALBroadcasterTombstoneMaxLifetime = ParamItem{
 		Key:     "streaming.walBroadcaster.tombstone.maxLifetime",
 		Version: "2.6.0",
-		Doc: `The max lifetime of tombstone, 30m by default.
+		Doc: `The max lifetime of tombstone, 24h by default.
 Tombstone is used to reject duplicate submissions of DDL messages,
 too few tombstones may lead to ABA issues in the state of milvus cluster.`,
-		DefaultValue: "30m",
+		DefaultValue: "24h",
 		Export:       false,
 	}
 	p.WALBroadcasterTombstoneMaxLifetime.Init(base.mgr)
@@ -6517,32 +6546,6 @@ If that persist operation exceeds this timeout, the wal recovery module will clo
 		Export:       true,
 	}
 	p.WALRecoveryGracefulCloseTimeout.Init(base.mgr)
-
-	p.WALTruncateSampleInterval = ParamItem{
-		Key:     "streaming.walTruncate.sampleInterval",
-		Version: "2.6.0",
-		Doc: `The interval of sampling wal checkpoint when truncate, 30m by default.
-Every time the checkpoint is persisted, the checkpoint will be sampled and used to be a candidate of truncate checkpoint.
-More samples, more frequent truncate, more memory usage.`,
-		DefaultValue: "30m",
-		Export:       true,
-	}
-	p.WALTruncateSampleInterval.Init(base.mgr)
-
-	p.WALTruncateRetentionInterval = ParamItem{
-		Key:     "streaming.walTruncate.retentionInterval",
-		Version: "2.6.0",
-		Doc: `The retention interval of wal truncate, 72h by default.
-If the sampled checkpoint is older than this interval, it will be used to truncate wal checkpoint.
-Greater the interval, more wal storage usage, more redundant data in wal.
-Because current query path doesn't promise the read operation not happen before the truncate point,
-retention interval should be greater than the dataCoord.segment.maxLife to avoid the message lost at query path.
-If the wal is pulsar, the pulsar should close the subscription expiration to avoid the message lost.
-because the wal truncate operation is implemented by pulsar consumer.`,
-		DefaultValue: "72h",
-		Export:       true,
-	}
-	p.WALTruncateRetentionInterval.Init(base.mgr)
 }
 
 // runtimeConfig is just a private environment value table.

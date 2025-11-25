@@ -1058,7 +1058,7 @@ func TestCatalog_AlterCollection(t *testing.T) {
 		kc := NewCatalog(nil, snapshot).(*Catalog)
 		ctx := context.Background()
 		var collectionID int64 = 1
-		oldC := &model.Collection{CollectionID: collectionID, State: pb.CollectionState_CollectionCreating}
+		oldC := &model.Collection{CollectionID: collectionID, State: pb.CollectionState_CollectionCreated}
 		newC := &model.Collection{CollectionID: collectionID, State: pb.CollectionState_CollectionCreated, UpdateTimestamp: rand.Uint64()}
 		err := kc.AlterCollection(ctx, oldC, newC, metastore.MODIFY, 0, true)
 		assert.NoError(t, err)
@@ -1073,11 +1073,55 @@ func TestCatalog_AlterCollection(t *testing.T) {
 		assert.Equal(t, newC.UpdateTimestamp, got.UpdateTimestamp)
 	})
 
+	t.Run("modify EnableDynamicField and SchemaVersion", func(t *testing.T) {
+		snapshot := kv.NewMockSnapshotKV()
+		kvs := map[string]string{}
+		snapshot.SaveFunc = func(ctx context.Context, key string, value string, ts typeutil.Timestamp) error {
+			kvs[key] = value
+			return nil
+		}
+		snapshot.MultiSaveFunc = func(ctx context.Context, saveKvs map[string]string, _ typeutil.Timestamp) error {
+			for k, v := range saveKvs {
+				kvs[k] = v
+			}
+			return nil
+		}
+		kc := NewCatalog(nil, snapshot).(*Catalog)
+		ctx := context.Background()
+		var collectionID int64 = 1
+		oldC := &model.Collection{
+			CollectionID:       collectionID,
+			State:              pb.CollectionState_CollectionCreated,
+			EnableDynamicField: false,
+			SchemaVersion:      1,
+		}
+		newC := &model.Collection{
+			CollectionID:       collectionID,
+			State:              pb.CollectionState_CollectionCreated,
+			EnableDynamicField: true,
+			SchemaVersion:      2,
+			UpdateTimestamp:    rand.Uint64(),
+		}
+		err := kc.AlterCollection(ctx, oldC, newC, metastore.MODIFY, 0, true)
+		assert.NoError(t, err)
+		key := BuildCollectionKey(0, collectionID)
+		value, ok := kvs[key]
+		assert.True(t, ok)
+		var collPb pb.CollectionInfo
+		err = proto.Unmarshal([]byte(value), &collPb)
+		assert.NoError(t, err)
+		got := model.UnmarshalCollectionModel(&collPb)
+		assert.Equal(t, pb.CollectionState_CollectionCreated, got.State)
+		assert.Equal(t, newC.UpdateTimestamp, got.UpdateTimestamp)
+		assert.Equal(t, newC.EnableDynamicField, got.EnableDynamicField)
+		assert.Equal(t, newC.SchemaVersion, got.SchemaVersion)
+	})
+
 	t.Run("modify, tenant id changed", func(t *testing.T) {
 		kc := NewCatalog(nil, nil)
 		ctx := context.Background()
 		var collectionID int64 = 1
-		oldC := &model.Collection{TenantID: "1", CollectionID: collectionID, State: pb.CollectionState_CollectionCreating}
+		oldC := &model.Collection{TenantID: "1", CollectionID: collectionID, State: pb.CollectionState_CollectionCreated}
 		newC := &model.Collection{TenantID: "2", CollectionID: collectionID, State: pb.CollectionState_CollectionCreated}
 		err := kc.AlterCollection(ctx, oldC, newC, metastore.MODIFY, 0, true)
 		assert.Error(t, err)
@@ -1114,6 +1158,29 @@ func TestCatalog_AlterCollection(t *testing.T) {
 		}
 		oldC := &model.Collection{DBID: 0, CollectionID: collectionID, State: pb.CollectionState_CollectionCreated, Fields: fields}
 		newC := &model.Collection{DBID: 0, CollectionID: collectionID, State: pb.CollectionState_CollectionCreated, Fields: fields}
+		err := kc.AlterCollection(ctx, oldC, newC, metastore.MODIFY, 0, true)
+		assert.NoError(t, err)
+	})
+
+	t.Run("modify function", func(t *testing.T) {
+		var collectionID int64 = 1
+		snapshot := kv.NewMockSnapshotKV()
+		snapshot.MultiSaveFunc = func(ctx context.Context, saves map[string]string, ts typeutil.Timestamp) error {
+			assert.LessOrEqual(t, len(saves), 64)
+			return nil
+		}
+
+		kc := NewCatalog(nil, snapshot).(*Catalog)
+		ctx := context.Background()
+
+		functions := []*model.Function{
+			{
+				Name: "test_function",
+			},
+		}
+
+		oldC := &model.Collection{DBID: 0, CollectionID: collectionID, State: pb.CollectionState_CollectionCreated}
+		newC := &model.Collection{DBID: 0, CollectionID: collectionID, State: pb.CollectionState_CollectionCreated, Functions: functions}
 		err := kc.AlterCollection(ctx, oldC, newC, metastore.MODIFY, 0, true)
 		assert.NoError(t, err)
 	})
@@ -1267,7 +1334,7 @@ func TestCatalog_CreateCollection(t *testing.T) {
 		mockSnapshot := newMockSnapshot(t, withMockSave(errors.New("error mock Save")))
 		kc := NewCatalog(nil, mockSnapshot)
 		ctx := context.Background()
-		coll := &model.Collection{State: pb.CollectionState_CollectionCreating}
+		coll := &model.Collection{State: pb.CollectionState_CollectionCreated}
 		err := kc.CreateCollection(ctx, coll, 100)
 		assert.Error(t, err)
 	})
@@ -1280,7 +1347,7 @@ func TestCatalog_CreateCollection(t *testing.T) {
 			Partitions: []*model.Partition{
 				{PartitionName: "test"},
 			},
-			State: pb.CollectionState_CollectionCreating,
+			State: pb.CollectionState_CollectionCreated,
 		}
 		err := kc.CreateCollection(ctx, coll, 100)
 		assert.Error(t, err)
@@ -1294,7 +1361,7 @@ func TestCatalog_CreateCollection(t *testing.T) {
 			Partitions: []*model.Partition{
 				{PartitionName: "test"},
 			},
-			State: pb.CollectionState_CollectionCreating,
+			State: pb.CollectionState_CollectionCreated,
 		}
 		err := kc.CreateCollection(ctx, coll, 100)
 		assert.NoError(t, err)
@@ -1349,7 +1416,7 @@ func TestCatalog_CreateCollection(t *testing.T) {
 					OutputFieldNames: []string{"sparse"},
 				},
 			},
-			State: pb.CollectionState_CollectionCreating,
+			State: pb.CollectionState_CollectionCreated,
 		}
 		err := kc.CreateCollection(ctx, coll, 100)
 		assert.NoError(t, err)

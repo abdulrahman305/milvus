@@ -42,110 +42,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-type IterativeRecordReader struct {
-	cur     RecordReader
-	iterate func() (RecordReader, error)
-}
-
-// Close implements RecordReader.
-func (ir *IterativeRecordReader) Close() error {
-	if ir.cur != nil {
-		return ir.cur.Close()
-	}
-	return nil
-}
-
-var _ RecordReader = (*IterativeRecordReader)(nil)
-
-func (ir *IterativeRecordReader) Next() (Record, error) {
-	if ir.cur == nil {
-		r, err := ir.iterate()
-		if err != nil {
-			return nil, err
-		}
-		ir.cur = r
-	}
-	rec, err := ir.cur.Next()
-	if err == io.EOF {
-		closeErr := ir.cur.Close()
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		ir.cur, err = ir.iterate()
-		if err != nil {
-			return nil, err
-		}
-		rec, err = ir.cur.Next()
-	}
-	return rec, err
-}
-
-// ChunkedBlobsReader returns a chunk composed of blobs, or io.EOF if no more data
-type ChunkedBlobsReader func() ([]*Blob, error)
-
-type CompositeBinlogRecordReader struct {
-	fields map[FieldID]*schemapb.FieldSchema
-	index  map[FieldID]int16
-	brs    []*BinlogReader
-	rrs    []array.RecordReader
-}
-
-var _ RecordReader = (*CompositeBinlogRecordReader)(nil)
-
-func (crr *CompositeBinlogRecordReader) Next() (Record, error) {
-	recs := make([]arrow.Array, len(crr.fields))
-	nonExistingFields := make([]*schemapb.FieldSchema, 0)
-	nRows := 0
-	for _, f := range crr.fields {
-		idx := crr.index[f.FieldID]
-		if crr.rrs[idx] != nil {
-			if ok := crr.rrs[idx].Next(); !ok {
-				return nil, io.EOF
-			}
-			r := crr.rrs[idx].Record()
-			recs[idx] = r.Column(0)
-			if nRows == 0 {
-				nRows = int(r.NumRows())
-			}
-			if nRows != int(r.NumRows()) {
-				return nil, merr.WrapErrServiceInternal(fmt.Sprintf("number of rows mismatch for field %d", f.FieldID))
-			}
-		} else {
-			nonExistingFields = append(nonExistingFields, f)
-		}
-	}
-	for _, f := range nonExistingFields {
-		// If the field is not in the current batch, fill with null array
-		arr, err := GenerateEmptyArrayFromSchema(f, nRows)
-		if err != nil {
-			return nil, err
-		}
-		recs[crr.index[f.FieldID]] = arr
-	}
-	return &compositeRecord{
-		index: crr.index,
-		recs:  recs,
-	}, nil
-}
-
-func (crr *CompositeBinlogRecordReader) Close() error {
-	if crr.brs != nil {
-		for _, er := range crr.brs {
-			if er != nil {
-				er.Close()
-			}
-		}
-	}
-	if crr.rrs != nil {
-		for _, rr := range crr.rrs {
-			if rr != nil {
-				rr.Release()
-			}
-		}
-	}
-	return nil
-}
-
 func parseBlobKey(blobKey string) (colId FieldID, logId UniqueID) {
 	if _, _, _, colId, logId, ok := metautil.ParseInsertLogPath(blobKey); ok {
 		return colId, logId
@@ -577,23 +473,10 @@ func ValueSerializer(v []*Value, schema *schemapb.CollectionSchema) (Record, err
 		builder := builders[field.FieldID]
 		arrays[i] = builder.NewArray()
 		builder.Release()
-		fields[i] = ConvertToArrowField(field, arrays[i].DataType())
+		fields[i] = ConvertToArrowField(field, arrays[i].DataType(), false)
 		field2Col[field.FieldID] = i
 	}
 	return NewSimpleArrowRecord(array.NewRecord(arrow.NewSchema(fields, nil), arrays, int64(len(v))), field2Col), nil
-}
-
-type BinlogRecordWriter interface {
-	RecordWriter
-	GetLogs() (
-		fieldBinlogs map[FieldID]*datapb.FieldBinlog,
-		statsLog *datapb.FieldBinlog,
-		bm25StatsLog map[FieldID]*datapb.FieldBinlog,
-	)
-	GetRowNum() int64
-	FlushChunk() error
-	GetBufferUncompressed() uint64
-	Schema() *schemapb.CollectionSchema
 }
 
 type ChunkedBlobsWriter func([]*Blob) error
@@ -814,8 +697,9 @@ func (c *CompositeBinlogRecordWriter) GetLogs() (
 	fieldBinlogs map[FieldID]*datapb.FieldBinlog,
 	statsLog *datapb.FieldBinlog,
 	bm25StatsLog map[FieldID]*datapb.FieldBinlog,
+	manifest string,
 ) {
-	return c.fieldBinlogs, c.statsLog, c.bm25StatsLog
+	return c.fieldBinlogs, c.statsLog, c.bm25StatsLog, ""
 }
 
 func (c *CompositeBinlogRecordWriter) GetRowNum() int64 {

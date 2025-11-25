@@ -18,20 +18,24 @@ import (
 
 // newBroadcastTaskFromProto creates a new broadcast task from the proto.
 func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadcasterMetrics, ackCallbackScheduler *ackCallbackScheduler) *broadcastTask {
-	m := metrics.NewBroadcastTask(proto.GetState())
 	msg := message.NewBroadcastMutableMessageBeforeAppend(proto.Message.Payload, proto.Message.Properties)
+	m := metrics.NewBroadcastTask(msg.MessageType(), proto.GetState(), msg.BroadcastHeader().ResourceKeys.Collect())
+
+	fixAckInfoFromProto(proto, len(msg.BroadcastHeader().VChannels))
+
 	bt := &broadcastTask{
 		mu:                   sync.Mutex{},
+		taskMetricsGuard:     m,
 		msg:                  msg,
 		task:                 proto,
 		dirty:                true, // the task is recovered from the recovery info, so it's persisted.
-		metrics:              m,
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	if isAllDone(bt.task) {
-		close(bt.allAcked)
+		bt.closeAllAcked()
 	}
 	if proto.State == streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_TOMBSTONE {
 		close(bt.done)
@@ -39,14 +43,33 @@ func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadc
 	return bt
 }
 
+// fixAckInfoFromProto fixes the recovery info of the broadcast task.
+// because the zero value of the repeated field and bytes field in proto is ignored or treated as empty value but not nil pointer,
+// so we need to fix the recovery info of the broadcast task from proto to keep the consistency of memory state.
+func fixAckInfoFromProto(proto *streamingpb.BroadcastTask, vchannelCount int) {
+	bitmap := make([]byte, vchannelCount)
+	copy(bitmap, proto.AckedVchannelBitmap)
+
+	checkpoints := make([]*streamingpb.AckedCheckpoint, vchannelCount)
+	for i, cp := range proto.AckedCheckpoints {
+		if cp != nil && cp.TimeTick == 0 {
+			cp = nil
+		}
+		checkpoints[i] = cp
+	}
+	proto.AckedVchannelBitmap = bitmap
+	proto.AckedCheckpoints = checkpoints
+}
+
 // newBroadcastTaskFromBroadcastMessage creates a new broadcast task from the broadcast message.
 func newBroadcastTaskFromBroadcastMessage(msg message.BroadcastMutableMessage, metrics *broadcasterMetrics, ackCallbackScheduler *ackCallbackScheduler) *broadcastTask {
-	m := metrics.NewBroadcastTask(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING)
+	m := metrics.NewBroadcastTask(msg.MessageType(), streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING, msg.BroadcastHeader().ResourceKeys.Collect())
 	header := msg.BroadcastHeader()
 	bt := &broadcastTask{
-		Binder: log.Binder{},
-		mu:     sync.Mutex{},
-		msg:    msg,
+		Binder:           log.Binder{},
+		taskMetricsGuard: m,
+		mu:               sync.Mutex{},
+		msg:              msg,
 		task: &streamingpb.BroadcastTask{
 			Message:             msg.IntoMessageProto(),
 			State:               streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING,
@@ -54,10 +77,10 @@ func newBroadcastTaskFromBroadcastMessage(msg message.BroadcastMutableMessage, m
 			AckedCheckpoints:    make([]*streamingpb.AckedCheckpoint, len(header.VChannels)),
 		},
 		dirty:                false,
-		metrics:              m,
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	return bt
 }
@@ -68,20 +91,22 @@ func newBroadcastTaskFromImmutableMessage(msg message.ImmutableMessage, metrics 
 	task := newBroadcastTaskFromBroadcastMessage(broadcastMsg, metrics, ackCallbackScheduler)
 	// if the task is created from the immutable message, it already has been broadcasted, so transfer its state into recovered.
 	task.task.State = streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED
-	task.metrics.ToState(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED)
+	task.ObserveStateChanged(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED)
 	return task
 }
 
 // broadcastTask is the state of the broadcast task.
 type broadcastTask struct {
 	log.Binder
+	*taskMetricsGuard
+
 	mu                       sync.Mutex
 	msg                      message.BroadcastMutableMessage
 	task                     *streamingpb.BroadcastTask
 	dirty                    bool // a flag to indicate that the task has been modified and needs to be saved into the recovery info.
-	metrics                  *taskMetricsGuard
 	done                     chan struct{}
 	allAcked                 chan struct{}
+	allAckedClosed           bool
 	guards                   *lockGuards
 	ackCallbackScheduler     *ackCallbackScheduler
 	joinAckCallbackScheduled bool // a flag to indicate that the join ack callback is scheduled.
@@ -247,10 +272,18 @@ func (b *broadcastTask) ack(ctx context.Context, msgs ...message.ImmutableMessag
 		b.joinAckCallbackScheduled = true
 	}
 	if allDone {
-		close(b.allAcked)
-		b.metrics.ObserveAckAll()
+		b.closeAllAcked()
 	}
 	return nil
+}
+
+// closeAllAcked closes the allAcked channel.
+func (b *broadcastTask) closeAllAcked() {
+	if b.allAckedClosed {
+		return
+	}
+	close(b.allAcked)
+	b.allAckedClosed = true
 }
 
 // hasControlChannel checks if the control channel is broadcasted.
@@ -338,11 +371,10 @@ func findIdxOfVChannel(vchannel string, vchannels []string) (int, error) {
 // FastAck trigger a fast ack operation when the broadcast operation is done.
 func (b *broadcastTask) FastAck(ctx context.Context, broadcastResult map[string]*types.AppendResult) error {
 	// Broadcast operation is done.
-	b.metrics.ObserveBroadcastDone()
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.ObserveBroadcastDone()
 	// because we need to wait for the streamingnode to ack the message,
 	// however, if the message is already write into wal, the message is determined,
 	// so we can make a fast ack operation here to speed up the ack operation.
@@ -416,12 +448,12 @@ func (b *broadcastTask) saveTaskIfDirty(ctx context.Context, logger *log.MLogger
 	logger = logger.With(zap.String("state", b.task.State.String()), zap.Int("ackedVChannelCount", ackedCount(b.task)))
 	if err := resource.Resource().StreamingCatalog().SaveBroadcastTask(ctx, b.Header().BroadcastID, b.task); err != nil {
 		logger.Warn("save broadcast task failed", zap.Error(err))
-		if ctx.Err() != nil {
+		if ctx.Err() == nil {
 			panic("critical error: the save broadcast task is failed before the context is done")
 		}
 		return err
 	}
-	b.metrics.ToState(b.task.State)
+	b.ObserveStateChanged(b.task.State)
 	logger.Info("save broadcast task done")
 	return nil
 }

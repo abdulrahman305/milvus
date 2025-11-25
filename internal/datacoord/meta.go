@@ -1177,6 +1177,23 @@ func UpdateCheckPointOperator(segmentID int64, checkpoints []*datapb.CheckPoint,
 	}
 }
 
+func UpdateManifest(segmentID int64, manifestPath string) UpdateOperator {
+	return func(modPack *updateSegmentPack) bool {
+		segment := modPack.Get(segmentID)
+		if segment == nil {
+			log.Ctx(context.TODO()).Warn("meta update: update manifest failed - segment not found",
+				zap.Int64("segmentID", segmentID))
+			return false
+		}
+		// skip empty manifest update and same manifest
+		if manifestPath == "" || segment.ManifestPath == manifestPath {
+			return false
+		}
+		segment.ManifestPath = manifestPath
+		return true
+	}
+}
+
 func UpdateImportedRows(segmentID int64, rows int64) UpdateOperator {
 	return func(modPack *updateSegmentPack) bool {
 		segment := modPack.Get(segmentID)
@@ -1653,6 +1670,16 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 			return nil, nil, merr.WrapErrSegmentNotFound(segmentID)
 		}
 
+		// Re-validate segment health to prevent race condition with drop collection
+		// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+		if !isSegmentHealthy(segment) {
+			log.Warn("input segment was dropped during compaction mutation",
+				zap.Int64("planID", t.GetPlanID()),
+				zap.Int64("segmentID", segmentID),
+				zap.String("state", segment.GetState().String()))
+			return nil, nil, merr.WrapErrSegmentNotFound(segmentID, "input segment was dropped")
+		}
+
 		cloned := segment.Clone()
 
 		compactFromSegInfos = append(compactFromSegInfos, cloned)
@@ -1683,6 +1710,7 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 			// visible after stats and index
 			IsInvisible:    true,
 			StorageVersion: seg.GetStorageVersion(),
+			ManifestPath:   seg.GetManifest(),
 		}
 		segment := NewSegmentInfo(segmentInfo)
 		compactToSegInfos = append(compactToSegInfos, segment)
@@ -1732,6 +1760,16 @@ func (m *meta) completeMixCompactionMutation(
 			return nil, nil, merr.WrapErrSegmentNotFound(segmentID)
 		}
 
+		// Re-validate segment health to prevent race condition with drop collection
+		// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+		if !isSegmentHealthy(segment) {
+			log.Warn("input segment was dropped during compaction mutation",
+				zap.Int64("planID", t.GetPlanID()),
+				zap.Int64("segmentID", segmentID),
+				zap.String("state", segment.GetState().String()))
+			return nil, nil, merr.WrapErrSegmentNotFound(segmentID, "input segment was dropped")
+		}
+
 		cloned := segment.Clone()
 		cloned.DroppedAt = uint64(time.Now().UnixNano())
 		cloned.Compacted = true
@@ -1773,7 +1811,8 @@ func (m *meta) completeMixCompactionMutation(
 				DmlPosition: getMinPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 					return info.GetDmlPosition()
 				})),
-				IsSorted: compactToSegment.GetIsSorted(),
+				IsSorted:     compactToSegment.GetIsSorted(),
+				ManifestPath: compactToSegment.GetManifest(),
 			})
 
 		if compactToSegmentInfo.GetNumOfRows() == 0 {
@@ -2220,6 +2259,16 @@ func (m *meta) completeSortCompactionMutation(
 		return nil, nil, merr.WrapErrSegmentNotFound(compactFromSegID)
 	}
 
+	// Re-validate segment health to prevent race condition with drop collection
+	// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+	if !isSegmentHealthy(oldSegment) {
+		log.Warn("input segment was dropped during compaction mutation",
+			zap.Int64("planID", t.GetPlanID()),
+			zap.Int64("segmentID", compactFromSegID),
+			zap.String("state", oldSegment.GetState().String()))
+		return nil, nil, merr.WrapErrSegmentNotFound(compactFromSegID, "input segment was dropped")
+	}
+
 	resultInvisible := oldSegment.GetIsInvisible()
 	if !oldSegment.GetCreatedByCompaction() {
 		resultInvisible = false
@@ -2236,7 +2285,7 @@ func (m *meta) completeSortCompactionMutation(
 		StartPosition:             oldSegment.GetStartPosition(),
 		DmlPosition:               oldSegment.GetDmlPosition(),
 		IsImporting:               oldSegment.GetIsImporting(),
-		State:                     oldSegment.GetState(),
+		State:                     commonpb.SegmentState_Flushed,
 		Level:                     oldSegment.GetLevel(),
 		LastLevel:                 oldSegment.GetLastLevel(),
 		PartitionStatsVersion:     oldSegment.GetPartitionStatsVersion(),
@@ -2253,6 +2302,7 @@ func (m *meta) completeSortCompactionMutation(
 		Deltalogs:                 resultSegment.GetDeltalogs(),
 		CompactionFrom:            []int64{compactFromSegID},
 		IsSorted:                  true,
+		ManifestPath:              resultSegment.GetManifest(),
 	}
 
 	segment := NewSegmentInfo(segmentInfo)

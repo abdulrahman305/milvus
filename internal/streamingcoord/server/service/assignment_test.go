@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
@@ -37,11 +38,14 @@ func TestAssignmentService(t *testing.T) {
 
 	broadcast.ResetBroadcaster()
 	// Set up the balancer
+	snmanager.ResetStreamingNodeManager()
 	b := mock_balancer.NewMockBalancer(t)
+	b.EXPECT().WaitUntilWALbasedDDLReady(mock.Anything).Return(nil).Maybe()
 	b.EXPECT().WatchChannelAssignments(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, cb balancer.WatchChannelAssignmentsCallback) error {
 		<-ctx.Done()
 		return ctx.Err()
 	})
+	b.EXPECT().Close().Return().Maybe()
 	balance.Register(b)
 
 	// Set up the broadcaster
@@ -54,6 +58,7 @@ func TestAssignmentService(t *testing.T) {
 	mb.EXPECT().WithResourceKeys(mock.Anything, mock.Anything).Return(mba, nil).Maybe()
 	mb.EXPECT().Ack(mock.Anything, mock.Anything).Return(nil).Maybe()
 	mb.EXPECT().LegacyAck(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	mb.EXPECT().Close().Return().Maybe()
 	broadcast.Register(mb)
 
 	// Test assignment discover

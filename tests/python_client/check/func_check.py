@@ -454,8 +454,8 @@ class ResponseChecker:
             else:
                 ids = list(hits.ids)
                 distances = list(hits.distances)
-            if (len(hits) != check_items["limit"]) \
-                    or (len(ids) != check_items["limit"]):
+            if check_items.get("limit", None) is not None \
+                    and ((len(hits) != check_items["limit"]) or (len(ids) != check_items["limit"])):
                 log.error("search_results_check: limit(topK) searched (%d) "
                           "is not equal with expected (%d)"
                           % (len(hits), check_items["limit"]))
@@ -588,8 +588,8 @@ class ResponseChecker:
             if isinstance(query_res, list):
                 result = pc.compare_lists_with_epsilon_ignore_dict_order(a=query_res, b=exp_res)
                 if result is False:
-                    log.debug(f"query expected: {exp_res}")
-                    log.debug(f"query actual: {query_res}")
+                    # Only for debug, compare the result with deepdiff
+                    pc.compare_lists_with_epsilon_ignore_dict_order_deepdiff(a=query_res, b=exp_res)
                 assert result
                 return result
             else:

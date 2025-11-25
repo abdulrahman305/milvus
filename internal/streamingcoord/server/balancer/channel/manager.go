@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -22,9 +23,19 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
+const (
+	StreamingVersion260 = 1 // streaming version that since 2.6.0, the streaming based WAL is available.
+	StreamingVersion265 = 2 // streaming version that since 2.6.5, the WAL based DDL is available.
+)
+
 var ErrChannelNotExist = errors.New("channel not exist")
 
 type (
+	AllocVChannelParam struct {
+		CollectionID int64
+		Num          int
+	}
+
 	WatchChannelAssignmentsCallbackParam struct {
 		Version                typeutil.VersionInt64Pair
 		CChannelAssignment     *streamingpb.CChannelAssignment
@@ -178,6 +189,26 @@ func (cm *ChannelManager) IsStreamingEnabledOnce() bool {
 	return cm.streamingVersion != nil
 }
 
+// WaitUntilStreamingEnabled waits until the streaming service is enabled.
+func (cm *ChannelManager) WaitUntilStreamingEnabled(ctx context.Context) error {
+	cm.cond.L.Lock()
+	for cm.streamingVersion == nil {
+		if err := cm.cond.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	cm.cond.L.Unlock()
+	return nil
+}
+
+// IsWALBasedDDLEnabled returns true if the WAL based DDL is enabled.
+func (cm *ChannelManager) IsWALBasedDDLEnabled() bool {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+
+	return cm.streamingVersion != nil && cm.streamingVersion.Version >= StreamingVersion265
+}
+
 // ReplicateRole returns the replicate role of the channel manager.
 func (cm *ChannelManager) ReplicateRole() replicateutil.Role {
 	cm.cond.L.Lock()
@@ -205,8 +236,12 @@ func (cm *ChannelManager) MarkStreamingHasEnabled(ctx context.Context) error {
 	cm.cond.L.Lock()
 	defer cm.cond.L.Unlock()
 
+	if cm.streamingVersion != nil {
+		return nil
+	}
+
 	cm.streamingVersion = &streamingpb.StreamingVersion{
-		Version: 1,
+		Version: StreamingVersion260,
 	}
 
 	if err := resource.Resource().StreamingCatalog().SaveVersion(ctx, cm.streamingVersion); err != nil {
@@ -226,6 +261,24 @@ func (cm *ChannelManager) MarkStreamingHasEnabled(ctx context.Context) error {
 	return nil
 }
 
+func (cm *ChannelManager) MarkWALBasedDDLEnabled(ctx context.Context) error {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+
+	if cm.streamingVersion == nil {
+		return errors.New("streaming service is not enabled, cannot mark WAL based DDL enabled")
+	}
+	if cm.streamingVersion.Version >= StreamingVersion265 {
+		return nil
+	}
+	cm.streamingVersion.Version = StreamingVersion265
+	if err := resource.Resource().StreamingCatalog().SaveVersion(ctx, cm.streamingVersion); err != nil {
+		cm.Logger().Error("failed to save streaming version", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
 // CurrentPChannelsView returns the current view of pchannels.
 func (cm *ChannelManager) CurrentPChannelsView() *PChannelView {
 	cm.cond.L.Lock()
@@ -236,6 +289,49 @@ func (cm *ChannelManager) CurrentPChannelsView() *PChannelView {
 		cm.metrics.UpdateVChannelTotal(channel)
 	}
 	return view
+}
+
+// AllocVirtualChannels allocates virtual channels for a collection.
+func (cm *ChannelManager) AllocVirtualChannels(ctx context.Context, param AllocVChannelParam) ([]string, error) {
+	cm.cond.L.Lock()
+	defer cm.cond.L.Unlock()
+	if len(cm.channels) < param.Num {
+		return nil, errors.Errorf("not enough pchannels to allocate, expected: %d, got: %d", param.Num, len(cm.channels))
+	}
+
+	vchannels := make([]string, 0, param.Num)
+	for _, channel := range cm.sortChannelsByVChannelCount() {
+		if len(vchannels) >= param.Num {
+			break
+		}
+		vchannels = append(vchannels, funcutil.GetVirtualChannel(channel.id.Name, param.CollectionID, len(vchannels)))
+	}
+	return vchannels, nil
+}
+
+// withVChannelCount is a helper struct to sort the channels by the vchannel count.
+type withVChannelCount struct {
+	id            ChannelID
+	vchannelCount int
+}
+
+// sortChannelsByVChannelCount sorts the channels by the vchannel count.
+func (cm *ChannelManager) sortChannelsByVChannelCount() []withVChannelCount {
+	vchannelCounts := make([]withVChannelCount, 0, len(cm.channels))
+	for id := range cm.channels {
+		vchannelCounts = append(vchannelCounts, withVChannelCount{
+			id:            id,
+			vchannelCount: StaticPChannelStatsManager.Get().GetPChannelStats(id).VChannelCount(),
+		})
+	}
+	sort.Slice(vchannelCounts, func(i, j int) bool {
+		if vchannelCounts[i].vchannelCount == vchannelCounts[j].vchannelCount {
+			// make a stable sort result, so get the order of sort result with same vchannel count by name.
+			return vchannelCounts[i].id.Name < vchannelCounts[j].id.Name
+		}
+		return vchannelCounts[i].vchannelCount < vchannelCounts[j].vchannelCount
+	})
+	return vchannelCounts
 }
 
 // AssignPChannels update the pchannels to servers and return the modified pchannels.

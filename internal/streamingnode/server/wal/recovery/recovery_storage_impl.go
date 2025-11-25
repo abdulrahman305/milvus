@@ -16,6 +16,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
@@ -34,9 +35,10 @@ const (
 func RecoverRecoveryStorage(
 	ctx context.Context,
 	recoveryStreamBuilder RecoveryStreamBuilder,
+	cp *utility.WALCheckpoint,
 	lastTimeTickMessage message.ImmutableMessage,
 ) (RecoveryStorage, *RecoverySnapshot, error) {
-	rs := newRecoveryStorage(recoveryStreamBuilder.Channel())
+	rs := newRecoveryStorage(recoveryStreamBuilder.Channel(), cp)
 	if err := rs.recoverRecoveryInfoFromMeta(ctx, recoveryStreamBuilder.Channel(), lastTimeTickMessage); err != nil {
 		rs.Logger().Warn("recovery storage failed", zap.Error(err))
 		return nil, nil, err
@@ -54,18 +56,13 @@ func RecoverRecoveryStorage(
 		log.FieldComponent(componentRecoveryStorage),
 		zap.String("channel", recoveryStreamBuilder.Channel().String()),
 		zap.String("state", recoveryStorageStateWorking)))
-	rs.truncator = newSamplingTruncator(
-		snapshot.Checkpoint.Clone(),
-		recoveryStreamBuilder.RWWALImpls(),
-		rs.metrics,
-	)
-	rs.truncator.SetLogger(rs.Logger())
+	rs.truncator = recoveryStreamBuilder.RWWALImpls()
 	go rs.backgroundTask()
 	return rs, snapshot, nil
 }
 
 // newRecoveryStorage creates a new recovery storage.
-func newRecoveryStorage(channel types.PChannelInfo) *recoveryStorageImpl {
+func newRecoveryStorage(channel types.PChannelInfo, cp *utility.WALCheckpoint) *recoveryStorageImpl {
 	cfg := newConfig()
 	return &recoveryStorageImpl{
 		backgroundTaskNotifier: syncutil.NewAsyncTaskNotifier[struct{}](),
@@ -73,6 +70,7 @@ func newRecoveryStorage(channel types.PChannelInfo) *recoveryStorageImpl {
 		mu:                     sync.Mutex{},
 		currentClusterID:       paramtable.Get().CommonCfg.ClusterPrefix.GetValue(),
 		channel:                channel,
+		checkpoint:             cp,
 		dirtyCounter:           0,
 		persistNotifier:        make(chan struct{}, 1),
 		gracefulClosed:         false,
@@ -96,7 +94,7 @@ type recoveryStorageImpl struct {
 	// used to trigger the recovery persist operation.
 	persistNotifier        chan struct{}
 	gracefulClosed         bool
-	truncator              *samplingTruncator
+	truncator              walimpls.WALImpls
 	metrics                *recoveryMetrics
 	pendingPersistSnapshot *RecoverySnapshot
 }
@@ -150,11 +148,6 @@ func (r *recoveryStorageImpl) ObserveMessage(ctx context.Context, msg message.Im
 			return err
 		}
 	}
-	if funcutil.IsControlChannel(msg.VChannel()) && msg.MessageType() != message.MessageTypeAlterReplicateConfig {
-		// message on control channel except AlterReplicateConfig message is just used to determine the DDL/DCL order,
-		// will not affect the recovery storage, so skip it.
-		return nil
-	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -166,8 +159,6 @@ func (r *recoveryStorageImpl) ObserveMessage(ctx context.Context, msg message.Im
 func (r *recoveryStorageImpl) Close() {
 	r.backgroundTaskNotifier.Cancel()
 	r.backgroundTaskNotifier.BlockUntilFinish()
-	// Stop the truncator.
-	r.truncator.Close()
 	r.metrics.Close()
 }
 
@@ -292,6 +283,12 @@ func (r *recoveryStorageImpl) updateCheckpoint(msg message.ImmutableMessage) {
 
 // The incoming message id is always sorted with timetick.
 func (r *recoveryStorageImpl) handleMessage(msg message.ImmutableMessage) {
+	if funcutil.IsControlChannel(msg.VChannel()) && msg.MessageType() != message.MessageTypeAlterReplicateConfig {
+		// message on control channel except AlterReplicateConfig message is just used to determine the DDL/DCL order,
+		// will not affect the recovery storage, so skip it.
+		return
+	}
+
 	if msg.VChannel() != "" && msg.MessageType() != message.MessageTypeCreateCollection &&
 		msg.MessageType() != message.MessageTypeDropCollection && r.vchannels[msg.VChannel()] == nil && !funcutil.IsControlChannel(msg.VChannel()) {
 		r.detectInconsistency(msg, "vchannel not found")
@@ -334,6 +331,9 @@ func (r *recoveryStorageImpl) handleMessage(msg message.ImmutableMessage) {
 	case message.MessageTypeSchemaChange:
 		immutableMsg := message.MustAsImmutableSchemaChangeMessageV2(msg)
 		r.handleSchemaChange(immutableMsg)
+	case message.MessageTypeAlterCollection:
+		immutableMsg := message.MustAsImmutableAlterCollectionMessageV2(msg)
+		r.handleAlterCollection(immutableMsg)
 	case message.MessageTypeTimeTick:
 		// nothing, the time tick message make no recovery operation.
 	}
@@ -499,6 +499,21 @@ func (r *recoveryStorageImpl) handleSchemaChange(msg message.ImmutableSchemaChan
 	// persist the schema change into recovery info.
 	if vchannelInfo, ok := r.vchannels[msg.VChannel()]; ok {
 		vchannelInfo.ObserveSchemaChange(msg)
+	}
+}
+
+// handlePutCollection handles the put collection message.
+func (r *recoveryStorageImpl) handleAlterCollection(msg message.ImmutableAlterCollectionMessageV2) {
+	// when put collection happens, we need to flush all segments in the collection.
+	segments := make(map[int64]struct{}, len(msg.Header().FlushedSegmentIds))
+	for _, segmentID := range msg.Header().FlushedSegmentIds {
+		segments[segmentID] = struct{}{}
+	}
+	r.flushSegments(msg, segments)
+
+	// persist the schema change into recovery info.
+	if vchannelInfo, ok := r.vchannels[msg.VChannel()]; ok {
+		vchannelInfo.ObserveAlterCollection(msg)
 	}
 }
 

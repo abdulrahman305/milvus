@@ -29,6 +29,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/ce"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // RegisterDDLCallbacks registers the ddl callbacks.
@@ -36,6 +37,9 @@ func RegisterDDLCallbacks(core *Core) {
 	ddlCallback := &DDLCallback{
 		Core: core,
 	}
+
+	ddlCallback.registerCollectionCallbacks()
+	ddlCallback.registerPartitionCallbacks()
 	ddlCallback.registerRBACCallbacks()
 	ddlCallback.registerDatabaseCallbacks()
 	ddlCallback.registerAliasCallbacks()
@@ -69,6 +73,19 @@ func (c *DDLCallback) registerAliasCallbacks() {
 	registry.RegisterDropAliasV2AckCallback(c.dropAliasV2AckCallback)
 }
 
+// registerCollectionCallbacks registers the collection callbacks.
+func (c *DDLCallback) registerCollectionCallbacks() {
+	registry.RegisterCreateCollectionV1AckCallback(c.createCollectionV1AckCallback)
+	registry.RegisterAlterCollectionV2AckCallback(c.alterCollectionV2AckCallback)
+	registry.RegisterDropCollectionV1AckCallback(c.dropCollectionV1AckCallback)
+}
+
+// registerPartitionCallbacks registers the partition callbacks.
+func (c *DDLCallback) registerPartitionCallbacks() {
+	registry.RegisterCreatePartitionV1AckCallback(c.createPartitionV1AckCallback)
+	registry.RegisterDropPartitionV1AckCallback(c.dropPartitionV1AckCallback)
+}
+
 // DDLCallback is the callback of ddl.
 type DDLCallback struct {
 	*Core
@@ -80,7 +97,7 @@ type CacheExpirationsGetter interface {
 }
 
 // ExpireCaches handles the cache
-func (c *DDLCallback) ExpireCaches(ctx context.Context, expirations any, timetick uint64) error {
+func (c *DDLCallback) ExpireCaches(ctx context.Context, expirations any) error {
 	var cacheExpirations *message.CacheExpirations
 	if g, ok := expirations.(CacheExpirationsGetter); ok {
 		cacheExpirations = g.GetCacheExpirations()
@@ -92,18 +109,29 @@ func (c *DDLCallback) ExpireCaches(ctx context.Context, expirations any, timetic
 		panic(fmt.Sprintf("invalid getter type: %T", expirations))
 	}
 	for _, cacheExpiration := range cacheExpirations.CacheExpirations {
-		if err := c.expireCache(ctx, cacheExpiration, timetick); err != nil {
+		if err := c.expireCache(ctx, cacheExpiration); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *DDLCallback) expireCache(ctx context.Context, cacheExpiration *message.CacheExpiration, timetick uint64) error {
+func (c *DDLCallback) expireCache(ctx context.Context, cacheExpiration *message.CacheExpiration) error {
+	ts, err := c.tsoAllocator.GenerateTSO(1)
+	if err != nil {
+		return errors.Wrap(err, "failed to generate timestamp")
+	}
 	switch cacheExpiration.Cache.(type) {
 	case *messagespb.CacheExpiration_LegacyProxyCollectionMetaCache:
 		legacyProxyCollectionMetaCache := cacheExpiration.GetLegacyProxyCollectionMetaCache()
-		return c.Core.ExpireMetaCache(ctx, legacyProxyCollectionMetaCache.DbName, []string{legacyProxyCollectionMetaCache.CollectionName}, legacyProxyCollectionMetaCache.CollectionId, legacyProxyCollectionMetaCache.PartitionName, timetick, proxyutil.SetMsgType(legacyProxyCollectionMetaCache.MsgType))
+		return c.Core.ExpireMetaCache(
+			ctx,
+			legacyProxyCollectionMetaCache.DbName,
+			[]string{legacyProxyCollectionMetaCache.CollectionName},
+			legacyProxyCollectionMetaCache.CollectionId,
+			legacyProxyCollectionMetaCache.PartitionName,
+			ts,
+			proxyutil.SetMsgType(legacyProxyCollectionMetaCache.MsgType))
 	}
 	return nil
 }
@@ -126,15 +154,27 @@ func startBroadcastWithDatabaseLock(ctx context.Context, dbName string) (broadca
 	return broadcaster, nil
 }
 
-// startBroadcastWithAlterAliasLock starts a broadcast with alter alias lock.
-func startBroadcastWithAlterAliasLock(ctx context.Context, dbName string, collectionName string, alias string) (broadcaster.BroadcastAPI, error) {
+// startBroadcastWithCollectionLock starts a broadcast with collection lock.
+// CreateCollection and DropCollection can only be called with collection name itself, not alias.
+// So it's safe to use collection name directly for those API.
+func (*Core) startBroadcastWithCollectionLock(ctx context.Context, dbName string, collectionName string) (broadcaster.BroadcastAPI, error) {
 	broadcaster, err := broadcast.StartBroadcastWithResourceKeys(ctx,
 		message.NewSharedDBNameResourceKey(dbName),
 		message.NewExclusiveCollectionNameResourceKey(dbName, collectionName),
-		message.NewExclusiveCollectionNameResourceKey(dbName, alias),
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to start broadcast with alter alias lock")
+		return nil, errors.Wrap(err, "failed to start broadcast with collection lock")
 	}
 	return broadcaster, nil
+}
+
+// startBroadcastWithAliasOrCollectionLock starts a broadcast with alias or collection lock.
+// Some API like AlterCollection can be called with alias or collection name,
+// so we need to get the real collection name to add resource key lock.
+func (c *Core) startBroadcastWithAliasOrCollectionLock(ctx context.Context, dbName string, collectionNameOrAlias string) (broadcaster.BroadcastAPI, error) {
+	coll, err := c.meta.GetCollectionByName(ctx, dbName, collectionNameOrAlias, typeutil.MaxTimestamp)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get collection by name")
+	}
+	return c.startBroadcastWithCollectionLock(ctx, dbName, coll.Name)
 }

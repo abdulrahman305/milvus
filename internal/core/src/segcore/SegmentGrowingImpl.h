@@ -68,9 +68,6 @@ class SegmentGrowingImpl : public SegmentGrowing {
     void
     LoadFieldData(const LoadFieldDataInfo& info) override;
 
-    std::string
-    debug() const override;
-
     int64_t
     get_segment_id() const override {
         return id_;
@@ -108,6 +105,9 @@ class SegmentGrowingImpl : public SegmentGrowing {
 
     void
     FinishLoad() override;
+
+    void
+    Load(milvus::tracer::TraceContext& trace_ctx) override;
 
  private:
     // Build geometry cache for inserted data
@@ -457,13 +457,6 @@ class SegmentGrowingImpl : public SegmentGrowing {
         return false;
     }
 
-    std::vector<SegOffset>
-    search_pk(milvus::OpContext* op_ctx,
-              const PkType& pk,
-              Timestamp timestamp) const override {
-        return insert_record_.search_pk(pk, timestamp);
-    }
-
     void
     pk_range(milvus::OpContext* op_ctx,
              proto::plan::OpType op,
@@ -565,6 +558,34 @@ class SegmentGrowingImpl : public SegmentGrowing {
     void
     CreateTextIndexes();
 
+    /**
+     * @brief Load all column groups from a manifest file path
+     *
+     * This method parses the manifest path to retrieve column groups metadata
+     * and loads each column group into the growing segment.
+     *
+     * @param manifest_path JSON string containing base_path and version fields
+     */
+    void
+    LoadColumnsGroups(std::string manifest_path);
+
+    /**
+     * @brief Load a single column group and return field data
+     *
+     * Reads a specific column group from milvus storage and converts it to
+     * field data format that can be inserted into the growing segment.
+     *
+     * @param column_groups Metadata about all available column groups
+     * @param properties Storage properties for accessing the data
+     * @param index Index of the column group to load
+     * @return Map of field IDs to their corresponding field data vectors
+     */
+    std::unordered_map<FieldId, std::vector<FieldDataPtr>>
+    LoadColumnGroup(
+        const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+        const std::shared_ptr<milvus_storage::api::Properties>& properties,
+        int64_t index);
+
  private:
     storage::MmapChunkDescriptorPtr mmap_descriptor_ = nullptr;
     SegcoreConfig segcore_config_;
@@ -585,6 +606,9 @@ class SegmentGrowingImpl : public SegmentGrowing {
     int64_t id_;
 
     SegmentStats stats_{};
+
+    // milvus storage internal api reader instance
+    std::unique_ptr<milvus_storage::api::Reader> reader_;
 };
 
 inline SegmentGrowingPtr

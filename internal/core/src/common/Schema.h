@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -122,6 +123,31 @@ class Schema {
                                     element_type,
                                     dim,
                                     metric_type);
+        this->AddField(std::move(field_meta));
+        return field_id;
+    }
+
+    // string type
+    FieldId
+    AddDebugVarcharField(const FieldName& name,
+                         DataType data_type,
+                         int64_t max_length,
+                         bool nullable,
+                         bool enable_match,
+                         bool enable_analyzer,
+                         std::map<std::string, std::string>& params,
+                         std::optional<DefaultValueType> default_value) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        auto field_meta = FieldMeta(name,
+                                    field_id,
+                                    data_type,
+                                    max_length,
+                                    nullable,
+                                    enable_match,
+                                    enable_analyzer,
+                                    params,
+                                    std::move(default_value));
         this->AddField(std::move(field_meta));
         return field_id;
     }
@@ -303,6 +329,9 @@ class Schema {
     const ArrowSchemaPtr
     ConvertToArrowSchema() const;
 
+    proto::schema::CollectionSchema
+    ToProto() const;
+
     void
     UpdateLoadFields(const std::vector<int64_t>& field_ids) {
         load_fields_.clear();
@@ -369,5 +398,5 @@ class Schema {
 };
 
 using SchemaPtr = std::shared_ptr<Schema>;
-
+using SafeSchemaPtr = std::atomic<SchemaPtr*>;
 }  // namespace milvus

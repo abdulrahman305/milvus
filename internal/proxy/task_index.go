@@ -228,6 +228,8 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 					return Params.AutoIndexConfig.ScalarIntIndexType.GetValue()
 				} else if typeutil.IsFloatingType(dataType) {
 					return Params.AutoIndexConfig.ScalarFloatIndexType.GetValue()
+				} else if typeutil.IsTimestamptzType(dataType) {
+					return Params.AutoIndexConfig.ScalarTimestampTzIndexType.GetValue()
 				}
 				return Params.AutoIndexConfig.ScalarVarcharIndexType.GetValue()
 			}
@@ -427,7 +429,7 @@ func (cit *createIndexTask) parseIndexParams(ctx context.Context) error {
 		}
 	}
 
-	// auto fill json path with field name if not specified for json index
+	// autofill json path with field name if not specified for json index
 	if typeutil.IsJSONType(cit.fieldSchema.DataType) {
 		if _, exist := indexParamsMap[common.JSONPathKey]; !exist {
 			indexParamsMap[common.JSONPathKey] = cit.req.FieldName
@@ -1043,18 +1045,6 @@ func (dit *dropIndexTask) OnEnqueue() error {
 }
 
 func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
-	collName, fieldName := dit.CollectionName, dit.FieldName
-
-	if err := validateCollectionName(collName); err != nil {
-		return err
-	}
-
-	if fieldName != "" {
-		if err := validateFieldName(fieldName); err != nil {
-			return err
-		}
-	}
-
 	collID, err := globalMetaCache.GetCollectionID(ctx, dit.GetDbName(), dit.CollectionName)
 	if err != nil {
 		return err

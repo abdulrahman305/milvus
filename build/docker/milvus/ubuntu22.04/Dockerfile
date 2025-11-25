@@ -20,6 +20,9 @@ RUN apt-get update && \
     sed -i 's/http:/https:/g' /etc/apt/sources.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends curl libaio-dev libgomp1 libopenblas-dev && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && \
+        ln -sf /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
+        echo "Etc/UTC" > /etc/timezone && \
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
 
@@ -38,6 +41,14 @@ ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
 ENV LD_PRELOAD=${MILVUS_ASAN_LIB}:/milvus/lib/libjemalloc.so
 ENV MALLOC_CONF=background_thread:true
+
+# Change user to milvus
+ENV ASAN_OPTIONS=detect_leaks=0
+RUN groupadd -r milvus && useradd -r -g milvus milvus && \
+    mkdir -p /var/lib/milvus && \
+    chown -R milvus:milvus /milvus /var/lib/milvus
+ENV ASAN_OPTIONS=detect_leaks=1
+USER milvus:milvus
 
 ENTRYPOINT ["/tini", "--"]
 

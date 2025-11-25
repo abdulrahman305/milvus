@@ -50,7 +50,17 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-var errIgnoredAlterAlias = errors.New("ignored alter alias") // alias already created on current collection, so it can be ignored.
+var (
+	errIgnoredAlterAlias       = errors.New("ignored alter alias")       // alias already created on current collection, so it can be ignored.
+	errIgnoredAlterCollection  = errors.New("ignored alter collection")  // collection already created, so it can be ignored.
+	errIgnoredAlterDatabase    = errors.New("ignored alter database")    // database already created, so it can be ignored.
+	errIgnoredCreateCollection = errors.New("ignored create collection") // create collection with same schema, so it can be ignored.
+	errIgnoerdCreatePartition  = errors.New("ignored create partition")  // partition is already exist, so it can be ignored.
+	errIgnoredDropCollection   = errors.New("ignored drop collection")   // drop collection or database not found, so it can be ignored.
+	errIgnoredDropPartition    = errors.New("ignored drop partition")    // drop partition not found, so it can be ignored.
+
+	errAlterCollectionNotFound = errors.New("alter collection not found") // alter collection not found, so it can be ignored.
+)
 
 type MetaTableChecker interface {
 	RBACChecker
@@ -75,7 +85,7 @@ type IMetaTable interface {
 	AlterDatabase(ctx context.Context, newDB *model.Database, ts typeutil.Timestamp) error
 
 	AddCollection(ctx context.Context, coll *model.Collection) error
-	ChangeCollectionState(ctx context.Context, collectionID UniqueID, state pb.CollectionState, ts Timestamp) error
+	DropCollection(ctx context.Context, collectionID UniqueID, ts Timestamp) error
 	RemoveCollection(ctx context.Context, collectionID UniqueID, ts Timestamp) error
 	// GetCollectionID retrieves the corresponding collectionID based on the collectionName.
 	// If the collection does not exist, it will return InvalidCollectionID.
@@ -93,8 +103,8 @@ type IMetaTable interface {
 	GetCollectionVirtualChannels(ctx context.Context, colID int64) []string
 	GetPChannelInfo(ctx context.Context, pchannel string) *rootcoordpb.GetPChannelInfoResponse
 	AddPartition(ctx context.Context, partition *model.Partition) error
-	ChangePartitionState(ctx context.Context, collectionID UniqueID, partitionID UniqueID, state pb.PartitionState, ts Timestamp) error
-	RemovePartition(ctx context.Context, dbID int64, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error
+	DropPartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error
+	RemovePartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error
 
 	// Alias
 	AlterAlias(ctx context.Context, result message.BroadcastResultAlterAliasMessageV2) error
@@ -102,8 +112,8 @@ type IMetaTable interface {
 	DescribeAlias(ctx context.Context, dbName string, alias string, ts Timestamp) (string, error)
 	ListAliases(ctx context.Context, dbName string, collectionName string, ts Timestamp) ([]string, error)
 
-	AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp, fieldModify bool) error
-	RenameCollection(ctx context.Context, dbName string, oldName string, newDBName string, newName string, ts Timestamp) error
+	AlterCollection(ctx context.Context, result message.BroadcastResultAlterCollectionMessageV2) error
+	CheckIfCollectionRenamable(ctx context.Context, dbName string, oldName string, newDBName string, newName string) error
 	GetGeneralCount(ctx context.Context) int
 
 	// TODO: it'll be a big cost if we handle the time travel logic, since we should always list all aliases in catalog.
@@ -331,6 +341,10 @@ func (mt *MetaTable) createDefaultDb() error {
 
 		cipherProps := hookutil.GetDBCipherProperties(ezID, defaultRootKey)
 		defaultProperties = append(defaultProperties, cipherProps...)
+
+		if err := hookutil.CreateEZByDBProperties(defaultProperties); err != nil {
+			return err
+		}
 	}
 
 	return mt.createDatabasePrivate(mt.ctx, model.NewDefaultDatabase(defaultProperties), ts)
@@ -343,6 +357,7 @@ func (mt *MetaTable) CheckIfDatabaseCreatable(ctx context.Context, req *milvuspb
 	defer mt.ddLock.RUnlock()
 
 	if _, ok := mt.dbName2Meta[dbName]; ok || mt.aliases.exist(dbName) || mt.names.exist(dbName) {
+		// TODO: idempotency check here.
 		return fmt.Errorf("database already exist: %s", dbName)
 	}
 
@@ -367,11 +382,6 @@ func (mt *MetaTable) CreateDatabase(ctx context.Context, db *model.Database, ts 
 func (mt *MetaTable) createDatabasePrivate(ctx context.Context, db *model.Database, ts typeutil.Timestamp) error {
 	dbName := db.Name
 	if err := mt.catalog.CreateDatabase(ctx, db, ts); err != nil {
-		return err
-	}
-
-	// Call back cipher plugin when creating database succeeded
-	if err := hookutil.CreateEZByDBProperties(db.Properties); err != nil {
 		return err
 	}
 
@@ -430,11 +440,6 @@ func (mt *MetaTable) DropDatabase(ctx context.Context, dbName string, ts typeuti
 		return nil
 	}
 	if err := mt.catalog.DropDatabase(ctx, db.ID, ts); err != nil {
-		return err
-	}
-
-	// Call back cipher plugin when dropping database succeeded
-	if err := hookutil.RemoveEZByDBProperties(db.Properties); err != nil {
 		return err
 	}
 
@@ -497,22 +502,29 @@ func (mt *MetaTable) AddCollection(ctx context.Context, coll *model.Collection) 
 	// Note:
 	// 1, idempotency check was already done outside;
 	// 2, no need to check time travel logic, since ts should always be the latest;
-
-	db, err := mt.getDatabaseByIDInternal(ctx, coll.DBID, typeutil.MaxTimestamp)
-	if err != nil {
-		return err
+	if coll.State != pb.CollectionState_CollectionCreated {
+		return fmt.Errorf("collection state should be created, collection name: %s, collection id: %d, state: %s", coll.Name, coll.CollectionID, coll.State)
 	}
 
-	if coll.State != pb.CollectionState_CollectionCreating {
-		return fmt.Errorf("collection state should be creating, collection name: %s, collection id: %d, state: %s", coll.Name, coll.CollectionID, coll.State)
+	// check if there's a collection meta with the same collection id.
+	// merge the collection meta together.
+	if _, ok := mt.collID2Meta[coll.CollectionID]; ok {
+		log.Ctx(ctx).Info("collection already created, skip add collection to meta table", zap.Int64("collectionID", coll.CollectionID))
+		return nil
 	}
+
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
 	if err := mt.catalog.CreateCollection(ctx1, coll, coll.CreateTime); err != nil {
 		return err
 	}
 
 	mt.collID2Meta[coll.CollectionID] = coll.Clone()
-	mt.names.insert(db.Name, coll.Name, coll.CollectionID)
+	mt.names.insert(coll.DBName, coll.Name, coll.CollectionID)
+
+	pn := coll.GetPartitionNum(true)
+	mt.generalCnt += pn * int(coll.ShardsNum)
+	metrics.RootCoordNumOfCollections.WithLabelValues(coll.DBName).Inc()
+	metrics.RootCoordNumOfPartitions.WithLabelValues().Add(float64(pn))
 
 	channel.StaticPChannelStatsManager.MustGet().AddVChannel(coll.VirtualChannelNames...)
 	log.Ctx(ctx).Info("add collection to meta table",
@@ -524,7 +536,7 @@ func (mt *MetaTable) AddCollection(ctx context.Context, coll *model.Collection) 
 	return nil
 }
 
-func (mt *MetaTable) ChangeCollectionState(ctx context.Context, collectionID UniqueID, state pb.CollectionState, ts Timestamp) error {
+func (mt *MetaTable) DropCollection(ctx context.Context, collectionID UniqueID, ts Timestamp) error {
 	mt.ddLock.Lock()
 	defer mt.ddLock.Unlock()
 
@@ -532,8 +544,14 @@ func (mt *MetaTable) ChangeCollectionState(ctx context.Context, collectionID Uni
 	if !ok {
 		return nil
 	}
+	if coll.State == pb.CollectionState_CollectionDropping {
+		return nil
+	}
+
 	clone := coll.Clone()
-	clone.State = state
+	clone.State = pb.CollectionState_CollectionDropping
+	clone.UpdateTimestamp = ts
+
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
 	if err := mt.catalog.AlterCollection(ctx1, coll, clone, metastore.MODIFY, ts, false); err != nil {
 		return err
@@ -547,21 +565,13 @@ func (mt *MetaTable) ChangeCollectionState(ctx context.Context, collectionID Uni
 
 	pn := coll.GetPartitionNum(true)
 
-	switch state {
-	case pb.CollectionState_CollectionCreated:
-		mt.generalCnt += pn * int(coll.ShardsNum)
-		metrics.RootCoordNumOfCollections.WithLabelValues(db.Name).Inc()
-		metrics.RootCoordNumOfPartitions.WithLabelValues().Add(float64(pn))
-	case pb.CollectionState_CollectionDropping:
-		mt.generalCnt -= pn * int(coll.ShardsNum)
-		channel.StaticPChannelStatsManager.MustGet().RemoveVChannel(coll.VirtualChannelNames...)
-		metrics.RootCoordNumOfCollections.WithLabelValues(db.Name).Dec()
-		metrics.RootCoordNumOfPartitions.WithLabelValues().Sub(float64(pn))
-	}
+	mt.generalCnt -= pn * int(coll.ShardsNum)
+	channel.StaticPChannelStatsManager.MustGet().RemoveVChannel(coll.VirtualChannelNames...)
+	metrics.RootCoordNumOfCollections.WithLabelValues(db.Name).Dec()
+	metrics.RootCoordNumOfPartitions.WithLabelValues().Sub(float64(pn))
 
-	log.Ctx(ctx).Info("change collection state", zap.Int64("collection", collectionID),
-		zap.String("state", state.String()), zap.Uint64("ts", ts))
-
+	log.Ctx(ctx).Info("drop collection from meta table", zap.Int64("collection", collectionID),
+		zap.String("state", coll.State.String()), zap.Uint64("ts", ts))
 	return nil
 }
 
@@ -602,6 +612,9 @@ func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID
 	if !ok {
 		log.Ctx(ctx).Warn("not found collection, skip remove", zap.Int64("collectionID", collectionID))
 		return nil
+	}
+	if coll.State != pb.CollectionState_CollectionDropping {
+		return fmt.Errorf("remove collection which state is not dropping, collectionID: %d, state: %s", collectionID, coll.State.String())
 	}
 
 	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
@@ -914,22 +927,56 @@ func (mt *MetaTable) ListCollectionPhysicalChannels(ctx context.Context) map[typ
 	return chanMap
 }
 
-func (mt *MetaTable) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp, fieldModify bool) error {
+// AlterCollection is used to alter a collection in the meta table.
+func (mt *MetaTable) AlterCollection(ctx context.Context, result message.BroadcastResultAlterCollectionMessageV2) error {
+	header := result.Message.Header()
+	body := result.Message.MustBody()
+
 	mt.ddLock.Lock()
 	defer mt.ddLock.Unlock()
 
-	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
-	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, ts, fieldModify); err != nil {
-		return err
+	coll, ok := mt.collID2Meta[header.CollectionId]
+	if !ok {
+		// collection not exists, return directly.
+		return errAlterCollectionNotFound
 	}
-	mt.collID2Meta[oldColl.CollectionID] = newColl
-	log.Ctx(ctx).Info("alter collection finished", zap.Int64("collectionID", oldColl.CollectionID), zap.Uint64("ts", ts))
+
+	oldColl := coll.Clone()
+	newColl := coll.Clone()
+	newColl.ApplyUpdates(header, body)
+	fieldModify := false
+	dbChanged := false
+	for _, path := range header.UpdateMask.GetPaths() {
+		switch path {
+		case message.FieldMaskCollectionSchema:
+			fieldModify = true
+		case message.FieldMaskDB:
+			dbChanged = true
+		}
+	}
+	newColl.UpdateTimestamp = result.GetMaxTimeTick()
+
+	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
+	if !dbChanged {
+		if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, newColl.UpdateTimestamp, fieldModify); err != nil {
+			return err
+		}
+	} else {
+		if err := mt.catalog.AlterCollectionDB(ctx1, oldColl, newColl, newColl.UpdateTimestamp); err != nil {
+			return err
+		}
+	}
+
+	mt.names.remove(oldColl.DBName, oldColl.Name)
+	mt.names.insert(newColl.DBName, newColl.Name, newColl.CollectionID)
+	mt.collID2Meta[header.CollectionId] = newColl
+	log.Ctx(ctx).Info("alter collection finished", zap.Bool("dbChanged", dbChanged), zap.Int64("collectionID", oldColl.CollectionID), zap.Uint64("ts", newColl.UpdateTimestamp))
 	return nil
 }
 
-func (mt *MetaTable) RenameCollection(ctx context.Context, dbName string, oldName string, newDBName string, newName string, ts Timestamp) error {
-	mt.ddLock.Lock()
-	defer mt.ddLock.Unlock()
+func (mt *MetaTable) CheckIfCollectionRenamable(ctx context.Context, dbName string, oldName string, newDBName string, newName string) error {
+	mt.ddLock.RLock()
+	defer mt.ddLock.RUnlock()
 
 	ctx = contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
 	log := log.Ctx(ctx).With(
@@ -946,8 +993,21 @@ func (mt *MetaTable) RenameCollection(ctx context.Context, dbName string, oldNam
 		return fmt.Errorf("target database:%s not found", newDBName)
 	}
 
-	// check if new name already belongs to another existing collection
-	coll, err := mt.getCollectionByNameInternal(ctx, newDBName, newName, ts)
+	// old collection should not be an alias
+	_, ok = mt.aliases.get(dbName, oldName)
+	if ok {
+		log.Warn("unsupported use a alias to rename collection")
+		return fmt.Errorf("unsupported use an alias to rename collection, alias:%s", oldName)
+	}
+
+	_, ok = mt.aliases.get(newDBName, newName)
+	if ok {
+		log.Warn("cannot rename collection to an existing alias")
+		return fmt.Errorf("cannot rename collection to an existing alias: %s", newName)
+	}
+
+	// check new collection already exists
+	coll, err := mt.getCollectionByNameInternal(ctx, newDBName, newName, typeutil.MaxTimestamp)
 	if coll != nil {
 		log.Warn("duplicated new collection name, already taken by another collection or alias.")
 		return fmt.Errorf("duplicated new collection name %s:%s with other collection name or alias", newDBName, newName)
@@ -958,34 +1018,17 @@ func (mt *MetaTable) RenameCollection(ctx context.Context, dbName string, oldNam
 	}
 
 	// get old collection meta
-	oldColl, err := mt.getCollectionByNameInternal(ctx, dbName, oldName, ts)
+	oldColl, err := mt.getCollectionByNameInternal(ctx, dbName, oldName, typeutil.MaxTimestamp)
 	if err != nil {
 		log.Warn("fail to find collection with old name", zap.Error(err))
 		return err
 	}
 
-	newColl := oldColl.Clone()
-	newColl.Name = newName
-	newColl.DBName = dbName
-	newColl.DBID = targetDB.ID
-	if oldColl.DBID == newColl.DBID {
-		if err := mt.catalog.AlterCollection(ctx, oldColl, newColl, metastore.MODIFY, ts, false); err != nil {
-			log.Warn("alter collection by catalog failed", zap.Error(err))
-			return err
-		}
-	} else {
-		if err := mt.catalog.AlterCollectionDB(ctx, oldColl, newColl, ts); err != nil {
-			log.Warn("alter collectionDB by catalog failed", zap.Error(err))
-			return err
-		}
+	// unsupported rename collection while the collection has aliases
+	aliases := mt.listAliasesByID(oldColl.CollectionID)
+	if len(aliases) > 0 && oldColl.DBID != targetDB.ID {
+		return errors.New("fail to rename db name, must drop all aliases of this collection before rename")
 	}
-
-	mt.names.insert(newDBName, newName, oldColl.CollectionID)
-	mt.names.remove(dbName, oldName)
-
-	mt.collID2Meta[oldColl.CollectionID] = newColl
-
-	log.Info("rename collection finished")
 	return nil
 }
 
@@ -1042,8 +1085,17 @@ func (mt *MetaTable) AddPartition(ctx context.Context, partition *model.Partitio
 	if !ok || !coll.Available() {
 		return fmt.Errorf("collection not exists: %d", partition.CollectionID)
 	}
-	if partition.State != pb.PartitionState_PartitionCreating {
+
+	if partition.State != pb.PartitionState_PartitionCreated {
 		return fmt.Errorf("partition state is not created, collection: %d, partition: %d, state: %s", partition.CollectionID, partition.PartitionID, partition.State)
+	}
+
+	// idempotency check here.
+	for _, part := range coll.Partitions {
+		if part.PartitionID == partition.PartitionID {
+			log.Ctx(ctx).Info("partition already exists, ignore the operation", zap.Int64("collection", partition.CollectionID), zap.Int64("partition", partition.PartitionID))
+			return nil
+		}
 	}
 	if err := mt.catalog.CreatePartition(ctx, coll.DBID, partition, partition.PartitionCreatedTimestamp); err != nil {
 		return err
@@ -1053,11 +1105,14 @@ func (mt *MetaTable) AddPartition(ctx context.Context, partition *model.Partitio
 	log.Ctx(ctx).Info("add partition to meta table",
 		zap.Int64("collection", partition.CollectionID), zap.String("partition", partition.PartitionName),
 		zap.Int64("partitionid", partition.PartitionID), zap.Uint64("ts", partition.PartitionCreatedTimestamp))
+	mt.generalCnt += int(coll.ShardsNum) // 1 partition * shardNum
+	// support Dynamic load/release partitions
+	metrics.RootCoordNumOfPartitions.WithLabelValues().Inc()
 
 	return nil
 }
 
-func (mt *MetaTable) ChangePartitionState(ctx context.Context, collectionID UniqueID, partitionID UniqueID, state pb.PartitionState, ts Timestamp) error {
+func (mt *MetaTable) DropPartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error {
 	mt.ddLock.Lock()
 	defer mt.ddLock.Unlock()
 
@@ -1067,46 +1122,40 @@ func (mt *MetaTable) ChangePartitionState(ctx context.Context, collectionID Uniq
 	}
 	for idx, part := range coll.Partitions {
 		if part.PartitionID == partitionID {
+			if part.State == pb.PartitionState_PartitionDropping {
+				// promise idempotency here.
+				return nil
+			}
 			clone := part.Clone()
-			clone.State = state
+			clone.State = pb.PartitionState_PartitionDropping
 			ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
 			if err := mt.catalog.AlterPartition(ctx1, coll.DBID, part, clone, metastore.MODIFY, ts); err != nil {
 				return err
 			}
 			mt.collID2Meta[collectionID].Partitions[idx] = clone
 
-			switch state {
-			case pb.PartitionState_PartitionCreated:
-				mt.generalCnt += int(coll.ShardsNum) // 1 partition * shardNum
-				// support Dynamic load/release partitions
-				metrics.RootCoordNumOfPartitions.WithLabelValues().Inc()
-			case pb.PartitionState_PartitionDropping:
-				mt.generalCnt -= int(coll.ShardsNum) // 1 partition * shardNum
-				metrics.RootCoordNumOfPartitions.WithLabelValues().Dec()
-			}
-
-			log.Ctx(ctx).Info("change partition state", zap.Int64("collection", collectionID),
-				zap.Int64("partition", partitionID), zap.String("state", state.String()),
+			log.Ctx(ctx).Info("drop partition", zap.Int64("collection", collectionID),
+				zap.Int64("partition", partitionID),
 				zap.Uint64("ts", ts))
 
+			mt.generalCnt -= int(coll.ShardsNum) // 1 partition * shardNum
+			metrics.RootCoordNumOfPartitions.WithLabelValues().Dec()
 			return nil
 		}
 	}
-	return fmt.Errorf("partition not exist, collection: %d, partition: %d", collectionID, partitionID)
+	// partition not found, so promise idempotency here.
+	return nil
 }
 
-func (mt *MetaTable) RemovePartition(ctx context.Context, dbID int64, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error {
+func (mt *MetaTable) RemovePartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error {
 	mt.ddLock.Lock()
 	defer mt.ddLock.Unlock()
 
-	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
-	if err := mt.catalog.DropPartition(ctx1, dbID, collectionID, partitionID, ts); err != nil {
-		return err
-	}
 	coll, ok := mt.collID2Meta[collectionID]
 	if !ok {
 		return nil
 	}
+
 	loc := -1
 	for idx, part := range coll.Partitions {
 		if part.PartitionID == partitionID {
@@ -1114,9 +1163,20 @@ func (mt *MetaTable) RemovePartition(ctx context.Context, dbID int64, collection
 			break
 		}
 	}
-	if loc != -1 {
-		coll.Partitions = append(coll.Partitions[:loc], coll.Partitions[loc+1:]...)
+	if loc == -1 {
+		log.Ctx(ctx).Warn("not found partition, skip remove", zap.Int64("collection", collectionID), zap.Int64("partition", partitionID))
+		return nil
 	}
+	partition := coll.Partitions[loc]
+	if partition.State != pb.PartitionState_PartitionDropping {
+		return fmt.Errorf("remove partition which state is not dropping, collection: %d, partition: %d, state: %s", collectionID, partitionID, partition.State.String())
+	}
+
+	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
+	if err := mt.catalog.DropPartition(ctx1, coll.DBID, collectionID, partitionID, ts); err != nil {
+		return err
+	}
+	coll.Partitions = append(coll.Partitions[:loc], coll.Partitions[loc+1:]...)
 	log.Ctx(ctx).Info("remove partition", zap.Int64("collection", collectionID), zap.Int64("partition", partitionID), zap.Uint64("ts", ts))
 	return nil
 }

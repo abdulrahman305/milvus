@@ -42,6 +42,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -64,6 +65,7 @@ const (
 	StrictCastKey        = "strict_cast"
 	RankGroupScorer      = "rank_group_scorer"
 	AnnsFieldKey         = "anns_field"
+	AnalyzerKey          = "analyzer_name"
 	TopKKey              = "topk"
 	NQKey                = "nq"
 	MetricTypeKey        = common.MetricTypeKey
@@ -73,7 +75,6 @@ const (
 	OffsetKey            = "offset"
 	LimitKey             = "limit"
 	// key for timestamptz translation
-	TimezoneKey   = "timezone"
 	TimefieldsKey = "time_fields"
 
 	SearchIterV2Key        = "search_iter_v2"
@@ -105,6 +106,9 @@ const (
 	ListAliasesTaskName           = "ListAliasesTask"
 	AlterCollectionTaskName       = "AlterCollectionTask"
 	AlterCollectionFieldTaskName  = "AlterCollectionFieldTask"
+	AddCollectionFunctionTask     = "AddCollectionFunctionTask"
+	AlterCollectionFunctionTask   = "AlterCollectionFunctionTask"
+	DropCollectionFunctionTask    = "DropCollectionFunctionTask"
 	UpsertTaskName                = "UpsertTask"
 	CreateResourceGroupTaskName   = "CreateResourceGroupTask"
 	UpdateResourceGroupsTaskName  = "UpdateResourceGroupsTask"
@@ -114,6 +118,7 @@ const (
 	ListResourceGroupsTaskName    = "ListResourceGroupsTask"
 	DescribeResourceGroupTaskName = "DescribeResourceGroupTask"
 	RunAnalyzerTaskName           = "RunAnalyzer"
+	HighlightTaskName             = "Highlight"
 
 	CreateDatabaseTaskName   = "CreateCollectionTask"
 	DropDatabaseTaskName     = "DropDatabaseTaskName"
@@ -359,8 +364,13 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 	t.schema.AutoID = false
+	t.schema.DbName = t.GetDbName()
 
-	if err := validateFunction(t.schema); err != nil {
+	disableCheck, err := common.IsDisableFuncRuntimeCheck(t.GetProperties()...)
+	if err != nil {
+		return err
+	}
+	if err := validateFunction(t.schema, disableCheck); err != nil {
 		return err
 	}
 
@@ -415,6 +425,12 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	hasPartitionKey := hasPartitionKeyModeField(t.schema)
 	if _, err := validatePartitionKeyIsolation(ctx, t.CollectionName, hasPartitionKey, t.GetProperties()...); err != nil {
 		return err
+	}
+
+	// Validate timezone
+	tz, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.GetProperties())
+	if exist && !timestamptz.IsTimezoneValid(tz) {
+		return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", tz)
 	}
 
 	// validate clustering key
@@ -1203,9 +1219,9 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 			}
 		}
 		// Check the validation of timezone
-		err := checkTimezone(t.Properties...)
-		if err != nil {
-			return err
+		userDefinedTimezone, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.Properties)
+		if exist && !timestamptz.IsTimezoneValid(userDefinedTimezone) {
+			return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", userDefinedTimezone)
 		}
 	} else if len(t.GetDeleteKeys()) > 0 {
 		key := hasPropInDeletekeys(t.DeleteKeys)
@@ -3135,6 +3151,95 @@ func (t *RunAnalyzerTask) Execute(ctx context.Context) error {
 }
 
 func (t *RunAnalyzerTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
+// git highlight after search
+type HighlightTask struct {
+	baseTask
+	Condition
+	*querypb.GetHighlightRequest
+	ctx            context.Context
+	collectionName string
+	collectionID   typeutil.UniqueID
+	dbName         string
+	lb             shardclient.LBPolicy
+
+	result *querypb.GetHighlightResponse
+}
+
+func (t *HighlightTask) TraceCtx() context.Context {
+	return t.ctx
+}
+
+func (t *HighlightTask) ID() UniqueID {
+	return t.Base.MsgID
+}
+
+func (t *HighlightTask) SetID(uid UniqueID) {
+	t.Base.MsgID = uid
+}
+
+func (t *HighlightTask) Name() string {
+	return HighlightTaskName
+}
+
+func (t *HighlightTask) Type() commonpb.MsgType {
+	return t.Base.MsgType
+}
+
+func (t *HighlightTask) BeginTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *HighlightTask) EndTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *HighlightTask) SetTs(ts Timestamp) {
+	t.Base.Timestamp = ts
+}
+
+func (t *HighlightTask) OnEnqueue() error {
+	if t.Base == nil {
+		t.Base = commonpbutil.NewMsgBase()
+	}
+	t.Base.MsgType = commonpb.MsgType_RunAnalyzer
+	t.Base.SourceID = paramtable.GetNodeID()
+	return nil
+}
+
+func (t *HighlightTask) PreExecute(ctx context.Context) error {
+	return nil
+}
+
+func (t *HighlightTask) getHighlightOnShardleader(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
+	t.GetHighlightRequest.Channel = channel
+	resp, err := qn.GetHighlight(ctx, t.GetHighlightRequest)
+	if err != nil {
+		return err
+	}
+
+	if err := merr.Error(resp.GetStatus()); err != nil {
+		return err
+	}
+	t.result = resp
+	return nil
+}
+
+func (t *HighlightTask) Execute(ctx context.Context) error {
+	err := t.lb.ExecuteOneChannel(ctx, shardclient.CollectionWorkLoad{
+		Db:             t.dbName,
+		CollectionName: t.collectionName,
+		CollectionID:   t.collectionID,
+		Nq:             int64(len(t.GetTopks()) * len(t.GetTasks())),
+		Exec:           t.getHighlightOnShardleader,
+	})
+
+	return err
+}
+
+func (t *HighlightTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 

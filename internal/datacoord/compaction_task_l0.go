@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/samber/lo"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -126,10 +125,11 @@ func (t *l0CompactionTask) QueryTaskOnWorker(cluster session.Cluster) {
 		PlanID: t.GetTaskProto().GetPlanID(),
 	})
 	if err != nil || result == nil {
-		if errors.Is(err, merr.ErrNodeNotFound) {
-			t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
-		}
 		log.Warn("l0CompactionTask failed to get compaction result", zap.Error(err))
+		err = t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
+		if err != nil {
+			log.Warn("update l0 compaction task meta failed", zap.Error(err))
+		}
 		return
 	}
 	switch result.GetState() {
@@ -274,21 +274,27 @@ func (t *l0CompactionTask) ShadowClone(opts ...compactionTaskOpt) *datapb.Compac
 	return taskClone
 }
 
-func (t *l0CompactionTask) selectSealedSegment() ([]*SegmentInfo, []*datapb.CompactionSegmentBinlogs) {
+func (t *l0CompactionTask) selectFlushedSegment() ([]*SegmentInfo, []*datapb.CompactionSegmentBinlogs, error) {
 	taskProto := t.taskProto.Load().(*datapb.CompactionTask)
-	// Select sealed L1 segments for LevelZero compaction that meets the condition:
+	// Select flushed L1/L2 segments for LevelZero compaction that meets the condition:
 	// dmlPos < triggerInfo.pos
-	sealedSegments := t.meta.SelectSegments(context.TODO(), WithCollection(taskProto.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
+	flushedSegments := t.meta.SelectSegments(context.TODO(), WithCollection(taskProto.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
 		return (taskProto.GetPartitionID() == common.AllPartitionsID || info.GetPartitionID() == taskProto.GetPartitionID()) &&
 			info.GetInsertChannel() == taskProto.GetChannel() &&
-			isFlushState(info.GetState()) &&
+			(info.GetState() == commonpb.SegmentState_Sealed || isFlushState(info.GetState())) &&
 			!info.GetIsImporting() &&
 			info.GetLevel() != datapb.SegmentLevel_L0 &&
 			info.GetStartPosition().GetTimestamp() < taskProto.GetPos().GetTimestamp()
 	}))
 
-	sealedSegBinlogs := lo.Map(sealedSegments, func(info *SegmentInfo, _ int) *datapb.CompactionSegmentBinlogs {
-		return &datapb.CompactionSegmentBinlogs{
+	sealedSegBinlogs := []*datapb.CompactionSegmentBinlogs{}
+	for _, info := range flushedSegments {
+		// Sealed is unexpected, fail fast
+		if info.GetState() == commonpb.SegmentState_Sealed {
+			return nil, nil, fmt.Errorf("L0 compaction selected invalid sealed segment %d", info.GetID())
+		}
+
+		sealedSegBinlogs = append(sealedSegBinlogs, &datapb.CompactionSegmentBinlogs{
 			SegmentID:           info.GetID(),
 			Field2StatslogPaths: info.GetStatslogs(),
 			InsertChannel:       info.GetInsertChannel(),
@@ -296,20 +302,11 @@ func (t *l0CompactionTask) selectSealedSegment() ([]*SegmentInfo, []*datapb.Comp
 			CollectionID:        info.GetCollectionID(),
 			PartitionID:         info.GetPartitionID(),
 			IsSorted:            info.GetIsSorted(),
-		}
-	})
-
-	return sealedSegments, sealedSegBinlogs
-}
-
-func (t *l0CompactionTask) CheckCompactionContainsSegment(segmentID int64) bool {
-	sealedSegmentIDs, _ := t.selectSealedSegment()
-	for _, sealedSegment := range sealedSegmentIDs {
-		if sealedSegment.GetID() == segmentID {
-			return true
-		}
+			Manifest:            info.GetManifestPath(),
+		})
 	}
-	return false
+
+	return flushedSegments, sealedSegBinlogs, nil
 }
 
 func (t *l0CompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, error) {
@@ -345,18 +342,23 @@ func (t *l0CompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, err
 			InsertChannel: segInfo.GetInsertChannel(),
 			Deltalogs:     segInfo.GetDeltalogs(),
 			IsSorted:      segInfo.GetIsSorted(),
+			Manifest:      segInfo.GetManifestPath(),
 		})
 		segments = append(segments, segInfo)
 	}
 
-	sealedSegments, sealedSegBinlogs := t.selectSealedSegment()
-	if len(sealedSegments) == 0 {
+	flushedSegments, flushedSegBinlogs, err := t.selectFlushedSegment()
+	if err != nil {
+		log.Warn("invalid L0 compaction plan, unable to select flushed segments", zap.Error(err))
+		return nil, err
+	}
+	if len(flushedSegments) == 0 {
 		// TODO fast finish l0 segment, just drop l0 segment
 		log.Info("l0Compaction available non-L0 Segments is empty ")
 		return nil, errors.Errorf("Selected zero L1/L2 segments for the position=%v", taskProto.GetPos())
 	}
 
-	segments = append(segments, sealedSegments...)
+	segments = append(segments, flushedSegments...)
 	logIDRange, err := PreAllocateBinlogIDs(t.allocator, segments)
 	if err != nil {
 		return nil, err
@@ -365,10 +367,10 @@ func (t *l0CompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, err
 	// BeginLogID is deprecated, but still assign it for compatibility.
 	plan.BeginLogID = logIDRange.Begin
 
-	plan.SegmentBinlogs = append(plan.SegmentBinlogs, sealedSegBinlogs...)
+	plan.SegmentBinlogs = append(plan.SegmentBinlogs, flushedSegBinlogs...)
 	log.Info("l0CompactionTask refreshed level zero compaction plan",
 		zap.Any("target position", taskProto.GetPos()),
-		zap.Any("target segments count", len(sealedSegBinlogs)),
+		zap.Any("target segments count", len(flushedSegBinlogs)),
 		zap.Any("PreAllocatedLogIDs", logIDRange))
 
 	WrapPluginContext(taskProto.GetCollectionID(), taskProto.GetSchema().GetProperties(), plan)

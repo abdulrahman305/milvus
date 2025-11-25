@@ -111,7 +111,7 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         """
         # step 1: create collection with all datatype schema
         client = self._client()
-        schema = cf.gen_all_datatype_collection_schema(dim=default_dim)
+        schema = cf.gen_all_datatype_collection_schema(dim=default_dim, enable_struct_array_field=False)
         index_params = self.prepare_index_params(client)[0]
         text_sparse_emb_field_name = "text_sparse_emb"
 
@@ -141,7 +141,8 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         
         vector_field_type = [DataType.FLOAT16_VECTOR,
                             DataType.BFLOAT16_VECTOR, 
-                            DataType.INT8_VECTOR]
+                            DataType.INT8_VECTOR,
+                            DataType.FLOAT_VECTOR]
         # fields to be updated
         update_fields_name = []
         scalar_update_name = []
@@ -163,6 +164,7 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         expected = [{field: new_rows[i][field] for field in scalar_update_name}
                     for i in range(default_nb)]
 
+        expected = cf.convert_timestamptz(expected, ct.default_timestamptz_field_name, "UTC")
         result = self.query(client, collection_name, filter=f"{primary_key_field_name} >= 0",
                 check_task=CheckTasks.check_query_results,
                 output_fields=scalar_update_name,
@@ -201,7 +203,7 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         collection_name = cf.gen_collection_name_by_testcase_name()
         
         # Create schema with all data types
-        schema = cf.gen_all_datatype_collection_schema(dim=dim)
+        schema = cf.gen_all_datatype_collection_schema(dim=dim, enable_struct_array_field=False)
 
         # Create index parameters
         index_params = client.prepare_index_params()
@@ -1261,6 +1263,61 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
 
         self.drop_collection(client, collection_name)
 
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_client_partial_update_duplicate_pk(self):
+        """
+        target: test PU will success when partial update duplicate pk
+        method:
+            1. Create a collection
+            2. Insert rows with duplicate pk
+            3. Upsert the rows with duplicate pk
+        expected: Step 3 should success
+        """
+        # step 1: create collection
+        client = self._client()
+        schema = self.create_schema(client, enable_dynamic_field=False)[0]
+        schema.add_field(default_primary_key_field_name, DataType.INT64, is_primary=True, auto_id=False)
+        schema.add_field(default_vector_field_name, DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field(default_int32_field_name, DataType.INT32, nullable=True)
+        schema.add_field(default_string_field_name, DataType.VARCHAR, nullable=True, max_length=64)
+        index_params = self.prepare_index_params(client)[0]
+        index_params.add_index(default_primary_key_field_name, index_type="AUTOINDEX")
+        index_params.add_index(default_vector_field_name, index_type="AUTOINDEX")
+        collection_name = cf.gen_collection_name_by_testcase_name(module_index=1)
+        self.create_collection(client, collection_name, default_dim, schema=schema, 
+                               consistency_level="Strong", index_params=index_params)
+        
+        # step 2: Insert rows with duplicate pk
+        rows = cf.gen_row_data_by_schema(nb=default_nb, schema=schema, skip_field_names=[default_string_field_name])
+        self.insert(client, collection_name, rows)
+        dup_rows = cf.gen_row_data_by_schema(nb=default_nb, schema=schema, skip_field_names=[default_int32_field_name])
+        self.insert(client, collection_name, dup_rows)
+
+        # verify the duplicate pk is inserted and can be queried
+        for row in dup_rows:
+            row[default_int32_field_name] = None
+        res = self.query(client, collection_name, filter=default_search_exp,
+                   check_task=CheckTasks.check_query_results,
+                   check_items={exp_res: dup_rows,
+                                "pk_name": default_primary_key_field_name})[0]
+        assert len(res) == default_nb
+
+        # step 3: Upsert the rows with duplicate pk
+        new_rows = cf.gen_row_data_by_schema(nb=default_nb, schema=schema, 
+                                            desired_field_names=[default_primary_key_field_name, default_string_field_name])
+
+        self.upsert(client, collection_name, new_rows, partial_update=True)
+        for i, row in enumerate(dup_rows):
+            row[default_string_field_name] = new_rows[i][default_string_field_name]
+
+        res = self.query(client, collection_name, filter=default_search_exp,
+                   check_task=CheckTasks.check_query_results,
+                   check_items={exp_res: dup_rows,
+                                "pk_name": default_primary_key_field_name})[0]
+
+        assert len(res) == default_nb
+
+        self.drop_collection(client, collection_name)
 
 class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
     """ Test case of partial update interface """

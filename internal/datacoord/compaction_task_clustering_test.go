@@ -471,14 +471,15 @@ func (s *ClusteringCompactionTaskSuite) TestQueryTaskOnWorker() {
 			},
 		})
 		cluster := session.NewMockCluster(s.T())
-		cluster.EXPECT().QueryCompaction(mock.Anything, mock.Anything).Return(nil, nil).Once()
-		task.QueryTaskOnWorker(cluster)
-		s.Equal(datapb.CompactionTaskState_executing, task.GetTaskProto().GetState())
 		cluster.EXPECT().QueryCompaction(mock.Anything, mock.Anything).Return(&datapb.CompactionPlanResult{
 			State: datapb.CompactionTaskState_executing,
 		}, nil).Once()
 		task.QueryTaskOnWorker(cluster)
 		s.Equal(datapb.CompactionTaskState_executing, task.GetTaskProto().GetState())
+
+		cluster.EXPECT().QueryCompaction(mock.Anything, mock.Anything).Return(nil, nil).Once()
+		task.QueryTaskOnWorker(cluster)
+		s.Equal(datapb.CompactionTaskState_pipelining, task.GetTaskProto().GetState())
 	})
 
 	s.Run("QueryTaskOnWorker, scalar clustering key, compaction result ready", func() {
@@ -627,11 +628,12 @@ func (s *ClusteringCompactionTaskSuite) TestProcessIndexingState() {
 		task := s.generateBasicTask(false)
 		task.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_indexing))
 
-		indexReq := &indexpb.CreateIndexRequest{
-			CollectionID: 1,
-		}
 		task.updateAndSaveTaskMeta(setResultSegments([]int64{10, 11}))
-		_, err := s.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 3, false)
+		err := s.meta.indexMeta.CreateIndex(context.TODO(), &model.Index{
+			CollectionID: 1,
+			FieldID:      3,
+			IndexID:      3,
+		})
 		s.NoError(err)
 
 		s.False(task.Process())
@@ -641,10 +643,11 @@ func (s *ClusteringCompactionTaskSuite) TestProcessIndexingState() {
 	s.Run("collection has index, segment indexed", func() {
 		task := s.generateBasicTask(false)
 		task.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_indexing))
-		indexReq := &indexpb.CreateIndexRequest{
+		err := s.meta.indexMeta.CreateIndex(context.TODO(), &model.Index{
 			CollectionID: 1,
-		}
-		_, err := s.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 3, false)
+			FieldID:      3,
+			IndexID:      3,
+		})
 		s.NoError(err)
 
 		s.meta.indexMeta.updateSegmentIndex(&model.SegmentIndex{

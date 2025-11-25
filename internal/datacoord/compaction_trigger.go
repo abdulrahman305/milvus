@@ -363,7 +363,10 @@ func (t *compactionTrigger) handleSignal(signal *compactionSignal) error {
 		coll, err := t.getCollection(group.collectionID)
 		if err != nil {
 			log.Warn("get collection info failed, skip handling compaction", zap.Error(err))
-			return err
+			if signal.collectionID != 0 {
+				return err
+			}
+			continue
 		}
 
 		if !signal.isForce && !isCollectionAutoCompactionEnabled(coll) {
@@ -814,10 +817,10 @@ func getExpandedSize(size int64) int64 {
 	return int64(float64(size) * Params.DataCoordCfg.SegmentExpansionRate.GetAsFloat())
 }
 
-func canTriggerSortCompaction(segment *SegmentInfo) bool {
+func canTriggerSortCompaction(segment *SegmentInfo, isPartitionIsolationEnabled bool) bool {
 	return segment.GetState() == commonpb.SegmentState_Flushed &&
 		segment.GetLevel() != datapb.SegmentLevel_L0 &&
-		!segment.GetIsSorted() &&
+		(!segment.GetIsSorted() || (isPartitionIsolationEnabled && !segment.GetIsPartitionKeySorted())) &&
 		!segment.GetIsImporting() &&
 		!segment.isCompacting
 }

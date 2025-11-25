@@ -18,6 +18,7 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	sio "io"
 	"path"
@@ -67,6 +68,7 @@ type rwOptions struct {
 	collectionID        int64
 	storageConfig       *indexpb.StorageConfig
 	neededFields        typeutil.Set[int64]
+	useLoonFFI          bool
 }
 
 func (o *rwOptions) validate() error {
@@ -163,6 +165,12 @@ func WithNeededFields(neededFields typeutil.Set[int64]) RwOption {
 	}
 }
 
+func WithUseLoonFFI(useLoonFFI bool) RwOption {
+	return func(options *rwOptions) {
+		options.useLoonFFI = useLoonFFI
+	}
+}
+
 func makeBlobsReader(ctx context.Context, binlogs []*datapb.FieldBinlog, downloader downloaderFn) (ChunkedBlobsReader, error) {
 	if len(binlogs) == 0 {
 		return func() ([]*Blob, error) {
@@ -254,7 +262,7 @@ func NewBinlogRecordReader(ctx context.Context, binlogs []*datapb.FieldBinlog, s
 				pluginContext = &indexcgopb.StoragePluginContext{
 					EncryptionZoneId: ez.EzID,
 					CollectionId:     ez.CollectionID,
-					EncryptionKey:    string(unsafe),
+					EncryptionKey:    base64.StdEncoding.EncodeToString(unsafe),
 				}
 			}
 		}
@@ -274,6 +282,7 @@ func NewBinlogRecordReader(ctx context.Context, binlogs []*datapb.FieldBinlog, s
 		sort.Slice(binlogs, func(i, j int) bool {
 			return binlogs[i].GetFieldID() < binlogs[j].GetFieldID()
 		})
+
 		binlogLists := lo.Map(binlogs, func(fieldBinlog *datapb.FieldBinlog, _ int) []*datapb.Binlog {
 			return fieldBinlog.GetBinlogs()
 		})
@@ -297,6 +306,31 @@ func NewBinlogRecordReader(ctx context.Context, binlogs []*datapb.FieldBinlog, s
 		return nil, err
 	}
 	return rr, nil
+}
+
+func NewManifestRecordReader(ctx context.Context, manifestPath string, schema *schemapb.CollectionSchema, option ...RwOption) (rr RecordReader, err error) {
+	rwOptions := DefaultReaderOptions()
+	for _, opt := range option {
+		opt(rwOptions)
+	}
+	if err := rwOptions.validate(); err != nil {
+		return nil, err
+	}
+
+	var pluginContext *indexcgopb.StoragePluginContext
+	if hookutil.IsClusterEncyptionEnabled() {
+		if ez := hookutil.GetEzByCollProperties(schema.GetProperties(), rwOptions.collectionID); ez != nil {
+			unsafe := hookutil.GetCipher().GetUnsafeKey(ez.EzID, ez.CollectionID)
+			if len(unsafe) > 0 {
+				pluginContext = &indexcgopb.StoragePluginContext{
+					EncryptionZoneId: ez.EzID,
+					CollectionId:     ez.CollectionID,
+					EncryptionKey:    string(unsafe),
+				}
+			}
+		}
+	}
+	return NewRecordReaderFromManifest(manifestPath, schema, rwOptions.bufferSize, rwOptions.storageConfig, pluginContext)
 }
 
 func NewBinlogRecordWriter(ctx context.Context, collectionID, partitionID, segmentID UniqueID,
@@ -337,7 +371,7 @@ func NewBinlogRecordWriter(ctx context.Context, collectionID, partitionID, segme
 				pluginContext = &indexcgopb.StoragePluginContext{
 					EncryptionZoneId: ez.EzID,
 					CollectionId:     ez.CollectionID,
-					EncryptionKey:    string(unsafe),
+					EncryptionKey:    base64.StdEncoding.EncodeToString(unsafe),
 				}
 			}
 		}
@@ -350,12 +384,20 @@ func NewBinlogRecordWriter(ctx context.Context, collectionID, partitionID, segme
 			blobsWriter, allocator, chunkSize, rootPath, maxRowNum, opts...,
 		)
 	case StorageV2:
-		return newPackedBinlogRecordWriter(collectionID, partitionID, segmentID, schema,
-			blobsWriter, allocator, maxRowNum,
-			rwOptions.bufferSize, rwOptions.multiPartUploadSize, rwOptions.columnGroups,
-			rwOptions.storageConfig,
-			pluginContext,
-		)
+		if rwOptions.useLoonFFI {
+			return newPackedManifestRecordWriter(collectionID, partitionID, segmentID, schema,
+				blobsWriter, allocator, maxRowNum,
+				rwOptions.bufferSize, rwOptions.multiPartUploadSize, rwOptions.columnGroups,
+				rwOptions.storageConfig,
+				pluginContext)
+		} else {
+			return newPackedBinlogRecordWriter(collectionID, partitionID, segmentID, schema,
+				blobsWriter, allocator, maxRowNum,
+				rwOptions.bufferSize, rwOptions.multiPartUploadSize, rwOptions.columnGroups,
+				rwOptions.storageConfig,
+				pluginContext,
+			)
+		}
 	}
 	return nil, merr.WrapErrServiceInternal(fmt.Sprintf("unsupported storage version %d", rwOptions.version))
 }

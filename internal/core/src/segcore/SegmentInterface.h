@@ -197,12 +197,25 @@ class SegmentInterface {
     // currently it's used to sync field data list with updated schema.
     virtual void
     FinishLoad() = 0;
+
+    virtual void
+    SetLoadInfo(const milvus::proto::segcore::SegmentLoadInfo& load_info) = 0;
+
+    virtual void
+    Load(milvus::tracer::TraceContext& trace_ctx) = 0;
 };
 
 // internal API for DSL calculation
 // only for implementation
 class SegmentInternalInterface : public SegmentInterface {
  public:
+    virtual void
+    prefetch_chunks(milvus::OpContext* op_ctx,
+                    FieldId field_id,
+                    const std::vector<int64_t>& chunk_ids) const {
+        // do nothing
+    }
+
     template <typename T>
     PinWrapper<Span<T>>
     chunk_data(milvus::OpContext* op_ctx,
@@ -330,9 +343,6 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual bool
     HasIndex(FieldId field_id) const = 0;
 
-    virtual std::string
-    debug() const = 0;
-
     int64_t
     get_real_count() const override;
 
@@ -380,6 +390,12 @@ class SegmentInternalInterface : public SegmentInterface {
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const override;
+
+    virtual void
+    SetLoadInfo(
+        const milvus::proto::segcore::SegmentLoadInfo& load_info) override {
+        load_info_ = load_info;
+    }
 
  public:
     // `query_offsets` is not null only for vector array (embedding list) search
@@ -579,11 +595,6 @@ class SegmentInternalInterface : public SegmentInterface {
         int64_t count,
         const std::vector<std::string>& dynamic_field_names) const = 0;
 
-    virtual std::vector<SegOffset>
-    search_pk(milvus::OpContext* op_ctx,
-              const PkType& pk,
-              Timestamp timestamp) const = 0;
-
     virtual void
     pk_range(milvus::OpContext* op_ctx,
              proto::plan::OpType op,
@@ -598,6 +609,8 @@ class SegmentInternalInterface : public SegmentInterface {
  protected:
     // mutex protecting rw options on schema_
     std::shared_mutex sch_mutex_;
+
+    milvus::proto::segcore::SegmentLoadInfo load_info_;
 
     mutable std::shared_mutex mutex_;
     // fieldID -> std::pair<num_rows, avg_size>

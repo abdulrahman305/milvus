@@ -261,7 +261,7 @@ func (st *statsTask) sort(ctx context.Context) ([]*datapb.FieldBinlog, error) {
 		return nil, err
 	}
 
-	binlogs, stats, bm25stats := srw.GetLogs()
+	binlogs, stats, bm25stats, _ := srw.GetLogs()
 	insertLogs := storage.SortFieldBinlogs(binlogs)
 	if err := binlog.CompressFieldBinlogs(insertLogs); err != nil {
 		return nil, err
@@ -334,6 +334,13 @@ func (st *statsTask) Execute(ctx context.Context) error {
 	}
 	if (st.req.EnableJsonKeyStatsInSort && st.req.GetSubJobType() == indexpb.StatsSubJob_Sort) || st.req.GetSubJobType() == indexpb.StatsSubJob_JsonKeyIndexJob {
 		if !st.req.GetEnableJsonKeyStats() {
+			return nil
+		}
+
+		// for compatibility, we only support json data format version 2 and above after 2.6
+		// for old version, we skip creating json key index
+		if st.req.GetJsonKeyStatsDataFormat() < 2 {
+			log.Ctx(ctx).Info("json data format version is too old, skip creating json key index", zap.Int64("data format", st.req.GetJsonKeyStatsDataFormat()))
 			return nil
 		}
 
@@ -439,12 +446,12 @@ func (st *statsTask) createTextIndex(ctx context.Context,
 		return binlog.GetFieldID()
 	})
 
-	getInsertFiles := func(fieldID int64) ([]string, error) {
+	getInsertFiles := func(fieldID int64, enableNull bool) ([]string, error) {
 		if st.req.GetStorageVersion() == storage.StorageV2 {
 			return []string{}, nil
 		}
 		binlogs, ok := fieldBinlogs[fieldID]
-		if !ok {
+		if !ok && !enableNull {
 			return nil, fmt.Errorf("field binlog not found for field %d", fieldID)
 		}
 		result := make([]string, 0, len(binlogs))
@@ -469,7 +476,7 @@ func (st *statsTask) createTextIndex(ctx context.Context,
 		}
 		log.Info("field enable match, ready to create text index", zap.Int64("field id", field.GetFieldID()))
 		// create text index and upload the text index files.
-		files, err := getInsertFiles(field.GetFieldID())
+		files, err := getInsertFiles(field.GetFieldID(), field.GetNullable())
 		if err != nil {
 			return err
 		}

@@ -18,39 +18,52 @@ package rootcoord
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
+	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_broadcaster"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
+	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/walimplstest"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -62,10 +75,44 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func initStreamingSystem() {
-	t := common.NewEmptyMockT()
+func initStreamingSystemAndCore(t *testing.T) *Core {
+	kv, _ := kvfactory.GetEtcdAndPath()
+	path := funcutil.RandomString(10)
+	catalogKV := etcdkv.NewEtcdKV(kv, path)
+
+	ss, err := rootcoord.NewSuffixSnapshot(catalogKV, rootcoord.SnapshotsSep, path, rootcoord.SnapshotPrefix)
+	require.NoError(t, err)
+	testDB := newNameDb()
+	collID2Meta := make(map[typeutil.UniqueID]*model.Collection)
+	tso := mocktso.NewAllocator(t)
+	tso.EXPECT().GenerateTSO(mock.Anything).Return(uint64(1), nil).Maybe()
+	core := newTestCore(withHealthyCode(),
+		withMeta(&MetaTable{
+			catalog:     rootcoord.NewCatalog(catalogKV, ss),
+			names:       testDB,
+			aliases:     newNameDb(),
+			dbName2Meta: make(map[string]*model.Database),
+			collID2Meta: collID2Meta,
+		}),
+		withValidMixCoord(),
+		withValidProxyManager(),
+		withValidIDAllocator(),
+		withTsoAllocator(tso),
+		withBroker(newValidMockBroker()),
+	)
+	registry.ResetRegistration()
+	RegisterDDLCallbacks(core)
+	// TODO: we should merge all coordinator code into one package unit,
+	// so these mock code can be replaced with the real code.
+	registry.RegisterDropIndexV2AckCallback(func(ctx context.Context, result message.BroadcastResultDropIndexMessageV2) error {
+		return nil
+	})
+	registry.RegisterDropLoadConfigV2AckCallback(func(ctx context.Context, result message.BroadcastResultDropLoadConfigMessageV2) error {
+		return nil
+	})
+
 	wal := mock_streaming.NewMockWALAccesser(t)
-	wal.EXPECT().ControlChannel().Return(funcutil.GetControlChannel("by-dev-rootcoord-dml_0"))
+	wal.EXPECT().ControlChannel().Return(funcutil.GetControlChannel("by-dev-rootcoord-dml_0")).Maybe()
 	streaming.SetWALForTest(wal)
 
 	bapi := mock_broadcaster.NewMockBroadcastAPI(t)
@@ -73,24 +120,47 @@ func initStreamingSystem() {
 		results := make(map[string]*message.AppendResult)
 		for _, vchannel := range msg.BroadcastHeader().VChannels {
 			results[vchannel] = &message.AppendResult{
-				MessageID:              walimplstest.NewTestMessageID(1),
+				MessageID:              rmq.NewRmqID(1),
 				TimeTick:               tsoutil.ComposeTSByTime(time.Now(), 0),
-				LastConfirmedMessageID: walimplstest.NewTestMessageID(1),
+				LastConfirmedMessageID: rmq.NewRmqID(1),
 			}
 		}
-		registry.CallMessageAckCallback(context.Background(), msg, results)
+		retry.Do(context.Background(), func() error {
+			log.Info("broadcast message", log.FieldMessage(msg))
+			return registry.CallMessageAckCallback(context.Background(), msg, results)
+		}, retry.AttemptAlways())
 		return &types.BroadcastAppendResult{}, nil
-	})
-	bapi.EXPECT().Close().Return()
+	}).Maybe()
+	bapi.EXPECT().Close().Return().Maybe()
 
 	mb := mock_broadcaster.NewMockBroadcaster(t)
 	mb.EXPECT().WithResourceKeys(mock.Anything, mock.Anything).Return(bapi, nil).Maybe()
 	mb.EXPECT().WithResourceKeys(mock.Anything, mock.Anything, mock.Anything).Return(bapi, nil).Maybe()
 	mb.EXPECT().WithResourceKeys(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(bapi, nil).Maybe()
-	mb.EXPECT().Close().Return()
-	broadcast.Release()
+	mb.EXPECT().WithResourceKeys(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(bapi, nil).Maybe()
+	mb.EXPECT().Close().Return().Maybe()
 	broadcast.ResetBroadcaster()
 	broadcast.Register(mb)
+
+	snmanager.ResetStreamingNodeManager()
+	b := mock_balancer.NewMockBalancer(t)
+	b.EXPECT().AllocVirtualChannels(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, param balancer.AllocVChannelParam) ([]string, error) {
+		vchannels := make([]string, 0, param.Num)
+		for i := 0; i < param.Num; i++ {
+			vchannels = append(vchannels, funcutil.GetVirtualChannel(fmt.Sprintf("%s-rootcoord-dml_%d_100v0", path, i), param.CollectionID, i))
+		}
+		return vchannels, nil
+	}).Maybe()
+	b.EXPECT().WaitUntilWALbasedDDLReady(mock.Anything).Return(nil).Maybe()
+	b.EXPECT().WatchChannelAssignments(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, callback balancer.WatchChannelAssignmentsCallback) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}).Maybe()
+	b.EXPECT().Close().Return().Maybe()
+	balance.Register(b)
+	channel.ResetStaticPChannelStatsManager()
+	channel.RecoverPChannelStatsManager([]string{})
+	return core
 }
 
 func TestRootCoord_CreateDatabase(t *testing.T) {
@@ -170,36 +240,6 @@ func TestRootCoord_CreateCollection(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
-
-	t.Run("failed to add task", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to execute", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("normal case, everything is ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{})
-		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
 }
 
 func TestRootCoord_DropCollection(t *testing.T) {
@@ -209,36 +249,6 @@ func TestRootCoord_DropCollection(t *testing.T) {
 		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to add task", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to execute", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("normal case, everything is ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
-		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 }
 
@@ -250,36 +260,6 @@ func TestRootCoord_CreatePartition(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
-
-	t.Run("failed to add task", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to execute", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("normal case, everything is ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{})
-		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
 }
 
 func TestRootCoord_DropPartition(t *testing.T) {
@@ -289,36 +269,6 @@ func TestRootCoord_DropPartition(t *testing.T) {
 		resp, err := c.DropPartition(ctx, &milvuspb.DropPartitionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to add task", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropPartition(ctx, &milvuspb.DropPartitionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("failed to execute", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropPartition(ctx, &milvuspb.DropPartitionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("normal case, everything is ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.DropPartition(ctx, &milvuspb.DropPartitionRequest{})
-		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 }
 
@@ -951,36 +901,6 @@ func TestRootCoord_RenameCollection(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
-
-	t.Run("add task failed", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.RenameCollection(ctx, &milvuspb.RenameCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("execute task failed", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.RenameCollection(ctx, &milvuspb.RenameCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("run ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
-		ctx := context.Background()
-		resp, err := c.RenameCollection(ctx, &milvuspb.RenameCollectionRequest{})
-		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
 }
 
 func TestRootCoord_ListPolicy(t *testing.T) {
@@ -1349,61 +1269,101 @@ func TestRootCoord_AlterCollection(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
+}
 
-	t.Run("add task failed", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withInvalidScheduler())
-
+func TestRootCoord_AddCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
 		ctx := context.Background()
-		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{})
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
-	})
-
-	t.Run("execute task failed", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withTaskFailScheduler())
-
-		ctx := context.Background()
-		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{})
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 
 	t.Run("run ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
 		ctx := context.Background()
-		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{})
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAddFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 
-	t.Run("set_dynamic_field_bad_request", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
+	t.Run("run failed", func(t *testing.T) {
 		ctx := context.Background()
-		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
-			Properties: []*commonpb.KeyValuePair{
-				{Key: common.EnableDynamicSchemaKey, Value: "abc"},
-			},
-		})
-		assert.Error(t, merr.CheckRPCCall(resp, err))
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAddFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_DropCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		ctx := context.Background()
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 
-	t.Run("set_dynamic_field_ok", func(t *testing.T) {
-		c := newTestCore(withHealthyCode(),
-			withValidScheduler())
-
+	t.Run("run ok", func(t *testing.T) {
 		ctx := context.Background()
-		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
-			Properties: []*commonpb.KeyValuePair{
-				{Key: common.EnableDynamicSchemaKey, Value: "true"},
-			},
-		})
-		assert.NoError(t, merr.CheckRPCCall(resp, err))
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForDropFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run failed", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForDropFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_AlterCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		ctx := context.Background()
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run ok", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAlterFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run failed", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAlterFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
 	})
 }
 
@@ -1734,25 +1694,6 @@ type RootCoordSuite struct {
 
 func (s *RootCoordSuite) TestRestore() {
 	meta := mockrootcoord.NewIMetaTable(s.T())
-	gc := mockrootcoord.NewGarbageCollector(s.T())
-
-	finishCh := make(chan struct{}, 4)
-	gc.EXPECT().ReDropPartition(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Once().
-		Run(func(args mock.Arguments) {
-			finishCh <- struct{}{}
-		})
-	gc.EXPECT().RemoveCreatingPartition(mock.Anything, mock.Anything, mock.Anything).Once().
-		Run(func(args mock.Arguments) {
-			finishCh <- struct{}{}
-		})
-	gc.EXPECT().ReDropCollection(mock.Anything, mock.Anything).Once().
-		Run(func(args mock.Arguments) {
-			finishCh <- struct{}{}
-		})
-	gc.EXPECT().RemoveCreatingCollection(mock.Anything).Once().
-		Run(func(args mock.Arguments) {
-			finishCh <- struct{}{}
-		})
 
 	meta.EXPECT().ListDatabases(mock.Anything, mock.Anything).
 		Return([]*model.Database{
@@ -1813,16 +1754,9 @@ func (s *RootCoordSuite) TestRestore() {
 		return 100, nil
 	}
 	core := newTestCore(
-		withGarbageCollector(gc),
-		// withTtSynchronizer(ticker),
 		withTsoAllocator(tsoAllocator),
-		// withValidProxyManager(),
 		withMeta(meta))
 	core.restore(context.Background())
-
-	for i := 0; i < 4; i++ {
-		<-finishCh
-	}
 }
 
 func TestRootCoordSuite(t *testing.T) {

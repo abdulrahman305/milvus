@@ -34,8 +34,8 @@ type SessionInterface interface {
 	GetSessionsWithVersionRange(prefix string, r semver.Range) (map[string]*Session, int64, error)
 
 	GoingStop() error
-	WatchServices(prefix string, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent)
-	WatchServicesWithVersionRange(prefix string, r semver.Range, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent)
+	WatchServices(prefix string, revision int64, rewatch Rewatch) (watcher SessionWatcher)
+	WatchServicesWithVersionRange(prefix string, r semver.Range, revision int64, rewatch Rewatch) (watcher SessionWatcher)
 	LivenessCheck(ctx context.Context, callback func())
 	Stop()
 	Revoke(timeout time.Duration)
@@ -45,9 +45,13 @@ type SessionInterface interface {
 	Disconnected() bool
 	SetEnableActiveStandBy(enable bool)
 	ProcessActiveStandBy(activateFunc func() error) error
-	ForceActiveStandby(activateFunc func() error) error
 
 	GetAddress() string
 	GetServerID() int64
 	IsTriggerKill() bool
+}
+
+type SessionWatcher interface {
+	EventChannel() <-chan *SessionEvent
+	Stop()
 }

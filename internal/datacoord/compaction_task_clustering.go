@@ -150,13 +150,10 @@ func (t *clusteringCompactionTask) QueryTaskOnWorker(cluster session.Cluster) {
 		PlanID: t.GetTaskProto().GetPlanID(),
 	})
 	if err != nil || result == nil {
-		log.Warn("processExecuting clustering compaction", zap.Error(err))
-		if errors.Is(err, merr.ErrNodeNotFound) {
-			log.Warn("GetCompactionPlanResult fail", zap.Error(err))
-			err = t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining))
-			if err != nil {
-				log.Warn("update clustering compaction task meta failed", zap.Error(err))
-			}
+		log.Warn("clusteringCompactionTask failed to get compaction result", zap.Error(err))
+		err = t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
+		if err != nil {
+			log.Warn("update clustering compaction task meta failed", zap.Error(err))
 		}
 		return
 	}
@@ -332,10 +329,6 @@ func (t *clusteringCompactionTask) Clean() bool {
 	return t.doClean() == nil
 }
 
-func (t *clusteringCompactionTask) CheckCompactionContainsSegment(segmentID int64) bool {
-	return false
-}
-
 func (t *clusteringCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, error) {
 	taskProto := t.taskProto.Load().(*datapb.CompactionTask)
 	logIDRange, err := PreAllocateBinlogIDs(t.allocator, t.meta.GetSegmentInfos(taskProto.GetInputSegments()))
@@ -384,6 +377,7 @@ func (t *clusteringCompactionTask) BuildCompactionRequest() (*datapb.CompactionP
 			Deltalogs:           segInfo.GetDeltalogs(),
 			IsSorted:            segInfo.GetIsSorted(),
 			StorageVersion:      segInfo.GetStorageVersion(),
+			Manifest:            segInfo.GetManifestPath(),
 		})
 	}
 	WrapPluginContext(taskProto.GetCollectionID(), taskProto.GetSchema().GetProperties(), plan)

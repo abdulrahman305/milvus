@@ -15,7 +15,7 @@ FROM rockylinux/rockylinux:8
 ARG TARGETARCH
 ARG MILVUS_ASAN_LIB
 
-RUN dnf install -y wget libgomp libaio libatomic
+RUN dnf install -y wget libgomp libaio libatomic tzdata
 
 # install openblas-devel
 RUN dnf -y install dnf-plugins-core && \
@@ -37,6 +37,12 @@ ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
 ENV LD_PRELOAD=${MILVUS_ASAN_LIB}:/milvus/lib/libjemalloc.so
 ENV MALLOC_CONF=background_thread:true
+
+# Change user to milvus
+RUN groupadd -r milvus && useradd -r -g milvus milvus && \
+    mkdir -p /var/lib/milvus && \
+    chown -R milvus:milvus /milvus /var/lib/milvus
+USER milvus:milvus
 
 ENTRYPOINT ["/tini", "--"]
 

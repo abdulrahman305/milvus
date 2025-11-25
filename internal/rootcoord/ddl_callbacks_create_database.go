@@ -27,9 +27,13 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/ce"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 )
 
 func (c *Core) broadcastCreateDatabase(ctx context.Context, req *milvuspb.CreateDatabaseRequest) error {
@@ -53,6 +57,15 @@ func (c *Core) broadcastCreateDatabase(ctx context.Context, req *milvuspb.Create
 	properties, err := hookutil.TidyDBCipherProperties(dbID, req.GetProperties())
 	if err != nil {
 		return errors.Wrap(err, "failed to tidy database cipher properties")
+	}
+
+	tz, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, properties)
+	if exist && !timestamptz.IsTimezoneValid(tz) {
+		return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", tz)
+	}
+
+	if err := hookutil.CreateEZByDBProperties(properties); err != nil {
+		return errors.Wrap(err, "failed to create ez by db properties")
 	}
 
 	msg := message.NewCreateDatabaseMessageBuilderV2().
@@ -79,6 +92,5 @@ func (c *DDLCallback) createDatabaseV1AckCallback(ctx context.Context, result me
 		WithLegacyProxyCollectionMetaCache(
 			ce.OptLPCMDBName(header.DbName),
 			ce.OptLPCMMsgType(commonpb.MsgType_DropDatabase),
-		),
-		result.GetControlChannelResult().TimeTick)
+		))
 }

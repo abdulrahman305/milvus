@@ -171,8 +171,8 @@ func (kc *Catalog) ListDatabases(ctx context.Context, ts typeutil.Timestamp) ([]
 }
 
 func (kc *Catalog) CreateCollection(ctx context.Context, coll *model.Collection, ts typeutil.Timestamp) error {
-	if coll.State != pb.CollectionState_CollectionCreating {
-		return fmt.Errorf("cannot create collection with state: %s, collection: %s", coll.State.String(), coll.Name)
+	if coll.State != pb.CollectionState_CollectionCreated {
+		return fmt.Errorf("collection state should be created, collection name: %s, collection id: %d, state: %s", coll.Name, coll.CollectionID, coll.State)
 	}
 
 	k1 := BuildCollectionKey(coll.DBID, coll.CollectionID)
@@ -696,6 +696,8 @@ func (kc *Catalog) alterModifyCollection(ctx context.Context, oldColl *model.Col
 	oldCollClone.Fields = newColl.Fields
 	oldCollClone.StructArrayFields = newColl.StructArrayFields
 	oldCollClone.UpdateTimestamp = newColl.UpdateTimestamp
+	oldCollClone.EnableDynamicField = newColl.EnableDynamicField
+	oldCollClone.SchemaVersion = newColl.SchemaVersion
 
 	newKey := BuildCollectionKey(newColl.DBID, oldColl.CollectionID)
 	value, err := proto.Marshal(model.MarshalCollectionModel(oldCollClone))
@@ -720,6 +722,15 @@ func (kc *Catalog) alterModifyCollection(ctx context.Context, oldColl *model.Col
 			k := BuildStructArrayFieldKey(newColl.CollectionID, structArrayField.FieldID)
 			structArrayFieldInfo := model.MarshalStructArrayFieldModel(structArrayField)
 			v, err := proto.Marshal(structArrayFieldInfo)
+			if err != nil {
+				return err
+			}
+			saves[k] = string(v)
+		}
+		for _, function := range newColl.Functions {
+			k := BuildFunctionKey(newColl.CollectionID, function.ID)
+			functionInfo := model.MarshalFunctionModel(function)
+			v, err := proto.Marshal(functionInfo)
 			if err != nil {
 				return err
 			}
