@@ -3444,6 +3444,7 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Key:          "queryNode.segcore.tieredStorage.warmup.scalarField",
 		Version:      "2.6.0",
 		DefaultValue: "sync",
+		Forbidden:    true,
 		Doc: `options: sync, disable.
 Specifies the timing for warming up the Tiered Storage cache.
 - "sync": data will be loaded into the cache before a segment is considered loaded.
@@ -3457,6 +3458,7 @@ Defaults to "sync", except for vector field which defaults to "disable".`,
 		Key:          "queryNode.segcore.tieredStorage.warmup.scalarIndex",
 		Version:      "2.6.0",
 		DefaultValue: "sync",
+		Forbidden:    true,
 		Export:       true,
 	}
 	p.TieredWarmupScalarIndex.Init(base.mgr)
@@ -3465,6 +3467,7 @@ Defaults to "sync", except for vector field which defaults to "disable".`,
 		Key:          "queryNode.segcore.tieredStorage.warmup.vectorField",
 		Version:      "2.6.0",
 		DefaultValue: "disable",
+		Forbidden:    true,
 		Doc:          `cache warmup for vector field raw data is by default disabled.`,
 		Export:       true,
 	}
@@ -3474,6 +3477,7 @@ Defaults to "sync", except for vector field which defaults to "disable".`,
 		Key:          "queryNode.segcore.tieredStorage.warmup.vectorIndex",
 		Version:      "2.6.0",
 		DefaultValue: "sync",
+		Forbidden:    true,
 		Export:       true,
 	}
 	p.TieredWarmupVectorIndex.Init(base.mgr)
@@ -3482,6 +3486,7 @@ Defaults to "sync", except for vector field which defaults to "disable".`,
 		Key:          "queryNode.segcore.tieredStorage.evictionEnabled",
 		Version:      "2.6.0",
 		DefaultValue: "false",
+		Forbidden:    true,
 		Doc: `Enable eviction for Tiered Storage. Defaults to false.
 Note that if eviction is enabled, cache data loaded during sync warmup is also subject to eviction.`,
 		Export: true,
@@ -3492,6 +3497,7 @@ Note that if eviction is enabled, cache data loaded during sync warmup is also s
 		Key:          "queryNode.segcore.tieredStorage.evictableMemoryCacheRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.3",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3513,6 +3519,7 @@ It defaults to 0.3 (meaning about 30% of evictable in-memory data can be cached)
 		Key:          "queryNode.segcore.tieredStorage.evictableDiskCacheRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.3",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3534,6 +3541,7 @@ It defaults to 0.3 (meaning about 30% of evictable on-disk data can be cached), 
 		Key:          "queryNode.segcore.tieredStorage.memoryLowWatermarkRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.75",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3554,6 +3562,7 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Key:          "queryNode.segcore.tieredStorage.memoryHighWatermarkRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.8",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3569,6 +3578,7 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Key:          "queryNode.segcore.tieredStorage.diskLowWatermarkRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.75",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3584,6 +3594,7 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Key:          "queryNode.segcore.tieredStorage.diskHighWatermarkRatio",
 		Version:      "2.6.0",
 		DefaultValue: "0.8",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
@@ -3599,6 +3610,7 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Key:          "queryNode.segcore.tieredStorage.cacheTouchWindowMs",
 		Version:      "2.6.0",
 		DefaultValue: "3000",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			window := getAsInt64(v)
 			if window < 0 {
@@ -3615,6 +3627,7 @@ eviction is necessary and the amount of data to evict from memory/disk.
 		Key:          "queryNode.segcore.tieredStorage.backgroundEvictionEnabled",
 		Version:      "2.6.2",
 		DefaultValue: "false",
+		Forbidden:    true,
 		Doc: `Enable background eviction for Tiered Storage. Defaults to false.
 Background eviction is used to do periodic eviction in a separate thread.
 And it will only work when both 'evictionEnabled' and 'backgroundEvictionEnabled' are set to 'true'.`,
@@ -3626,6 +3639,7 @@ And it will only work when both 'evictionEnabled' and 'backgroundEvictionEnabled
 		Key:          "queryNode.segcore.tieredStorage.evictionIntervalMs",
 		Version:      "2.6.0",
 		DefaultValue: "1000",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			window := getAsInt64(v)
 			if window < 0 {
@@ -3642,6 +3656,7 @@ And it will only work when both 'evictionEnabled' and 'backgroundEvictionEnabled
 		Key:          "queryNode.segcore.tieredStorage.cacheTtl",
 		Version:      "2.6.0",
 		DefaultValue: "0",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			timeout := getAsInt64(v)
 			if timeout <= 0 {
@@ -3660,6 +3675,7 @@ If set to 0, time based eviction is disabled.`,
 		Key:          "queryNode.segcore.tieredStorage.storageUsageTrackingEnabled",
 		Version:      "2.6.3",
 		DefaultValue: "false",
+		Forbidden:    true,
 		Doc:          "Enable storage usage tracking for Tiered Storage. Defaults to false.",
 		Export:       true,
 	}
@@ -3669,6 +3685,7 @@ If set to 0, time based eviction is disabled.`,
 		Key:          "queryNode.segcore.tieredStorage.loadingResourceFactor",
 		Version:      "2.6.0",
 		DefaultValue: "1.0",
+		Forbidden:    true,
 		Formatter: func(v string) string {
 			factor := getAsFloat(v)
 			if factor < 1.0 {
@@ -3973,7 +3990,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapVectorIndex = ParamItem{
 		Key:          "queryNode.mmap.vectorIndex",
 		Version:      "2.4.7",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -3988,7 +4005,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapScalarField = ParamItem{
 		Key:          "queryNode.mmap.scalarField",
 		Version:      "2.4.7",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -4003,7 +4020,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapScalarIndex = ParamItem{
 		Key:          "queryNode.mmap.scalarIndex",
 		Version:      "2.4.7",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -4028,7 +4045,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.GrowingMmapEnabled = ParamItem{
 		Key:          "queryNode.mmap.growingMmapEnabled",
 		Version:      "2.4.6",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		FallbackKeys: []string{"queryNode.growingMmapEnabled"},
 		Doc: `Enable memory mapping (mmap) to optimize the handling of growing raw data.
 By activating this feature, the memory overhead associated with newly added or modified data will be significantly minimized.
@@ -4588,22 +4605,25 @@ type dataCoordConfig struct {
 	CompactionTaskQueueCapacity            ParamItem `refreshable:"false"`
 	CompactionPreAllocateIDExpansionFactor ParamItem `refreshable:"false"`
 
-	CompactionRPCTimeout             ParamItem `refreshable:"true"`
-	CompactionMaxParallelTasks       ParamItem `refreshable:"true"`
-	CompactionWorkerParallelTasks    ParamItem `refreshable:"true"`
-	MinSegmentToMerge                ParamItem `refreshable:"true"`
-	SegmentSmallProportion           ParamItem `refreshable:"true"`
-	SegmentCompactableProportion     ParamItem `refreshable:"true"`
-	SegmentExpansionRate             ParamItem `refreshable:"true"`
-	CompactionTimeoutInSeconds       ParamItem `refreshable:"true"` // deprecated
-	CompactionDropToleranceInSeconds ParamItem `refreshable:"true"`
-	CompactionGCIntervalInSeconds    ParamItem `refreshable:"true"`
-	CompactionCheckIntervalInSeconds ParamItem `refreshable:"false"` // deprecated
-	CompactionScheduleInterval       ParamItem `refreshable:"false"`
-	MixCompactionTriggerInterval     ParamItem `refreshable:"false"`
-	L0CompactionTriggerInterval      ParamItem `refreshable:"false"`
-	GlobalCompactionInterval         ParamItem `refreshable:"false"`
-	CompactionExpiryTolerance        ParamItem `refreshable:"true"`
+	CompactionRPCTimeout                      ParamItem `refreshable:"true"`
+	CompactionMaxParallelTasks                ParamItem `refreshable:"true"`
+	CompactionWorkerParallelTasks             ParamItem `refreshable:"true"`
+	CompactionMaxFullSegmentThreshold         ParamItem `refreshable:"true"`
+	CompactionForceMergeDataNodeMemoryFactor  ParamItem `refreshable:"true"`
+	CompactionForceMergeQueryNodeMemoryFactor ParamItem `refreshable:"true"`
+	MinSegmentToMerge                         ParamItem `refreshable:"true"`
+	SegmentSmallProportion                    ParamItem `refreshable:"true"`
+	SegmentCompactableProportion              ParamItem `refreshable:"true"`
+	SegmentExpansionRate                      ParamItem `refreshable:"true"`
+	CompactionTimeoutInSeconds                ParamItem `refreshable:"true"` // deprecated
+	CompactionDropToleranceInSeconds          ParamItem `refreshable:"true"`
+	CompactionGCIntervalInSeconds             ParamItem `refreshable:"true"`
+	CompactionCheckIntervalInSeconds          ParamItem `refreshable:"false"` // deprecated
+	CompactionScheduleInterval                ParamItem `refreshable:"false"`
+	MixCompactionTriggerInterval              ParamItem `refreshable:"false"`
+	L0CompactionTriggerInterval               ParamItem `refreshable:"false"`
+	GlobalCompactionInterval                  ParamItem `refreshable:"false"`
+	CompactionExpiryTolerance                 ParamItem `refreshable:"true"`
 
 	SingleCompactionRatioThreshold    ParamItem `refreshable:"true"`
 	SingleCompactionDeltaLogMaxSize   ParamItem `refreshable:"true"`
@@ -5052,6 +5072,47 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 		Doc: "The time interval in milliseconds for scheduling compaction tasks. If the configuration setting is below 100ms, it will be adjusted upwards to 100ms",
 	}
 	p.CompactionScheduleInterval.Init(base.mgr)
+
+	p.CompactionMaxFullSegmentThreshold = ParamItem{
+		Key:          "dataCoord.compaction.maxFullSegmentThreshold",
+		Version:      "2.6.8",
+		DefaultValue: "100",
+		Doc:          "Maximum number of segments to use maxFull algorithm (O(n³) complexity) for optimal full segment count. For larger counts, uses faster larger algorithm (O(n)).",
+		Export:       false,
+	}
+	p.CompactionMaxFullSegmentThreshold.Init(base.mgr)
+
+	p.CompactionForceMergeDataNodeMemoryFactor = ParamItem{
+		Key:          "dataCoord.compaction.forceMerge.dataNodeMemoryFactor",
+		Version:      "2.6.8",
+		DefaultValue: "3.0",
+		Doc:          "Memory safety factor for DataNode during force merge compaction. Max segment size = DataNode memory / factor. Default 3.0 means segments can use up to 1/3 of DataNode memory. Must be >= 1.0.",
+		Export:       false,
+		Formatter: func(value string) string {
+			factor, err := strconv.ParseFloat(value, 64)
+			if err != nil || factor < 1.0 {
+				factor = 1.0
+			}
+			return strconv.FormatFloat(factor, 'f', -1, 64)
+		},
+	}
+	p.CompactionForceMergeDataNodeMemoryFactor.Init(base.mgr)
+
+	p.CompactionForceMergeQueryNodeMemoryFactor = ParamItem{
+		Key:          "dataCoord.compaction.forceMerge.queryNodeMemoryFactor",
+		Version:      "2.6.8",
+		DefaultValue: "3.0",
+		Doc:          "Memory safety factor for QueryNode when loading segments after force merge. Max segment size = QueryNode memory / factor. Default 3.0 means segments can use up to 40% of QueryNode memory. Must be >= 1.0.",
+		Export:       false,
+		Formatter: func(value string) string {
+			factor, err := strconv.ParseFloat(value, 64)
+			if err != nil || factor < 1.0 {
+				factor = 1.0
+			}
+			return strconv.FormatFloat(factor, 'f', -1, 64)
+		},
+	}
+	p.CompactionForceMergeQueryNodeMemoryFactor.Init(base.mgr)
 
 	p.SingleCompactionRatioThreshold = ParamItem{
 		Key:          "dataCoord.compaction.single.ratio.threshold",
