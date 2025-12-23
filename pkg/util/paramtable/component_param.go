@@ -294,8 +294,10 @@ type commonConfig struct {
 	Stv2SplitAvgSizeThreshold            ParamItem `refreshable:"true"`
 	UseLoonFFI                           ParamItem `refreshable:"true"`
 
-	StoragePathPrefix         ParamItem `refreshable:"false"`
-	StorageZstdConcurrency    ParamItem `refreshable:"false"`
+	StoragePathPrefix        ParamItem `refreshable:"false"`
+	StorageZstdConcurrency   ParamItem `refreshable:"false"`
+	StorageReadRetryAttempts ParamItem `refreshable:"true"`
+
 	TTMsgEnabled              ParamItem `refreshable:"true"`
 	TraceLogMode              ParamItem `refreshable:"true"`
 	BloomFilterSize           ParamItem `refreshable:"true"`
@@ -1064,6 +1066,15 @@ The default value is 1, which is enough for most cases.`,
 		Export: false,
 	}
 	p.StorageZstdConcurrency.Init(base.mgr)
+
+	p.StorageReadRetryAttempts = ParamItem{
+		Key:          "common.storage.readRetryAttempts",
+		Version:      "2.6.8",
+		DefaultValue: "10",
+		Doc:          "The number of retry attempts for reading from object storage; only retryable errors will trigger a retry.",
+		Export:       false,
+	}
+	p.StorageReadRetryAttempts.Init(base.mgr)
 
 	p.TTMsgEnabled = ParamItem{
 		Key:          "common.ttMsgEnabled",
@@ -4945,7 +4956,7 @@ This configuration takes effect only when dataCoord.enableCompaction is set as t
 	p.CompactionTaskPrioritizer = ParamItem{
 		Key:          "dataCoord.compaction.taskPrioritizer",
 		Version:      "2.5.0",
-		DefaultValue: "default",
+		DefaultValue: "level",
 		Doc: `compaction task prioritizer, options: [default, level, mix].
 default is FIFO.
 level is prioritized by level: L0 compactions first, then mix compactions, then clustering compactions.
